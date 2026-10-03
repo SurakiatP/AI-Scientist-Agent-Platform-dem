@@ -574,6 +574,11 @@ def _validate_url(url: object, recipients: list[str], *, allow_lan: bool = False
 def _dispatch(request: OperationRequest, target: DispatchTarget) -> tuple[bytes, int]:
     if _transport is not None:
         return _transport(request, target)
+    return http_transport(request, target)
+
+
+def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[bytes, int]:
+    """Native bounded HTTP transport, usable beneath durable dispatch bindings."""
     host, port, path, ip = _validate_url(target.url, list(target.approved_recipients), allow_lan=target.kind == "peer")
     if target.kind == "llm":
         messages = request.payload.get("messages")

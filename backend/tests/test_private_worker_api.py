@@ -1,4 +1,5 @@
 import json
+import asyncio
 from hashlib import sha256
 from uuid import UUID, uuid4
 
@@ -13,6 +14,44 @@ from scientist.contracts import CheckpointManifest, ObjectRef
 from scientist.runtime_contracts import BoundaryRequest, RuntimeContextV1, canonical_bytes, operation_fingerprint
 from scientist.private_worker_api import RuntimePins, WorkerController, create_private_app, parse_boundary
 from test_broker import broker_fixture, request as request_for
+
+
+def test_effect_stream_limit_precedes_json_parse_even_with_false_content_length(monkeypatch):
+    from scientist import private_worker_api
+    monkeypatch.setattr(private_worker_api, 'MAX_EFFECT_BYTES', 128, raising=False)
+    app = create_private_app(object())
+    incoming = [
+        {'type':'http.request','body':b'{"pad":"'+b'x'*100,'more_body':True},
+        {'type':'http.request','body':b'x'*100,'more_body':True},
+        {'type':'http.request','body':b'"}','more_body':False},
+    ]
+    sent, received = [], []
+    async def receive():
+        item = incoming[len(received)]
+        received.append(item)
+        return item
+    async def send(item):
+        sent.append(item)
+    asyncio.run(app({'type':'http','asgi':{'version':'3.0'},'http_version':'1.1',
+        'method':'POST','scheme':'http','path':'/effects','raw_path':b'/effects',
+        'query_string':b'', 'headers':[(b'content-type',b'application/json'),
+                                      (b'content-length',b'1')],
+        'server':('testserver',80),'client':('127.0.0.1',1234)}, receive, send))
+    assert sent[0]['status'] == 413
+    assert len(received) == 2  # The remaining hostile stream was never consumed.
+
+
+def test_effect_at_body_limit_keeps_original_request_and_dispatches_once(controller_fixture, monkeypatch):
+    from scientist import private_worker_api
+    db, run, token, boundary, controller, calls = controller_fixture
+    body = request_for(run).model_dump_json().encode()
+    monkeypatch.setattr(private_worker_api, 'MAX_EFFECT_BYTES', len(body))
+    client = TestClient(create_private_app(controller))
+    response = client.post('/effects', content=body,
+        headers={'content-type':'application/json','x-worker-capability':token})
+    assert response.status_code == 200
+    assert response.json()['state'] == 'committed'
+    assert db.execute(text('SELECT COUNT(*) FROM operations WHERE run_id=:run'), {'run':run}).scalar_one() == 1
 
 
 @pytest.fixture

@@ -14,6 +14,8 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from scientist import broker, broker_api, objects
 from scientist.auth import DomainError
@@ -25,6 +27,7 @@ from scientist.runtime_contracts import (
 )
 
 _MAX_RESULT_BYTES = 2 * 1024 * 1024
+MAX_EFFECT_BYTES = 2 * 1024 * 1024
 Capture = Callable[[Session, UUID, int, bytes, Path], CheckpointManifest]
 ResultReader = Callable[[ObjectRef], bytes]
 
@@ -221,8 +224,44 @@ class WorkerController:
         return data
 
 
+class _EffectBodyLimit:
+    """Bound actual incoming effect bytes before FastAPI's JSON allocation."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope['type'] != 'http' or scope['method'] != 'POST' or scope['path'] != '/effects':
+            await self.app(scope, receive, send)
+            return
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message['type'] == 'http.disconnect':
+                return
+            chunk = message.get('body', b'')
+            if len(body) + len(chunk) > MAX_EFFECT_BYTES:
+                await JSONResponse(status_code=413, content={'detail':{'code':'request_too_large'}})(
+                    scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get('more_body', False):
+                break
+        forwarded = False
+
+        async def bounded_receive():
+            nonlocal forwarded
+            if not forwarded:
+                forwarded = True
+                return {'type':'http.request', 'body':bytes(body), 'more_body':False}
+            return await receive()
+
+        await self.app(scope, bounded_receive, send)
+
+
 def create_private_app(controller: WorkerController) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(_EffectBodyLimit)
     app.include_router(broker_api.router)
 
     @app.post("/control/boundary", response_model=BoundaryAck)
