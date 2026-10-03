@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 from scientist.contracts import PlanSpec, OperationRequest
-from scientist.runtime_contracts import RuntimeContextV1, BoundaryRequest, operation_fingerprint
+from scientist.runtime_contracts import RuntimeContextV1, BoundaryRequest, BootstrapMetadata, operation_fingerprint
 
 def canonical(value):
     return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
@@ -151,3 +151,27 @@ def test_native_reset_compression_state_roundtrips_without_coercion(context_data
     parsed = RuntimeContextV1.model_validate(context_data)
     assert parsed.compacted_context.summary_has_user_turn is None
     assert parsed.compacted_context.micro.defrag_threshold_tokens == 2000
+
+
+def test_raw_to_applied_tool_ids_are_explicit_and_unambiguous(context_data):
+    context_data['messages'].append({'role':'assistant','content':None,'tool_calls':[
+        {'id':'raw-a','type':'function','function':{'name':'todo','arguments':'{ }'}},
+        {'id':'raw-b','type':'function','function':{'name':'todo','arguments':'{}'}}]})
+    context_data['boundary'] = 'before_tool'
+    context_data['pending_assistant'] = {'turn_id':context_data['turn_id'],'message_index':1,'next_tool_index':0,
+        'applied_tool_ids':[{'raw_id':'raw-a','applied_id':'native-a'},{'raw_id':'raw-b','applied_id':'native-b'}]}
+    parsed = RuntimeContextV1.model_validate(context_data)
+    assert parsed.pending_assistant.applied_tool_ids[0].raw_id == 'raw-a'
+    assert parsed.messages[1].tool_calls[0].function.arguments == '{ }'
+    context_data['pending_assistant']['applied_tool_ids'][1]['applied_id'] = 'native-a'
+    with pytest.raises(ValidationError):
+        RuntimeContextV1.model_validate(context_data)
+
+
+def test_bootstrap_checkpoint_sequence_is_required_and_distinct_from_run_revision():
+    assert BootstrapMetadata(schema_version=1,checkpoint_revision=0).checkpoint_revision == 0
+    assert BootstrapMetadata(schema_version=1,checkpoint_revision=12).checkpoint_revision == 12
+    for value in ({'schema_version':1}, {'schema_version':True,'checkpoint_revision':0},
+                  {'schema_version':1,'checkpoint_revision':True}):
+        with pytest.raises(ValidationError):
+            BootstrapMetadata.model_validate(value)

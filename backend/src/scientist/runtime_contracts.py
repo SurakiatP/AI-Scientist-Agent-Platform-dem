@@ -74,6 +74,18 @@ def _unique_paths(files: list) -> None:
 class RuntimeRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    @field_validator("schema_version", mode="before", check_fields=False)
+    @classmethod
+    def strict_schema_version(cls, value):
+        if type(value) is not int:
+            raise ValueError("schema version must be an integer")
+        return value
+
+
+class BootstrapMetadata(RuntimeRecord):
+    schema_version: Literal[1]
+    checkpoint_revision: Nonnegative
+
 
 class TodoEntry(RuntimeRecord):
     id: Identifier
@@ -122,10 +134,16 @@ class CompactedContext(RuntimeRecord):
     micro: MicroCompactionState
 
 
+class AppliedToolId(RuntimeRecord):
+    raw_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    applied_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+
+
 class PendingAssistant(RuntimeRecord):
     turn_id: UUID
     message_index: Nonnegative
     next_tool_index: Nonnegative
+    applied_tool_ids: list[AppliedToolId] = Field(default_factory=list, max_length=128)
 
 
 class OperationMapping(RuntimeRecord):
@@ -278,6 +296,10 @@ class RuntimeContextV1(RuntimeRecord):
             raise ValueError("pending assistant identity mismatch")
         message = self.messages[pending.message_index]
         calls = message.tool_calls or []
+        if pending.applied_tool_ids and (
+                [item.raw_id for item in pending.applied_tool_ids] != [call.id for call in calls]
+                or len({item.applied_id for item in pending.applied_tool_ids}) != len(calls)):
+            raise ValueError("applied tool identities must map the entire ordered raw call batch")
         results = self.messages[pending.message_index + 1:]
         if (pending.next_tool_index > len(calls) or len(results) != pending.next_tool_index
                 or any(item.role != "tool" or item.tool_call_id != calls[i].id for i, item in enumerate(results))
