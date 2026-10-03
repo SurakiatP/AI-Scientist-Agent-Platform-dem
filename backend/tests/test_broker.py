@@ -217,7 +217,7 @@ def test_llm_secret_cannot_be_sent_to_other_approved_data_recipient(broker_fixtu
     malicious = OperationRequest(run_id=run_id, generation=1, operation_id="llm-alternate", kind="llm",
                                  payload={"provider_id": str(plan.provider_id), "model": plan.model,
                                           "recipient": ALTERNATE_RECIPIENT, "credential_id": str(plan.provider_id),
-                                          "prompt": "question", "max_output_tokens": 1}, reserve_tokens=100)
+                                          "prompt": "question", "max_output_tokens": 1}, reserve_tokens=200)
     with pytest.raises(DomainError, match="forbidden"):
         broker.execute(db, capability, malicious)
     assert transport.calls == 0
@@ -325,13 +325,150 @@ def test_valid_llm_effect_uses_plan_recipient_and_scoped_credential(broker_fixtu
     db.execute(text("INSERT INTO credentials (id, project_id, label, provider, encrypted_value) VALUES (:id, :project, 'fixture', 'fixture', :value)"),
                {"id": plan.provider_id, "project": project_id, "value": b"fixture-secret"})
     valid = OperationRequest(run_id=run_id, generation=1, operation_id="valid-llm", kind="llm",
-                             payload={"provider_id": str(plan.provider_id), "model": plan.model,
-                                      "recipient": "https://research.example", "credential_id": str(plan.provider_id),
-                                      "prompt": "hello", "max_output_tokens": 3}, reserve_tokens=100)
+        payload={"provider_id": str(plan.provider_id), "model": plan.model,
+                 "recipient": "https://research.example", "credential_id": str(plan.provider_id),
+                 "prompt": "hello", "max_output_tokens": 3}, reserve_tokens=200)
     result = broker.execute(db, capability, valid)
     assert result.state == "committed"
     assert transport.targets[-1].url == "https://research.example"
     assert transport.targets[-1].credential_id == plan.provider_id
+
+
+def test_llm_tool_history_is_accepted_and_forwarded_without_rewriting(broker_fixture):
+    db, _, run_id, transport, _ = broker_fixture
+    capability = broker.issue_capability(db, run_id, 1, 300)
+    plan = broker._load_plan(db, run_id, 2)
+    project_id = db.execute(text("SELECT project_id FROM runs WHERE id = :run"), {"run": run_id}).scalar_one()
+    db.execute(
+        text("INSERT INTO credentials (id, project_id, label, provider, encrypted_value) VALUES (:id, :project, 'fixture', 'fixture', :value)"),
+        {"id": plan.provider_id, "project": project_id, "value": b"fixture-secret"},
+    )
+    messages = [
+        {"role": "user", "content": "Compute 1 + 1"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_ab12", "type": "function", "function": {"name": "add", "arguments": '{"left":1, "right":1}'}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_ab12", "content": "2"},
+    ]
+    tool = {"type": "function", "function": {"name": "add", "parameters": {"type": "object", "properties": {}}}}
+    request_with_tools = OperationRequest(
+        run_id=run_id,
+        generation=1,
+        operation_id="llm-tool-history",
+        kind="llm",
+        payload={
+            "provider_id": str(plan.provider_id),
+            "model": plan.model,
+            "recipient": "https://research.example",
+            "credential_id": str(plan.provider_id),
+            "messages": messages,
+            "tools": [tool],
+            "tool_choice": {"type": "function", "function": {"name": "add"}},
+            "max_output_tokens": 3,
+        },
+        reserve_tokens=1000,
+    )
+
+    result = broker.execute(db, capability, request_with_tools)
+
+    assert result.state == "committed"
+    assert transport.calls == 1
+    assert transport.targets[-1].kind == "llm"
+    committed = db.execute(
+        text("SELECT result FROM operations WHERE run_id = :run AND operation_id = :operation"),
+        {"run": run_id, "operation": "llm-tool-history"},
+    ).scalar_one()
+    assert committed["request"]["payload"]["messages"] == messages
+    assert committed["request"]["payload"]["tools"] == [tool]
+
+
+def test_llm_oversized_tool_schema_is_rejected_before_dispatch(broker_fixture):
+    db, _, run_id, transport, _ = broker_fixture
+    capability = broker.issue_capability(db, run_id, 1, 300)
+    plan = broker._load_plan(db, run_id, 2)
+    project_id = db.execute(text("SELECT project_id FROM runs WHERE id = :run"), {"run": run_id}).scalar_one()
+    db.execute(
+        text("INSERT INTO credentials (id, project_id, label, provider, encrypted_value) VALUES (:id, :project, 'fixture', 'fixture', :value)"),
+        {"id": plan.provider_id, "project": project_id, "value": b"fixture-secret"},
+    )
+    too_large = OperationRequest(
+        run_id=run_id,
+        generation=1,
+        operation_id="llm-oversized-tool",
+        kind="llm",
+        payload={
+            "provider_id": str(plan.provider_id),
+            "model": plan.model,
+            "recipient": "https://research.example",
+            "credential_id": str(plan.provider_id),
+            "messages": [{"role": "user", "content": "question"}],
+            "tools": [{"type": "function", "function": {"name": "large", "parameters": {"type": "object", "description": "x" * 40_000}}}],
+            "max_output_tokens": 3,
+        },
+        reserve_tokens=100_000,
+    )
+
+    with pytest.raises(DomainError, match="forbidden"):
+        broker.execute(db, capability, too_large)
+    assert transport.calls == 0
+
+
+def test_llm_tool_schema_and_choice_are_included_in_reservation(broker_fixture):
+    db, _, run_id, transport, _ = broker_fixture
+    capability = broker.issue_capability(db, run_id, 1, 300)
+    plan = broker._load_plan(db, run_id, 2)
+    project_id = db.execute(text("SELECT project_id FROM runs WHERE id = :run"), {"run": run_id}).scalar_one()
+    db.execute(
+        text("INSERT INTO credentials (id, project_id, label, provider, encrypted_value) VALUES (:id, :project, 'fixture', 'fixture', :value)"),
+        {"id": plan.provider_id, "project": project_id, "value": b"fixture-secret"},
+    )
+    underreserved = OperationRequest(
+        run_id=run_id,
+        generation=1,
+        operation_id="llm-schema-budget",
+        kind="llm",
+        payload={
+            "provider_id": str(plan.provider_id),
+            "model": plan.model,
+            "recipient": "https://research.example",
+            "credential_id": str(plan.provider_id),
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function", "function": {"name": "lookup", "description": "x" * 900, "parameters": {"type": "object", "properties": {}}}}],
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+            "max_output_tokens": 3,
+        },
+        reserve_tokens=100,
+    )
+
+    with pytest.raises(DomainError, match="budget_exhausted"):
+        broker.execute(db, capability, underreserved)
+    assert transport.calls == 0
+
+
+@pytest.mark.parametrize("extra", [{"headers": {"Authorization": "Bearer attacker"}}, {"url": "https://attacker.example"}])
+def test_llm_rejects_untrusted_wire_and_routing_fields_before_dispatch(broker_fixture, extra):
+    db, _, run_id, transport, _ = broker_fixture
+    capability = broker.issue_capability(db, run_id, 1, 300)
+    plan = broker._load_plan(db, run_id, 2)
+    project_id = db.execute(text("SELECT project_id FROM runs WHERE id = :run"), {"run": run_id}).scalar_one()
+    db.execute(
+        text("INSERT INTO credentials (id, project_id, label, provider, encrypted_value) VALUES (:id, :project, 'fixture', 'fixture', :value)"),
+        {"id": plan.provider_id, "project": project_id, "value": b"fixture-secret"},
+    )
+    payload = {
+        "provider_id": str(plan.provider_id),
+        "model": plan.model,
+        "recipient": "https://research.example",
+        "credential_id": str(plan.provider_id),
+        "messages": [{"role": "user", "content": "question"}],
+        "max_output_tokens": 3,
+        **extra,
+    }
+    invalid = OperationRequest(run_id=run_id, generation=1, operation_id="llm-invalid-wire", kind="llm", payload=payload, reserve_tokens=1000)
+
+    with pytest.raises(DomainError, match="forbidden"):
+        broker.execute(db, capability, invalid)
+    assert transport.calls == 0
 
 
 def test_outbound_llm_client_releases_secret_only_to_approved_target(broker_fixture, monkeypatch):
@@ -367,17 +504,32 @@ def test_outbound_llm_client_releases_secret_only_to_approved_target(broker_fixt
         size=len(data), content_type=content_type
     ), capability_key=b"b" * 32, resolver=lambda host, port: ["8.8.8.8"],
         provider_destinations={str(plan.provider_id): "https://research.example"})
+    messages = [
+        {"role": "user", "content": "Compute 1 + 1"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_ab12", "type": "function", "function": {"name": "add", "arguments": '{"left":1, "right":1}'}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_ab12", "content": "2"},
+    ]
+    tools = [{"type": "function", "function": {"name": "add", "parameters": {"type": "object", "properties": {}}}}]
     valid = OperationRequest(run_id=run_id, generation=1, operation_id="outbound-llm", kind="llm",
                              payload={"provider_id": str(plan.provider_id), "model": plan.model,
                                       "recipient": "https://research.example", "credential_id": str(plan.provider_id),
-                                      "prompt": "hello", "max_output_tokens": 3}, reserve_tokens=100)
+                                      "messages": messages, "tools": tools,
+                                      "tool_choice": {"type": "function", "function": {"name": "add"}},
+                                      "temperature": 0.2, "max_output_tokens": 3}, reserve_tokens=1000)
     broker.execute(db, capability, valid)
     import json
     outbound = json.loads(captured["body"])
     assert captured["target"] == ("research.example", 443, "8.8.8.8")
     assert captured["headers"]["Authorization"] == "Bearer fixture-secret"
     assert outbound["model"] == plan.model
-    assert outbound["max_output_tokens"] == 3
+    assert outbound["max_tokens"] == 3
+    assert outbound["messages"] == messages
+    assert outbound["tools"] == tools
+    assert outbound["tool_choice"] == {"type": "function", "function": {"name": "add"}}
+    assert outbound["temperature"] == 0.2
+    assert "max_output_tokens" not in outbound
     assert "credential_id" not in outbound
     assert "fixture-secret" not in captured["body"].decode()
 

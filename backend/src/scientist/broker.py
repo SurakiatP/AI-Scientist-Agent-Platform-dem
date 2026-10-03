@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from scientist.auth import DomainError
 from scientist.contracts import ObjectRef, OperationRequest, OperationResult, PlanSpec, Principal, RunView
 from scientist.domain import _event, _run_view
+from scientist.model_payload import ModelPayloadError, build_chat_completion_body, serialized_input_bytes
 from scientist.secrets import read_secret
 
 @dataclass(frozen=True)
@@ -69,6 +70,10 @@ _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_TIMEOUT_SECONDS = 20
 _MAX_HTTP_TOTAL_SECONDS = 20.0
 _LLM_PROTOCOL_OVERHEAD = 64
+_LLM_CONTROLS = {
+    "temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "seed",
+    "parallel_tool_calls", "logprobs", "top_logprobs", "tools", "tool_choice",
+}
 _METADATA_HOSTS = {"metadata.google.internal", "metadata.google", "metadata.azure.internal", "instance-data"}
 _METADATA_ADDRESSES = {ipaddress.ip_address("169.254.169.254"), ipaddress.ip_address("100.100.100.200"),
                        ipaddress.ip_address("168.63.129.16"), ipaddress.ip_address("fd00:ec2::254")}
@@ -421,7 +426,7 @@ def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: Oper
         raise DomainError("forbidden", 403)
     payload = request.payload
     if request.kind == "llm":
-        _reject_fields(payload, {"provider_id", "model", "recipient", "credential_id", "max_output_tokens", "prompt", "messages", "temperature", "timeout_seconds"})
+        _reject_fields(payload, {"provider_id", "model", "recipient", "credential_id", "max_output_tokens", "prompt", "messages", "timeout_seconds", *_LLM_CONTROLS})
         if not {"provider_id", "model", "recipient", "credential_id", "max_output_tokens"} <= set(payload):
             raise DomainError("forbidden", 400)
         if str(payload.get("provider_id")) != str(plan.provider_id) or payload.get("model") != plan.model:
@@ -432,9 +437,6 @@ def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: Oper
         input_bytes = _llm_input_bytes(payload)
         if request.reserve_tokens < input_bytes + _LLM_PROTOCOL_OVERHEAD + max_output:
             raise DomainError("budget_exhausted", 409)
-        temperature = payload.get("temperature")
-        if temperature is not None and (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2):
-            raise DomainError("forbidden", 400)
         _validate_timeout(payload)
         recipient = _provider_destinations.get(str(plan.provider_id))
         if not recipient or payload.get("recipient") != recipient:
@@ -501,23 +503,17 @@ def _validate_timeout(payload: dict) -> None:
 def _llm_input_bytes(payload: dict) -> int:
     if ("prompt" in payload) == ("messages" in payload):
         raise DomainError("forbidden", 400)
+    messages = payload.get("messages")
     if "prompt" in payload:
         prompt = payload["prompt"]
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 200_000:
             raise DomainError("forbidden", 400)
-        return len(prompt.encode("utf-8"))
-    messages = payload["messages"]
-    if not isinstance(messages, list) or not 1 <= len(messages) <= 128:
-        raise DomainError("forbidden", 400)
-    size = 0
-    for message in messages:
-        if not isinstance(message, dict) or set(message) != {"role", "content"}:
-            raise DomainError("forbidden", 400)
-        role, content = message["role"], message["content"]
-        if not isinstance(role, str) or role not in {"system", "developer", "user", "assistant"} or not isinstance(content, str):
-            raise DomainError("forbidden", 400)
-        size += len(role.encode("utf-8")) + len(content.encode("utf-8"))
-    return size + 16 * len(messages)
+        messages = [{"role": "user", "content": prompt}]
+    controls = {key: payload[key] for key in _LLM_CONTROLS if key in payload}
+    try:
+        return serialized_input_bytes(messages, **controls)
+    except ModelPayloadError as exc:
+        raise DomainError("forbidden", 400) from exc
 
 
 def _approved_recipient(plan: PlanSpec, recipient: object) -> None:
@@ -579,11 +575,24 @@ def _dispatch(request: OperationRequest, target: DispatchTarget) -> tuple[bytes,
     if _transport is not None:
         return _transport(request, target)
     host, port, path, ip = _validate_url(target.url, list(target.approved_recipients), allow_lan=target.kind == "peer")
-    body_fields = {"credential_id", "url", "source", "endpoint", "destination", "recipient", "provider_id", "model", "peer_id", "timeout_seconds"}
-    outbound = {key: value for key, value in request.payload.items() if key not in body_fields}
     if target.kind == "llm":
-        outbound["model"] = target.model
-    body = json.dumps(outbound, separators=(",", ":")).encode()
+        messages = request.payload.get("messages")
+        if "prompt" in request.payload:
+            messages = [{"role": "user", "content": request.payload["prompt"]}]
+        controls = {key: request.payload[key] for key in _LLM_CONTROLS if key in request.payload}
+        try:
+            outbound = build_chat_completion_body(
+                target.model or "",
+                messages,
+                request.payload.get("max_output_tokens"),
+                **controls,
+            )
+        except ModelPayloadError as exc:
+            raise DomainError("forbidden", 400) from exc
+    else:
+        body_fields = {"credential_id", "url", "source", "endpoint", "destination", "recipient", "provider_id", "model", "peer_id", "timeout_seconds"}
+        outbound = {key: value for key, value in request.payload.items() if key not in body_fields}
+    body = json.dumps(outbound, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
     if len(body) > _MAX_REQUEST_BYTES:
         raise DomainError("request_too_large", 413)
     timeout = min(float(request.payload.get("timeout_seconds", _MAX_TIMEOUT_SECONDS)), _MAX_HTTP_TOTAL_SECONDS)
