@@ -199,7 +199,7 @@ def _validate_schema_shape(value: dict[str, Any], *, root: bool = False) -> None
 
 class FunctionDefinition(_WireModel):
     name: StrictStr = Field(min_length=1, max_length=64)
-    description: StrictStr | None = Field(default=None, max_length=1024)
+    description: StrictStr | None = Field(default=None, max_length=2048)
     parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
     strict: StrictBool | None = None
 

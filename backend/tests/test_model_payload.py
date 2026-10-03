@@ -12,6 +12,20 @@ from scientist.model_payload import (
 )
 
 
+def test_bounded_native_tool_description_retains_exact_text_and_reservation_bytes():
+    description = ('Discover tools.\n  Preserve this indentation.\n' * 30)[:1060]
+    assert len(description) == 1060
+    tools = [{'type':'function','function':{'name':'tool_search',
+        'description':description,'parameters':{'type':'object','properties':{}}}}]
+    messages = [{'role':'user','content':'Find a tool'}]
+    body = build_chat_completion_body('fixture', messages, 64, tools=tools)
+    assert body['tools'][0]['function']['description'] == description
+    assert serialized_input_bytes(messages, tools=tools) >= len(description.encode())
+    tools[0]['function']['description'] = 'x' * 2049
+    with pytest.raises(ValueError):
+        validate_tools(tools)
+
+
 def test_tool_history_serializes_null_assistant_content_and_raw_calls_exactly():
     messages = [
         {"role": "user", "content": "Compute 1 + 1"},
