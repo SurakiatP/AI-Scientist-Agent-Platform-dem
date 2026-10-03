@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from scientist.auth import DomainError
 from scientist.contracts import ObjectRef, OperationRequest, OperationResult, PlanSpec, Principal, RunView
 from scientist.domain import _event, _run_view
+from scientist import limits
 from scientist.model_payload import ModelPayloadError, build_chat_completion_body, serialized_input_bytes
 from scientist.secrets import read_secret
 
@@ -142,17 +143,36 @@ def execute(db: Session, worker_capability: str, request: OperationRequest) -> O
         if existing.state == "unknown" and pending.get("usage_known") and pending.get("ref"):
             return _finalize_staged_success(db, request.run_id, request.operation_id)
         return _operation_result(existing)
+    if limits.budget_exhausted(db, row, reserve_tokens=request.reserve_tokens):
+        decision_id = limits.mark_budget_wait(db, request.run_id, row.revision, _event)
+        if decision_id is None:
+            db.rollback()
+            raise DomainError("forbidden", 403)
+        db.commit()
+        raise DomainError("budget_exhausted", 409)
 
     reserved = db.execute(text("""
         UPDATE runs SET reserved_tokens = reserved_tokens + :reserve
         WHERE id = :run AND generation = :generation
           AND state = 'running' AND lease_expires_at > now()
           AND usage_tokens + reserved_tokens + :reserve <= token_limit
-        RETURNING id
+          AND elapsed_used_ms + CASE
+                WHEN elapsed_active_since IS NULL THEN 0
+                ELSE GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                    (clock_timestamp() - elapsed_active_since)) * 1000)::bigint)
+              END < elapsed_limit_ms
+          RETURNING id
     """), {"run": request.run_id, "generation": request.generation, "reserve": request.reserve_tokens}).scalar_one_or_none()
     if reserved is None:
         current = _load_run(db, request.run_id)
         if current.generation != request.generation or current.state != "running" or current.lease_expires_at is None or current.lease_expires_at <= datetime.now(timezone.utc):
+            raise DomainError("forbidden", 403)
+        if limits.budget_exhausted(db, current, reserve_tokens=request.reserve_tokens):
+            decision_id = limits.mark_budget_wait(db, request.run_id, current.revision, _event)
+            if decision_id is not None:
+                db.commit()
+                raise DomainError("budget_exhausted", 409)
+            db.rollback()
             raise DomainError("forbidden", 403)
         raise DomainError("budget_exhausted", 409)
     db.execute(text("""
@@ -213,14 +233,18 @@ def _finish_reserved_operation(
         db.rollback()
         raise DomainError("revision_conflict", 409)
     db.execute(text("""
-        UPDATE runs SET reserved_tokens = reserved_tokens - :reserve, usage_tokens = usage_tokens + :usage,
-            state = CASE WHEN usage_tokens + :usage > token_limit THEN 'waiting_input' ELSE state END,
-            waiting_reason = CASE WHEN usage_tokens + :usage > token_limit THEN 'budget_exhausted' ELSE waiting_reason END
+        UPDATE runs SET reserved_tokens = reserved_tokens - :reserve,
+                        usage_tokens = usage_tokens + :usage
         WHERE id = :run
     """), {"reserve": request.reserve_tokens, "usage": usage_tokens, "run": request.run_id})
     _emit_usage_event(db, request.run_id, revision)
+    run = _load_run(db, request.run_id)
+    if (
+        run.usage_tokens + run.reserved_tokens >= run.token_limit
+        or limits.effective_elapsed_ms(db, request.run_id) >= run.elapsed_limit_ms
+    ):
+        limits.mark_budget_wait(db, request.run_id, revision, _event)
     db.commit()
-
     return _finalize_staged_success(db, request.run_id, request.operation_id)
 
 

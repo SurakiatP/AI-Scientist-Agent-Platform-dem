@@ -283,6 +283,65 @@ def test_recover_final_quiescent_checkpoint_completes_once(
     ).scalar_one() == queued_events_before
 
 
+def test_recover_pauses_at_exhausted_elapsed_budget_after_proving_quiescence(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    run = _prepare_recovery_run(
+        db, project_session, object_fixture, tmp_path, boundary="before_model"
+    )
+    db.execute(text("""
+        UPDATE runs SET elapsed_used_ms=elapsed_limit_ms,
+            elapsed_active_since=clock_timestamp()-interval '1 second'
+        WHERE id=:run
+    """), {"run": run.run_id})
+    db.commit()
+    monkeypatch.setattr(
+        supervisor, "_config", SimpleNamespace(engine=object(), dispatch=object())
+    )
+
+    recovered = supervisor.recover(db, run.run_id)
+
+    assert recovered.state == "waiting_input"
+    assert recovered.waiting_reason == "budget_exhausted"
+    assert db.execute(text("""
+        SELECT elapsed_active_since IS NULL, elapsed_used_ms >= elapsed_limit_ms
+        FROM runs WHERE id=:run
+    """), {"run": run.run_id}).one() == (True, True)
+    assert db.execute(text("""
+        SELECT count(*) FROM events WHERE run_id=:run AND kind='decision.required'
+          AND payload->>'reason'='budget_exhausted'
+    """), {"run": run.run_id}).scalar_one() == 1
+
+
+def test_recover_final_checkpoint_completion_wins_at_elapsed_ceiling(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    run = _prepare_recovery_run(
+        db, project_session, object_fixture, tmp_path, boundary="final"
+    )
+    db.execute(text("""
+        UPDATE runs SET elapsed_used_ms=elapsed_limit_ms,
+            elapsed_active_since=clock_timestamp()-interval '1 second'
+        WHERE id=:run
+    """), {"run": run.run_id})
+    db.commit()
+    monkeypatch.setattr(
+        supervisor, "_config", SimpleNamespace(engine=object(), dispatch=object())
+    )
+
+    recovered = supervisor.recover(db, run.run_id)
+
+    assert recovered.state == "completed"
+    assert recovered.waiting_reason is None
+    assert db.execute(text("""
+        SELECT elapsed_active_since IS NULL FROM runs WHERE id=:run
+    """), {"run": run.run_id}).scalar_one() is True
+    assert db.execute(text("""
+        SELECT count(*) FROM events WHERE run_id=:run AND kind='decision.required'
+          AND payload->>'reason'='budget_exhausted'
+    """), {"run": run.run_id}).scalar_one() == 0
+
+
 def test_recover_stale_final_checkpoint_fails_closed(
     db, project_session, object_fixture, tmp_path, monkeypatch
 ):
@@ -353,7 +412,8 @@ def test_stop_records_exact_worker_inactive_proof(
 ):
     run, _ = _approved_run(db, project_session)
     db.execute(
-        text("UPDATE runs SET state='running', generation=1 WHERE id=:run"),
+        text("""UPDATE runs SET state='running', generation=1, elapsed_used_ms=11,
+            elapsed_active_since=clock_timestamp()-interval '2 seconds' WHERE id=:run"""),
         {"run": run.run_id},
     )
     worker_ref = ExecutorRef(uuid4(), run.run_id, 1, "worker", None, uuid4(), "engine-test", "1" * 64)
@@ -378,6 +438,11 @@ def test_stop_records_exact_worker_inactive_proof(
     stopped = supervisor.stop(db, run.run_id, 0)
 
     assert stopped.state == "canceled", stopped.waiting_reason
+    elapsed_used, elapsed_active_since = db.execute(text("""
+        SELECT elapsed_used_ms, elapsed_active_since FROM runs WHERE id=:run
+    """), {"run": run.run_id}).one()
+    assert elapsed_active_since is None
+    assert elapsed_used >= 1_900
     rows = db.execute(
         text("SELECT kind, state, proof FROM runtime_executors WHERE run_id=:run ORDER BY kind"),
         {"run": run.run_id},

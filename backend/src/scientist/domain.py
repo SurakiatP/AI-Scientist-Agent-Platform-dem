@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from scientist.auth import DomainError, authorize
 from scientist.contracts import ArtifactView, PlanSpec, PlanView, Principal, RunEvent, RunView
+from scientist import limits
 
 _SNAPSHOT_MAX_BYTES = 1024 * 1024
 
@@ -108,6 +109,107 @@ def approve_run(db: Session, owner: Principal, run_id: UUID, expected_revision: 
     if updated is None:
         raise DomainError("budget_exhausted", 409)
     _event(db, run_id, row.revision, "run.state", {"state": "queued"})
+    return _run_view(db, run_id)
+
+
+def extend_run_budget(
+    db: Session,
+    owner: Principal,
+    run_id: UUID,
+    expected_revision: int,
+    decision_id: UUID,
+    idempotency_key: str,
+    token_limit: int,
+    elapsed_limit_ms: int,
+) -> RunView:
+    """Record an immutable owner extension while keeping the run paused."""
+    if owner.kind != "owner":
+        raise DomainError("forbidden", 403)
+    if (
+        not isinstance(idempotency_key, str)
+        or not 1 <= len(idempotency_key) <= 200
+        or type(expected_revision) is not int
+        or expected_revision < 1
+        or type(token_limit) is not int
+        or token_limit < 0
+        or type(elapsed_limit_ms) is not int
+        or elapsed_limit_ms < 0
+    ):
+        raise DomainError("forbidden", 400)
+
+    row = _load_run(db, run_id, lock=True)
+    payload_hash = _digest({
+        "run_id": str(run_id),
+        "revision": expected_revision,
+        "decision_id": str(decision_id),
+        "token_limit": token_limit,
+        "elapsed_limit_ms": elapsed_limit_ms,
+    })
+    existing = db.execute(text("""
+        SELECT caller_identity, payload_hash
+        FROM run_budget_extensions
+        WHERE run_id = :run AND idempotency_key = :key
+    """), {"run": run_id, "key": idempotency_key}).one_or_none()
+    if existing is not None:
+        if existing.caller_identity != owner.identity:
+            raise DomainError("forbidden", 403)
+        if existing.payload_hash.strip() != payload_hash:
+            raise DomainError("idempotency_conflict", 409)
+        return _run_view(db, run_id)
+
+    if row.revision != expected_revision:
+        raise DomainError("revision_conflict", 409)
+    if (
+        row.state != "waiting_input"
+        or row.waiting_reason != "budget_exhausted"
+        or row.budget_decision_id != decision_id
+    ):
+        raise DomainError("revision_conflict", 409)
+    if token_limit < row.token_limit or elapsed_limit_ms < row.elapsed_limit_ms:
+        raise DomainError("forbidden", 400)
+    if token_limit == row.token_limit and elapsed_limit_ms == row.elapsed_limit_ms:
+        raise DomainError("forbidden", 400)
+
+    db.execute(text("""
+        INSERT INTO run_budget_extensions (
+            id, run_id, idempotency_key, caller_identity, expected_revision,
+            payload_hash, token_limit_before, token_limit_after,
+            elapsed_limit_before_ms, elapsed_limit_after_ms
+        ) VALUES (
+            :id, :run, :key, :caller, :revision, :hash,
+            :token_before, :token_after, :elapsed_before, :elapsed_after
+        )
+    """), {
+        "id": uuid4(),
+        "run": run_id,
+        "key": idempotency_key,
+        "caller": owner.identity,
+        "revision": expected_revision,
+        "hash": payload_hash,
+        "token_before": row.token_limit,
+        "token_after": token_limit,
+        "elapsed_before": row.elapsed_limit_ms,
+        "elapsed_after": elapsed_limit_ms,
+    })
+    db.execute(text("""
+        UPDATE runs
+        SET token_limit = :token_limit, elapsed_limit_ms = :elapsed_limit_ms,
+            budget_decision_id = NULL
+        WHERE id = :run AND state = 'waiting_input'
+    """), {
+        "token_limit": token_limit,
+        "elapsed_limit_ms": elapsed_limit_ms,
+        "run": run_id,
+    })
+    _event(db, run_id, row.revision, "usage.updated", {
+        "usage_tokens": row.usage_tokens,
+        "reserved_tokens": row.reserved_tokens,
+        "token_limit": token_limit,
+    })
+    updated = _load_run(db, run_id)
+    if limits.budget_exhausted(db, updated):
+        limits.mark_budget_wait(db, run_id, row.revision, _event)
+    db.commit()
     return _run_view(db, run_id)
 
 

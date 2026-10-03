@@ -29,6 +29,7 @@ from scientist import checkpoints
 from scientist.auth import DomainError
 from scientist.contracts import CheckpointManifest, RunView
 from scientist.domain import _event, _run_view
+from scientist import limits
 from scientist.dispatch_authority import dispatch_is_inactive
 from scientist.runtime_contracts import (
     BootstrapMetadata,
@@ -230,7 +231,7 @@ def claim(db: Session, max_active: int) -> tuple[UUID, int] | None:
         db.rollback()
         return None
     row = db.execute(text("""
-        SELECT r.id, r.revision, r.plan_digest, r.generation
+        SELECT r.*
         FROM runs AS r
         WHERE r.state = 'queued' AND r.cancel_requested = false
           AND r.plan_digest IS NOT NULL
@@ -242,10 +243,15 @@ def claim(db: Session, max_active: int) -> tuple[UUID, int] | None:
     if row is None:
         db.rollback()
         return None
+    if limits.budget_exhausted(db, row):
+        limits.mark_budget_wait(db, row["id"], row["revision"], _event)
+        db.commit()
+        return None
     generation = row["generation"] + 1
     changed = db.execute(text("""
         UPDATE runs SET state = 'running', generation = :generation,
             lease_expires_at = now() + (:lease * interval '1 second'),
+            elapsed_active_since = COALESCE(elapsed_active_since, clock_timestamp()),
             waiting_reason = NULL, error_code = NULL
         WHERE id = :run AND state = 'queued' AND generation = :old_generation
         RETURNING id
@@ -394,6 +400,7 @@ def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
     if latest.state in {"completed", "failed", "canceled", "rejected"}:
         db.rollback()
         return _run_view(db, run_id)
+    limits.settle_active_interval(db, run_id)
     db.execute(text("""
         UPDATE runs SET state='canceled', lease_expires_at=NULL,
             waiting_reason=NULL, error_code=NULL
@@ -558,12 +565,14 @@ def recover(db: Session, run_id: UUID) -> RunView:
         """), {"run": run_id, "reason": reason})
         _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
     elif row["cancel_requested"]:
+        limits.settle_active_interval(db, run_id)
         db.execute(text("""
             UPDATE runs SET state='canceled', waiting_reason=NULL,
                 lease_expires_at=NULL WHERE id=:run
         """), {"run": run_id})
         _event(db, run_id, row["revision"], "run.state", {"state": "canceled"})
     elif pending_unknown:
+        limits.settle_active_interval(db, run_id)
         reason = "unknown_outcome" if pending_unknown else "executor_quiescence_unproven"
         db.execute(text("""
             UPDATE runs SET state='waiting_input', waiting_reason=:reason,
@@ -571,6 +580,7 @@ def recover(db: Session, run_id: UUID) -> RunView:
         """), {"run": run_id, "reason": reason})
         _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
     else:
+        limits.settle_active_interval(db, run_id)
         # Reserved effects have no completed response. The broker must reconcile
         # them before continuation; without a durable outcome, retain the budget.
         reserved = db.execute(text("""
@@ -630,12 +640,7 @@ def recover(db: Session, run_id: UUID) -> RunView:
                             """), {"run": run_id, "generation": generation})
                             _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
                     else:
-                        db.execute(text("""
-                            UPDATE runs SET state='queued', waiting_reason=NULL,
-                                lease_expires_at=NULL, error_code=NULL
-                            WHERE id=:run AND generation=:generation
-                        """), {"run": run_id, "generation": generation})
-                        _event(db, run_id, row["revision"], "run.state", {"state": "queued"})
+                        _queue_recovered_run(db, run_id, generation, row["revision"])
                 except Exception:
                     db.execute(text("""
                         UPDATE runs SET state='waiting_input',
@@ -644,13 +649,27 @@ def recover(db: Session, run_id: UUID) -> RunView:
                     """), {"run": run_id, "generation": generation})
                     _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
             else:
-                db.execute(text("""
-                    UPDATE runs SET state='queued', waiting_reason=NULL, lease_expires_at=NULL,
-                        error_code=NULL WHERE id=:run AND generation=:generation
-                """), {"run": run_id, "generation": generation})
-                _event(db, run_id, row["revision"], "run.state", {"state": "queued"})
+                _queue_recovered_run(db, run_id, generation, row["revision"])
     db.commit()
     return _run_view(db, run_id)
+
+
+def _queue_recovered_run(db: Session, run_id: UUID, generation: int, revision: int) -> None:
+    current = db.execute(
+        text("SELECT * FROM runs WHERE id=:run AND generation=:generation FOR UPDATE"),
+        {"run": run_id, "generation": generation},
+    ).mappings().one_or_none()
+    if current is None:
+        return
+    if limits.budget_exhausted(db, current):
+        limits.mark_budget_wait(db, run_id, revision, _event)
+        return
+    changed = db.execute(text("""
+        UPDATE runs SET state='queued', waiting_reason=NULL, lease_expires_at=NULL, error_code=NULL
+        WHERE id=:run AND generation=:generation AND cancel_requested=false
+    """), {"run": run_id, "generation": generation}).rowcount
+    if changed == 1:
+        _event(db, run_id, revision, "run.state", {"state": "queued"})
 
 
 def _fence_generation(db: Session, run_id: UUID, generation: int | None, grace_seconds: int) -> bool:
