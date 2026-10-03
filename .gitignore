@@ -1,0 +1,33 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local editor and system files
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Local brainstorming previews
+/.superpowers/
+
+# Local AI integration memory
+/.integration-hub/
+/AGENTS.md
+/CLAUDE.md
