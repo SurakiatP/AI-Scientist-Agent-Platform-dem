@@ -10,10 +10,12 @@ import base64
 import binascii
 import hashlib
 import json
+import math
+from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from scientist.contracts import CheckpointManifest, OperationRequest, PlanSpec
 from scientist.model_payload import ChatMessage, validate_messages
@@ -188,6 +190,25 @@ class WorkspaceEntry(RuntimeRecord):
         return validate_workspace_path(value)
 
 
+def validate_native_timestamp(value):
+    if type(value) in (int, float):
+        if value < 0 or (type(value) is float and not math.isfinite(value)):
+            raise ValueError("native timestamp must be finite nonnegative seconds")
+        return value
+    if type(value) is str and 1 <= len(value) <= 64:
+        datetime.fromisoformat(value)
+        return value
+    raise ValueError("native timestamp must be numeric seconds or bounded ISO text")
+
+
+NativeTimestamp = Annotated[Any, BeforeValidator(validate_native_timestamp)]
+
+
+class NativeMessageMetadata(RuntimeRecord):
+    message_index: Nonnegative
+    timestamp: NativeTimestamp
+
+
 class RuntimeContextV1(RuntimeRecord):
     schema_version: Literal[1]
     run_id: UUID
@@ -207,6 +228,9 @@ class RuntimeContextV1(RuntimeRecord):
     turn_id: UUID
     system_prompt: Annotated[StrictStr, Field(max_length=MAX_CONTEXT_BYTES)]
     messages: list[ChatMessage] = Field(max_length=1000)
+    native_message_metadata: list[NativeMessageMetadata] = Field(default_factory=list, max_length=1000)
+    current_turn_user_index: Nonnegative | None = None
+    native_turn_timestamp: NativeTimestamp | None = None
     todo: TodoSnapshot
     compacted_context: CompactedContext | None
     boundary: Literal["before_model", "model_committed", "before_tool", "tool_committed", "final"]
@@ -247,6 +271,14 @@ class RuntimeContextV1(RuntimeRecord):
             raise ValueError("context changed approved plan identity")
         if len(canonical_bytes(self.model_dump(mode="json"))) > MAX_CONTEXT_BYTES:
             raise ValueError("context exceeds 1 MiB")
+        metadata_indices = [item.message_index for item in self.native_message_metadata]
+        if (len(set(metadata_indices)) != len(metadata_indices)
+                or any(index >= len(self.messages) for index in metadata_indices)):
+            raise ValueError("native metadata must bind unique canonical message indices")
+        if self.current_turn_user_index is not None and (
+                self.current_turn_user_index >= len(self.messages)
+                or self.messages[self.current_turn_user_index].role != "user"):
+            raise ValueError("current turn anchor must reference canonical primary user")
         _unique_paths(self.workspace_manifest)
         if sum(entry.size for entry in self.workspace_manifest) > MAX_WORKSPACE_BYTES:
             raise ValueError("workspace exceeds 64 MiB")

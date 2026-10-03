@@ -175,3 +175,48 @@ def test_bootstrap_checkpoint_sequence_is_required_and_distinct_from_run_revisio
                   {'schema_version':1,'checkpoint_revision':True}):
         with pytest.raises(ValidationError):
             BootstrapMetadata.model_validate(value)
+
+
+def test_native_timestamps_bind_to_canonical_history_without_polluting_wire(context_data):
+    context_data['native_message_metadata'] = [{'message_index':0,'timestamp':'2026-10-03T13:00:00+00:00'}]
+    parsed = RuntimeContextV1.model_validate(context_data)
+    assert parsed.native_message_metadata[0].timestamp == '2026-10-03T13:00:00+00:00'
+    assert 'timestamp' not in parsed.messages[0].model_dump()
+    for metadata in ([{'message_index':1,'timestamp':'2026-10-03T13:00:00+00:00'}],
+                     context_data['native_message_metadata'] * 2,
+                     [{'message_index':0,'timestamp':'not-a-timestamp'}]):
+        context_data['native_message_metadata'] = metadata
+        with pytest.raises(ValidationError):
+            RuntimeContextV1.model_validate(context_data)
+
+
+@pytest.mark.parametrize('timestamp', [0, 1791032400, 1791032400.123456])
+def test_native_numeric_timestamp_roundtrip_is_lossless(context_data, timestamp):
+    context_data['native_message_metadata'] = [{'message_index':0,'timestamp':timestamp}]
+    context_data['native_turn_timestamp'] = timestamp
+    parsed = RuntimeContextV1.model_validate(context_data)
+    restored = RuntimeContextV1.model_validate_json(parsed.model_dump_json())
+    assert restored.native_message_metadata[0].timestamp == timestamp
+    assert type(restored.native_message_metadata[0].timestamp) is type(timestamp)
+    assert restored.native_turn_timestamp == timestamp
+    assert type(restored.native_turn_timestamp) is type(timestamp)
+
+
+@pytest.mark.parametrize('timestamp', [True, False, -1, float('nan'), float('inf'), -float('inf')])
+def test_native_numeric_timestamp_rejects_invalid_values(context_data, timestamp):
+    for field in ('native_message_metadata', 'native_turn_timestamp'):
+        data = dict(context_data)
+        data[field] = ([{'message_index':0,'timestamp':timestamp}]
+                       if field == 'native_message_metadata' else timestamp)
+        with pytest.raises(ValidationError):
+            RuntimeContextV1.model_validate(data)
+
+
+def test_current_turn_anchor_must_reference_primary_user(context_data):
+    context_data['current_turn_user_index'] = 0
+    assert RuntimeContextV1.model_validate(context_data).current_turn_user_index == 0
+    context_data['messages'].append({'role':'assistant','content':'done'})
+    for anchor in (True, -1, 1, 2):
+        context_data['current_turn_user_index'] = anchor
+        with pytest.raises(ValidationError):
+            RuntimeContextV1.model_validate(context_data)
