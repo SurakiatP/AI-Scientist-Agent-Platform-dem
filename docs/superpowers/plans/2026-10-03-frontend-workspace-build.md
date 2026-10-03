@@ -175,7 +175,7 @@ test('refresh restores confirmed run state without a second submission', async (
 
 These helpers are defined in this test file using the test deployment's owner bootstrap and domain setup, without printing credentials. Explicitly test UI draft preservation while theme/language changes and state resynchronization after lost SSE/expired cursor.
 
-- [ ] **2. Observe RED.** Run `rtk npm --prefix apps/web run test:e2e -- tests/live-workspace.spec.ts`. A missing licensed/isolated test deployment is a blocked check, never silently replaced by static mocks.
+- [ ] **2. Observe RED.** Run `rtk npm --prefix apps/web run test:e2e -- tests/live-workspace.spec.ts`. A missing validated/isolated test deployment is a blocked check, never silently replaced by static mocks.
 
 - [ ] **3. Wire actual endpoints and connection states.** Settings consumes B6 connection/token/peer/capability routes and I2 actual peer checks. Password inputs are cleared after submission and never persisted in local/session storage. Save returns masked metadata only. Show checking/error/ready only from verified responses; do not infer connection success from saving a value. Tokens display once with copy action and scope; external enablement clearly shows local/network access policy.
 

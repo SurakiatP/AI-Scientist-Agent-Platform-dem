@@ -6,7 +6,7 @@
 
 **Architecture:** Official SDK transports/parsers wrap concrete domain operations, with no second orchestrator or separate authorization database. External listeners admit manually configured scoped bearer clients; the local owner interface remains separate. Deployment uses explicit trusted roles, private storage/database networks and owner-supplied operator prerequisites.
 
-**Tech Stack:** mcp 2.3.0, a2a-sdk 1.2.1, FastAPI, PostgreSQL, Docker/Compose, AIStor Free, Trivy and Syft. Versions/digests are rechecked and scanned at execution; candidate inspection is not a scan pass.
+**Tech Stack:** mcp 2.3.0, a2a-sdk 1.2.1, FastAPI, PostgreSQL, Docker/Compose, open-source MinIO, Trivy and Syft. Versions/digests are rechecked and scanned at execution; candidate inspection is not a scan pass.
 
 **Spec:** [MCP/A2A/storage/security specification](../specs/2026-10-03-platform-runtime-design.md) and [master wave plan](2026-10-03-platform-build.md).
 
@@ -194,13 +194,13 @@ Outbound peer requests require exact approved recipient/payload/input versions/l
 
 ### I3 — Local deployment, operator readiness and coordinated restore
 
-**Owns:** `deploy/{compose.yaml,Dockerfile.api,README.md}`; `backend/src/scientist/{launch,backup}.py`; `backend/tests/test_deployment_restore.py`. Parent owns application role composition and host integration. Secret/license/backup files are not created in source or delegated to workers.
+**Owns:** `deploy/{compose.yaml,Dockerfile.api,README.md}`; `backend/src/scientist/{launch,backup}.py`; `backend/tests/test_deployment_restore.py`. Parent owns application role composition and host integration. Secret/backup files are not created in source or delegated to workers.
 
-**Dependencies:** B1–B6/F1–F4/I1/I2 integrated. Actual fixed engine/license/encrypted storage are required for live deployment acceptance.
+**Dependencies:** B1–B6/F1–F4/I1/I2 integrated. Actual fixed engine/validated OSS storage/encrypted storage are required for live deployment acceptance.
 
-**Interfaces:** `launch.preflight() -> dict` validates compatible engine, image references, secret mounts, free license readiness, encrypted storage operator declaration and allowed network profile; `launch.owner_url() -> None` opens the one-time local bootstrap without logging it; `backup.create(destination: Path) -> dict` quiesces dispatch/writers and records a coordinated manifest; `backup.restore(source: Path) -> dict` restores into an explicitly isolated target and validates references before dispatch. No arbitrary host-path/API invocation of backup or Docker controls.
+**Interfaces:** `launch.preflight() -> dict` validates compatible engine, image references, secret mounts, pinned OSS source/build readiness, encrypted storage operator declaration and allowed network profile; `launch.owner_url() -> None` opens the one-time local bootstrap without logging it; `backup.create(destination: Path) -> dict` quiesces dispatch/writers and records a coordinated manifest; `backup.restore(source: Path) -> dict` restores into an explicitly isolated target and validates references before dispatch. No arbitrary host-path/API invocation of backup or Docker controls.
 
-- [ ] **1. Write readiness/restore rejection checks.** Test missing license/master key, storage permission/expiry failure, host affected version, invalid image digest, incomplete backup, wrong hashes, pending unknown operations and empty/partial restore:
+- [ ] **1. Write readiness/restore rejection checks.** Test unverified storage image/master key, storage permission/expiry failure, host affected version, invalid image digest, incomplete backup, wrong hashes, pending unknown operations and empty/partial restore:
 
 ```python
 def test_restore_missing_object_does_not_dispatch(restore_fixture):
@@ -211,15 +211,15 @@ def test_restore_missing_object_does_not_dispatch(restore_fixture):
     assert restore_fixture.started_workers == 0
 ```
 
-The fixture restores a real test PostgreSQL database and task-specific AIStor bucket/volume into a separate isolated Compose project. Host reboot is not required; stop/restart this test project to simulate full deployment loss. Do not touch the user's other containers or research data.
+The fixture restores a real test PostgreSQL database and task-specific MinIO bucket/volume into a separate isolated Compose project. Host reboot is not required; stop/restart this test project to simulate full deployment loss. Do not touch the user's other containers or research data.
 
-- [ ] **2. Observe RED and verify operator prerequisites.** Run `rtk proxy uv run pytest backend/tests/test_deployment_restore.py -q`. Check fixed/mitigated Docker, exact scanned images and mounted license readiness; do not execute default insecure examples or vendor signup/acceptance. A missing prerequisite is a blocked integration check. Owner acquisition of AIStor Free license is required before software download/install according to its terms.
+- [ ] **2. Observe RED and verify operator prerequisites.** Run `rtk proxy uv run pytest backend/tests/test_deployment_restore.py -q`. Check fixed/mitigated Docker, exact scanned images and pinned OSS storage provenance; do not execute default insecure examples or vendor signup/acceptance. A missing prerequisite is a blocked integration check. The pinned AGPL MinIO build requires source provenance, attribution and vulnerability verification; no AIStor license applies.
 
-- [ ] **3. Implement one documented deployment profile.** Compose roles: local-owner API/static frontend, trusted supervisor, broker, PostgreSQL and AIStor Free. A single application image may serve API/broker/supervisor entrypoints but only the supervisor receives Docker control. Workers and preparation containers are launched dynamically per run with bounded workspace volumes and internal networks. Put S3/database on a private service network, attach broker deliberately to run networks, disable packet forwarding/capabilities, and verify no cross-run route. Do not expose database/storage administration to workers.
+- [ ] **3. Implement one documented deployment profile.** Compose roles: local-owner API/static frontend, trusted supervisor, broker, PostgreSQL and open-source MinIO. A single application image may serve API/broker/supervisor entrypoints but only the supervisor receives Docker control. Workers and preparation containers are launched dynamically per run with bounded workspace volumes and internal networks. Put S3/database on a private service network, attach broker deliberately to run networks, disable packet forwarding/capabilities, and verify no cross-run route. Do not expose database/storage administration to workers.
 
 Publish the owner UI only on `127.0.0.1`; separate external protocol listener/app composition never accepts owner cookies/bootstrap/admin routes. Optional LAN profile requires explicit bind address/TLS reverse proxy/allowed hosts/origins/scoped bearer grants; advertise no remote owner UI. Trust proxy headers only from explicitly configured proxy IPs. Production serves the built frontend and SPA fallbacks from the API origin; Vite is development-only.
 
-Mount provider master key, generated service credentials and AIStor license outside source, read-only where possible. Store actual data on encrypted operator volumes, and backups on an encrypted destination. No `minioadmin`, default Postgres passwords or shared credentials; generation does not print values. Use app-level immutable keys and PG versions, no paid SSE/version-specific delete assumption. Surface license renewal/expiry/read-only/unavailable states.
+Mount provider master key and generated service credentials outside source, read-only where possible. Store actual data on encrypted operator volumes, and backups on an encrypted destination. No `minioadmin`, default Postgres passwords or shared credentials; generation does not print values. Use app-level immutable keys and PG versions, no paid SSE/version-specific delete assumption. Surface storage readiness/unavailable states.
 
 Backup: pause dispatch, settle/quiesce writers, capture PG plus every referenced immutable object and manifest hash, persist pending operations/usage/grants, then resume only after successful completion or safe rollback of the backup operation. Restore checks DB/object/manifest compatibility and refuses execution until all required references validate. Unknown remote effects remain pending decisions. Document exact local start/stop/restore commands and operator-supplied secret file paths, without sample secret values.
 
@@ -241,7 +241,7 @@ completed = subprocess.run([sys.executable, '-c', 'raise SystemExit(7)'],
 assert completed.returncode == 7
 ```
 
-The runner must preserve that nonzero result as a failed check. CI performs offline deterministic domain/frontend/protocol checks and scans; local licensed-container/live-LLM checks are separate and must appear as pending when CI cannot run them.
+The runner must preserve that nonzero result as a failed check. CI performs offline deterministic domain/frontend/protocol checks and scans; local actual-container/live-LLM checks are separate and must appear as pending when CI cannot run them.
 
 - [ ] **2. Run appropriate aggregate verification once.** Commands executed by the runner start with `rtk`:
 
@@ -254,14 +254,14 @@ rtk proxy npm --prefix apps/web audit --json
 rtk git diff --check
 ```
 
-Test selection separates deterministic checks from licensed/actual-container tests clearly; none are silently skipped in the final acceptance report. Recheck generated DTOs/OpenAPI/tool schemas against the committed files. Run actual component-image SBOM and scans using the installed verified tooling, with bounded files rather than noisy console dumps:
+Test selection separates deterministic checks from storage/actual-container tests clearly; none are silently skipped in the final acceptance report. Recheck generated DTOs/OpenAPI/tool schemas against the committed files. Run actual component-image SBOM and scans using the installed verified tooling, with bounded files rather than noisy console dumps:
 
 ```bash
 rtk proxy syft scan --from docker --output cyclonedx-json --file .local/security/runtime.sbom.json scientist-runtime:review
 rtk proxy trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output .local/security/runtime.vulns.json scientist-runtime:review
 ```
 
-The named tag is a local build whose recorded immutable image ID/digest appears in the report; repeat for API, database, AIStor and required scanner/build images. Supply the exact AIStor/database digest from deployment configuration, not a mutable latest tag. Validate coverage includes OS packages, installed Python/runtime dependencies and frontend/build lockfiles. Inspect current advisories and applicability; patch unmitigated applicable critical/high findings. A database/scanner outage or unsupported package ecosystem is an explicit evidence gap.
+The named tag is a local build whose recorded immutable image ID/digest appears in the report; repeat for API, database, MinIO and required scanner/build images. Supply the exact MinIO/database digest from deployment configuration, not a mutable latest tag. Validate coverage includes OS packages, installed Python/runtime dependencies and frontend/build lockfiles. Inspect current advisories and applicability; patch unmitigated applicable critical/high findings. A database/scanner outage or unsupported package ecosystem is an explicit evidence gap.
 
 - [ ] **3. Prove the live paper workflow and redact evidence.** Owner configures a selected provider key through the actual local Settings UI; do not request the key in chat. Run one explicit small paper question under a visible approved token/time ceiling. Check real scholarly source metadata, citation identifiers and access labels, approve/review stages, preserve partial outcomes where relevant, publish one selected result, and follow a citation to its known source. Record provider/model identifier, configured ceiling, actual reported usage, source retrieval dates and outcome without question/private file/secret payloads. No third-party paid analyses or peers are called without their explicit data/scope approval.
 

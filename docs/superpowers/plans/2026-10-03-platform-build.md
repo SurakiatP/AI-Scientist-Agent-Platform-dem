@@ -4,15 +4,15 @@
 
 **Goal:** Deliver a local scientific workspace that searches papers and synthesizes cited evidence through approved, isolated, recoverable runs, with scoped MCP and bidirectional A2A access.
 
-**Architecture:** React communicates with one Python domain through REST and persisted stage events. PostgreSQL owns lifecycle, approvals, grants, queue leases and effect/budget records; MinIO AIStor Free stores immutable bytes. A trusted supervisor launches run containers, and a separate credential-holding broker enforces their permitted external effects.
+**Architecture:** React communicates with one Python domain through REST and persisted stage events. PostgreSQL owns lifecycle, approvals, grants, queue leases and effect/budget records; open-source MinIO stores immutable bytes. A trusted supervisor launches run containers, and a separate credential-holding broker enforces their permitted external effects.
 
-**Tech Stack:** Python 3.13, FastAPI, PostgreSQL, AIStor Free single-node, Docker, React, TypeScript and Vite. Inspected protocol candidates are MCP specification 2026-07-28 / mcp 2.3.0 and A2A specification 1.0.1 / a2a-sdk 1.2.1.
+**Tech Stack:** Python 3.13, FastAPI, PostgreSQL, open-source MinIO single-node, Docker, React, TypeScript and Vite. Inspected protocol candidates are MCP specification 2026-07-28 / mcp 2.3.0 and A2A specification 1.0.1 / a2a-sdk 1.2.1.
 
 **Spec:** [Runtime and integration specification](../specs/2026-10-03-platform-runtime-design.md), [backend foundation](../specs/2026-10-03-backend-foundation-design.md), and [DESIGN.md](../../../DESIGN.md). Owner approved written system specification on 2026-10-03. This plan awaits written review; no product code has been created.
 
 ## Global Constraints
 
-- “Use **MinIO AIStor Free single-node**, selected by the owner, rather than the archived Community distribution.”
+- “Use **local open-source MinIO single-node**, as selected by the owner; the runtime specification pins the maintained AGPL fork and unchanged CVE/build gates.”
 - “Recovery means continuation from committed operation boundaries.”
 - “Do not automatically resend an LLM/read request merely because it is a read, and never blindly resend a state-changing request.”
 - “Workers use an isolated internal network, with no direct internet, host/LAN, PostgreSQL, storage, metadata-service or Docker access.”
@@ -24,7 +24,7 @@
 - “The existing `.venv` reports Python 3.9.6, while `.python-version` selects 3.13.6.” Recreate it only during approved execution, after preserving any needed local environment information without reading secret values.
 - Runtime commit: `bd0affe5e5f723579df8902852f5d0c47795f355`; reviewed catalog revision: `154988403bb5a18e9d3c0ce4e6d5e2e4b184a298`; initial skill set: paper-lookup, literature-review, scientific-writing.
 - App name is **AI Scientist Agent Platform**. TH/EN toggle at the upper right of every page; Ocean Blue; Light/Dark/System. Display research stages rather than runtime names, agent identities, skill/tool identifiers or hidden reasoning.
-- Shell commands start with `rtk`; unsupported commands use `rtk proxy`. Never delegate secrets, environment files, license contents, private data or production exports.
+- Shell commands start with `rtk`; unsupported commands use `rtk proxy`. Never delegate secrets, environment files, private credentials, private data or production exports.
 - No automatic shared Docker/Colima upgrade/restart, vendor license acceptance, public deployment, push or merge. The parent owns shared manifests, migrations, contract integration, Git commits and Hub updates at wave boundaries.
 
 ## Review Focus
@@ -51,7 +51,7 @@ No claim that all 177 catalog entries are installed or validated. Do not add acc
 
 Keep source in one repository. At the owner's subsequent instruction, branch `feat/scientist-platform` was created from local `develop` at `ebda91f361298858cdc9e7748306986ef3ba9392` on 2026-10-03, using the owner's `feat/...` naming preference (bug fixes use `fix/...`). Continue editing that branch in this checkout. The pre-existing `.python-version` remains untracked during planning; B1 reconciles it with a patched compatible Python 3.13 interpreter before tracking it during approved setup. If execution later needs a separate managed worktree, use the git-worktrees skill and existing-artifact checks with this explicit branch state, never the remote default branch. Develop is the eventual integration target; do not merge/push before the completed work is reviewed.
 
-`delegate-build` is the user-selected execution method. After plan review, dispatch a planner using **gpt-6.1-sol / high**, workers using **gpt-6-luna / high**, and an independent final reviewer using **gpt-6.1-sol / high**. Announce each role before dispatch. The planner validates ownership/dependencies against these plans; it does not silently change approved contracts or safety gates.
+`delegate-build` is the user-selected execution method. Following owner plan approval, dispatch a planner using **gpt-6.1-sol / high**, workers using **gpt-6-luna / high**, and an independent final reviewer using **gpt-6.1-sol / high**. Announce each role before dispatch. The planner validates ownership/dependencies against these plans; it does not silently change approved contracts or safety gates.
 
 There are three worker slots beside the parent. Only tasks in the same row may overlap. A worker owns exactly the files in its task; root manifests/lockfiles are edited only by the parent or their designated single task. No concurrent Git commits, shared test-database migrations, Docker daemon reconfiguration or changes to the same file. Use distinct test database names and container labels per task.
 
@@ -61,14 +61,14 @@ There are three worker slots beside the parent. Only tasks in the same row may o
 | 1 | B1 | Runnable database/typed contracts; parent locks dependencies and publishes TS contract |
 | 2 | B2, F1 | B1 contracts fixed; separate backend vs frontend manifests |
 | 3 | B3, B4, F2 | B2 authorization/ledger API; no shared migrations or lockfile edits |
-| 4 | B5 only | B3/B4; patched engine, owner-obtained AIStor license, scanned candidate images; actual containment/recovery tests pass |
+| 4 | B5 only | B3/B4; patched engine, validated pinned OSS MinIO build, scanned candidate images; actual containment/recovery tests pass |
 | 5 | B6, F3 | B5 integration validated; F3 uses B1 generated DTO fixtures independently of B6 implementation |
 | 6 | I1, I2 | B6 domain resource functions available; parent resolves both SDK dependencies once before dispatch |
 | 7 | F4 | Actual B6/I1/I2 services and F3 UI ready; generated contract remains parent-owned |
 | 8 | I3 | All component tasks integrated; real local deployment and backup/restore proof |
 | 9 | I4, then independent reviewer | Complete acceptance, live provider configuration and dated vulnerability evidence |
 
-B4's object/parser tests and F2's fixtures can be written before licensed storage is available. Their real AIStor acceptance remains pending and blocks B5, I3 and release acceptance. An unavailable license/fixed engine/provider key is recorded as a concrete prerequisite, never hidden by substituting a different storage backend or asserting fixture success proves a live workflow.
+B4's object/parser tests and F2's fixtures can be written before the validated OSS storage build is available. Their real MinIO acceptance remains pending and blocks B5, I3 and release acceptance. An unavailable validated storage build/fixed engine/provider key is recorded as a concrete prerequisite, never hidden by substituting a different storage backend or asserting fixture success proves a live workflow.
 
 ## Wave protocol and commit policy
 
@@ -92,7 +92,7 @@ B4's object/parser tests and F2's fixtures can be written before licensed storag
 | Project/session/file/finding routes, real SSE, decisions, history | B6, F2–F4 |
 | MCP 2026-07-28 profile and application cursors | I1 |
 | A2A v1 inbound/outbound, approval, cancellation/reconciliation | I2 |
-| AIStor license/features, patched hosts/images, encrypted storage, backup/restore | B4, I3 |
+| MinIO source/build provenance, patched hosts/images, encrypted storage, backup/restore | B4, I3 |
 | Lockfiles, SBOM, transitive CVEs, containment and live acceptance | B1, B5, I3, I4 |
 
 ## Plan review and handoff

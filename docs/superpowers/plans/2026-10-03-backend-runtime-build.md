@@ -306,7 +306,7 @@ LLM output limits and conservative input/output reservations precede dispatch. S
 
 **Owns:** `backend/src/scientist/{objects,files}.py`; `runtime/prepare.py`; `backend/tests/test_objects.py`; `backend/tests/test_file_preparation.py`. Parent owns any dependency-lock changes.
 
-**Dependencies:** B1/B2; production worker containment supplied by B5. Tests use a deterministic object transport until the separately gated real AIStor check.
+**Dependencies:** B1/B2; production worker containment supplied by B5. Tests use a deterministic object transport until the separately gated real MinIO check.
 
 **Interfaces:** `objects.put(db, project_id: UUID, content: BinaryIO, content_type: str) -> ObjectRef`; `objects.open_verified(ref: ObjectRef) -> context manager[BinaryIO]`; `objects.delete_unreferenced(db, key: str) -> bool`; `files.attach(db, principal: Principal, project_id: UUID, filename: str, content: BinaryIO) -> UUID`; `files.mark_prepared(db, file_id: UUID, extracted: ObjectRef, status: Literal['ready','failed']) -> None`; `files.publish(db, owner: Principal, run_id: UUID, object_keys: list[str], expected_project_revision: int, publication_key: str) -> list[UUID]`. `prepare.py` reads one approved local file and writes bounded extracted text/metadata to its own workspace; it accepts no arbitrary command or network destination.
 
@@ -328,7 +328,7 @@ def test_zip_expansion_is_bounded(tmp_path):
 
 Define `prepare_local_file(path: Path, output_dir: Path) -> dict` in `runtime/prepare.py`. Test traversal/symlink archives, empty/corrupt PDFs, CSV formula text, JSON depth/size limits, XLSX external links/macros, mismatched extensions/MIME, interrupted upload, missing bytes and two concurrent publication revisions. Parser output never becomes a policy instruction.
 
-- [ ] **2. Observe RED.** Run `rtk proxy uv run pytest backend/tests/test_objects.py backend/tests/test_file_preparation.py -q`. Resolve reviewed parser versions through parent before modifying the shared lockfile. Unit fake storage is explicitly identified as fake, not evidence that licensed AIStor is operational.
+- [ ] **2. Observe RED.** Run `rtk proxy uv run pytest backend/tests/test_objects.py backend/tests/test_file_preparation.py -q`. Resolve reviewed parser versions through parent before modifying the shared lockfile. Unit fake storage is explicitly identified as fake, not evidence that validated open-source MinIO is operational.
 
 - [ ] **3. Implement immutable keys and preparation limits.** Keys include project UUID plus content SHA-256 and a unique logical reference; never overwrite existing bytes. Verify uploaded size/hash before creating a ready version record. Support the designed PDF, CSV, XLSX, JSON, TXT and Markdown flow with an initial advertised 25 MiB upload cap, bounded extracted text/rows/columns/decompressed bytes and parser timeout/memory limits. Validate zip metadata before XLSX parsing; disable external links, macros and formula evaluation. CSV/JSON/text handling uses stdlib. PDF/XLSX third-party parsers run only in the preparation sandbox when processing actual uploaded content.
 
@@ -338,13 +338,13 @@ Publication writes new logical versions under the expected project revision, ret
 
 Initial retention is explicit owner-directed deletion, with no timed automatic purge. Retain active/retained run input and checkpoint references and every object referenced by retained backup manifests; a shared-file tombstone removes it from future context without destroying those versions. Cleanup of an unreferenced object is an authenticated maintenance operation and cannot run concurrently with a coordinated backup. Advertise disk pressure as a readiness/queue condition rather than deleting research data automatically.
 
-- [ ] **4. Verify and parent-commit.** Run object/parser tests. After license/host prerequisites and image checks, verify actual Free PUT/GET/ordinary DELETE, corrupt/missing references and license-unavailable behavior in a task-specific bucket. If those prerequisites are absent, record the real-store acceptance as pending and block B5. Commit `feat: preserve immutable research files and provenance`.
+- [ ] **4. Verify and parent-commit.** Run object/parser tests. After source/host prerequisites and image checks, verify actual MinIO PUT/GET/ordinary DELETE, corrupt/missing references and storage-unavailable behavior in a task-specific bucket. If those prerequisites are absent, record the real-store acceptance as pending and block B5. Commit `feat: preserve immutable research files and provenance`.
 
 ### B5 — Prove containment, runtime continuation and stopping
 
 **Owns:** `runtime/{Dockerfile,entrypoint.py,skills-manifest.json}`; `backend/src/scientist/{supervisor,checkpoints,runtime_adapter}.py`; `backend/tests/test_runtime_recovery.py`; `backend/tests/test_containment.py`. Parent owns deployment/network integration and runtime dependency lock/SBOM review. No native protocol gateway is exposed.
 
-**Dependencies:** B3/B4; fixed/mitigated engine, owner-obtained license, encrypted storage prerequisites and image scans. **This is the blocking feasibility tranche.**
+**Dependencies:** B3/B4; fixed/mitigated engine, validated pinned OSS storage build, encrypted storage prerequisites and image scans. **This is the blocking feasibility tranche.**
 
 **Interfaces:**
 
@@ -382,7 +382,7 @@ def test_lost_remote_response_requires_owner(runtime_fixture):
 
 `runtime_fixture` in this file composes real database/storage/broker/supervisor with a deterministic provider, isolated containers and per-test labels. Include direct IP/IPv6/DNS internet/host/LAN/metadata/socket denial, cross-run capability rejection, filesystem escape, package denial, hard CPU/memory/PID/disk enforcement, two runs in one project plus another project, supervisor restart, compressed context, corrupted checkpoint, stale lease, full isolated deployment restart, and hung-tool stop/completion races.
 
-- [ ] **2. Observe RED under safe prerequisites.** Check `rtk proxy docker version --format '{{.Server.Version}}'` against the current advisory and verify the licensed storage readiness without printing license contents. Do not pull images or run live sandbox tests on an unresolved affected engine. Run `rtk proxy uv run pytest backend/tests/test_containment.py backend/tests/test_runtime_recovery.py -q`; initial RED must identify missing enforcement/continuation. Shared host remediation remains operator-owned.
+- [ ] **2. Observe RED under safe prerequisites.** Check `rtk proxy docker version --format '{{.Server.Version}}'` against the current advisory and verify the validated open-source storage readiness without printing private credentials. Do not pull images or run live sandbox tests on an unresolved affected engine. Run `rtk proxy uv run pytest backend/tests/test_containment.py backend/tests/test_runtime_recovery.py -q`; initial RED must identify missing enforcement/continuation. Shared host remediation remains operator-owned.
 
 - [ ] **3. Build the smallest enforceable worker integration.** Fetch the exact Hermes/catalog revisions inside the image build, retain required attribution, lock actual runtime dependencies and review the three complete skill directories/resources. Disable runtime self-update, host skill mounts and native gateway endpoints. Use private run `HERMES_HOME`; private SQLite is not the platform state.
 
@@ -394,7 +394,7 @@ Use `SKIP LOCKED` leases with increasing generations. Capture checkpoint bytes a
 
 Cancellation closes dispatch, signals worker, then forcibly terminates after a documented bounded grace. Remain stopping until executor death is confirmed; preserve completed when it wins. Finish/reconcile sent broker requests separately from the canceled container.
 
-- [ ] **4. Verify the gate and parent-commit.** Run both actual-container suites and B3/B4 checks, retaining compact container/network/cgroup evidence without sensitive payloads. Explicitly fail if a check is skipped for unsupported driver, license, missing image scan, unsupported runtime continuation or unknown state. Commit `feat: enforce isolated checkpointed run execution` only with a truthful gate record. Parent stops dependent waves if this tranche fails.
+- [ ] **4. Verify the gate and parent-commit.** Run both actual-container suites and B3/B4 checks, retaining compact container/network/cgroup evidence without sensitive payloads. Explicitly fail if a check is skipped for unsupported driver, storage build, missing image scan, unsupported runtime continuation or unknown state. Commit `feat: enforce isolated checkpointed run execution` only with a truthful gate record. Parent stops dependent waves if this tranche fails.
 
 ### B6 — Paper workflow, research resources and REST event delivery
 
