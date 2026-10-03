@@ -167,3 +167,14 @@ def test_concurrent_reservations_respect_limit_and_actual_overage_is_recorded(db
         assert check.execute(text("SELECT usage_tokens, reserved_tokens FROM runs WHERE id = :id"), {"id": run_id}).one() == (20, 0)
         with pytest.raises(ValueError, match="budget exhausted"):
             reserve_tokens(check, run_id, 1)
+
+
+def test_followup_migration_stores_time_limit_and_message_order(db, project_session):
+    columns = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'runs' AND column_name = 'elapsed_limit_ms'")).all()
+    assert columns == [("elapsed_limit_ms",)]
+    project_id, session_id = project_session
+    sequences = []
+    for role in ("user", "assistant"):
+        sequences.append(db.execute(text("INSERT INTO messages (id, project_id, session_id, role, content) VALUES (:id, :project, :session, :role, 'test message') RETURNING sequence"), {"id": uuid4(), "project": project_id, "session": session_id, "role": role}).scalar_one())
+    assert sequences[0] < sequences[1]
+    assert db.execute(text("SELECT role FROM messages WHERE session_id = :session ORDER BY sequence"), {"session": session_id}).scalars().all() == ["user", "assistant"]
