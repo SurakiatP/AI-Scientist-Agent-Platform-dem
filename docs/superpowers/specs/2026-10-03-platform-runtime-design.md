@@ -2,7 +2,7 @@
 
 Date: 2026-10-03 (Asia/Bangkok)
 
-Status: Technical specification prepared for owner review. The owner selected MinIO AIStor Free single-node and pausing only an unknown-outcome step for an owner decision. Written-spec and implementation-plan review remain outstanding. Runtime feasibility and acceptance must be demonstrated during implementation; no product implementation or deployment is authorized by this document alone.
+Status: Written specification approved by the owner on 2026-10-03. The owner selected MinIO AIStor Free single-node and pausing only an unknown-outcome step for an owner decision. Implementation-plan review remains outstanding. Runtime feasibility and acceptance must be demonstrated during implementation; no product implementation or deployment is authorized by this document alone.
 
 ## Scope and authoritative documents
 
