@@ -4,6 +4,8 @@ Date: 2026-10-03 (Asia/Bangkok)
 
 Status: Record of the architectural direction, policies, and workflow approved in conversation. Detailed backend contracts and recovery behavior are still being designed. This document has not yet completed written-spec review and does not authorize product implementation.
 
+The companion [runtime and integration specification](2026-10-03-platform-runtime-design.md) records source-inspected constraints, proposed operational contracts, security acceptance checks, and the owner's subsequent choices of MinIO AIStor Free single-node and pausing unknown-outcome steps for an owner decision. It is prepared for written review; runtime verification remains an implementation prerequisite before dependent features are accepted.
+
 ## Intended outcome
 
 Build a multidisciplinary scientific assistant whose first complete workflow searches papers, evaluates accessible evidence, and produces a synthesis with traceable citations. Begin with one owner on a local machine. Support future server deployment and authorized clients on other machines through MCP and bidirectional A2A.
