@@ -276,7 +276,8 @@ def _capture_snapshot(db: Session, project_id: UUID, session_id: UUID, request: 
             SELECT picked.id AS requested_id, picked.ordinality, v.id, v.filename, v.object_key,
                    v.sha256, v.size, v.content_type, v.state
             FROM selected_inputs picked
-            LEFT JOIN file_versions v ON v.id = picked.id AND v.project_id = :project
+          LEFT JOIN file_versions v ON v.id = picked.id AND v.project_id = :project
+                                   AND v.tombstoned_at IS NULL
         ), files AS (
             SELECT COALESCE(jsonb_agg(jsonb_build_object(
                        'requested_id', requested_id::text, 'id', id::text, 'filename', filename,

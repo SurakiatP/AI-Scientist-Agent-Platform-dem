@@ -225,6 +225,19 @@ def test_snapshot_reads_one_mvcc_version_across_concurrent_shared_context_edit(d
             )
 
 
+def test_tombstoned_file_cannot_be_selected_for_a_new_run(db, project_session):
+    project_id, session_id = project_session
+    file_id = uuid4()
+    digest = sha256(b"retained fixture").hexdigest()
+    db.execute(text("""INSERT INTO file_versions
+        (id,project_id,filename,object_key,size,content_type,state,sha256,tombstoned_at)
+        VALUES (:id,:project,'retained.txt',:key,16,'text/plain','ready',:sha,now())"""),
+        {"id":file_id,"project":project_id,"key":f"{project_id}/{digest}","sha":digest})
+    with pytest.raises(DomainError, match="not_found"):
+        submit_run(db, Principal(identity=uuid4(), kind="owner"), project_id, session_id,
+                   "tombstone-fixture", "question", [file_id], uuid4(), "fixture")
+
+
 def test_ready_file_without_object_metadata_fails_closed(db, project_session):
     project_id, session_id = project_session
     file_id = uuid4()
