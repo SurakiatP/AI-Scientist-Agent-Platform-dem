@@ -1,5 +1,9 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, NavLink, Outlet, Route, Routes, useLocation, useNavigationType } from 'react-router-dom';
+import Projects from './Projects';
+import ProjectDetails from './ProjectDetails';
+import Library from './Library';
+import RunHistory from './RunHistory';
 import Landing from './Landing';
 import { AppearanceSettings, usePreferences } from './preferences';
 import { t } from './locales';
@@ -30,9 +34,12 @@ function PageFocus() {
 export default function App() {
   return <Routes><Route element={<AppShell />}>
     <Route index element={<LandingRoute />} />
-    <Route path="projects" element={<WorkspacePage titleKey="workspaceTitle" textKey="workspaceUnavailable" />} />
-    <Route path="sources" element={<WorkspacePage titleKey="sourcesTitle" textKey="workspaceUnavailable" />} />
-    <Route path="history" element={<WorkspacePage titleKey="historyTitle" textKey="workspaceUnavailable" />} />
+    <Route path="projects" element={<Projects />} />
+    <Route path="projects/:projectId" element={<ProjectDetails />} />
+    <Route path="projects/:projectId/library" element={<Library />} />
+    <Route path="projects/:projectId/runs" element={<RunHistory />} />
+    <Route path="sources" element={<Library />} />
+    <Route path="history" element={<RunHistory />} />
     <Route path="settings" element={<WorkspacePage titleKey="settingsTitle" textKey="settingsUnavailable" />} />
     <Route path="settings/appearance" element={<AppearanceRoute />} />
     <Route path="*" element={<WorkspacePage titleKey="workspaceTitle" textKey="workspaceUnavailable" />} />
