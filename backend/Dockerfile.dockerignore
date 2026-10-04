@@ -1,0 +1,13 @@
+# This allowlist applies to the root context used with -f backend/Dockerfile.
+**
+!backend/
+!backend/src/
+!backend/src/scientist/
+!backend/src/scientist/*.py
+!backend/migrations/
+!backend/migrations/*.sql
+!runtime/
+!runtime/__init__.py
+!runtime/entrypoint.py
+!runtime/skills-manifest.json
+!runtime/prepare.py
