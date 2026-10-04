@@ -37,6 +37,8 @@ Per-run dispatch template and launch files are written under private_dir and rem
 
 Deliberate divergences: `b5_matrix_common.py` / `b5_matrix_budget.py` (W5b, ADR-014): the owner-retry case no longer passes `dispatch_is_inactive` to `broker.configure` (the proof is registered by `supervisor.configure`) and submits the retry as a REST `POST /runs/{id}/decisions` through `create_app()` with both routers instead of calling `broker.resolve_unknown` directly; all assertions are unchanged, so their sha256 below no longer matches. The live files that now differ from the reviewed originals are `b5_matrix_common.py`, `b5_matrix_budget.py` and three `b5_native_*` scripts (the parent's single `SCIENTIST_PROVIDER_ENDPOINT` line); the sha256 table records the reviewed originals, not the current files. `b5_containment_acceptance.py` now differs from the reviewed original (its sha256 below no longer matches). `create_network` skips 172.29.x subnets already used by existing Docker networks instead of trusting the UUID-derived one. `b5_matrix_checkpoint_faults.py` and `b5_supervisor_matrix.py` also differ: a storage outage now expects `storage_unavailable` and no `reason_fixture_attested`.
 
+Fixture Dockerfiles are re-pinned to the server image they were last built from (server -09 `dac5a1ff…`, 2026-10-05); the table below records the reviewed -08 originals.
+
 | Original | New | sha256 |
 |---|---|---|
 | `b5_matrix_run_serial.sh` | `b5_matrix_run_serial.sh` | `d58a36eda57e0a7f2cba0f130dd5af3a4389c514c040570c674e66ad333bc246` |
