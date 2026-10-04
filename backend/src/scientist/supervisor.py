@@ -734,12 +734,14 @@ def recover(db: Session, run_id: UUID) -> RunView:
                             _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
                     else:
                         _queue_recovered_run(db, run_id, generation, row["revision"])
-                except Exception:
+                except Exception as exc:
+                    reason = ("storage_unavailable" if isinstance(exc, DomainError) and exc.code == "storage_unavailable"
+                              else "checkpoint_integrity_unproven")
                     db.execute(text("""
                         UPDATE runs SET state='waiting_input',
-                            waiting_reason='checkpoint_integrity_unproven',
+                            waiting_reason=:reason,
                             lease_expires_at=NULL WHERE id=:run AND generation=:generation
-                    """), {"run": run_id, "generation": generation})
+                    """), {"run": run_id, "generation": generation, "reason": reason})
                     _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
             else:
                 _queue_recovered_run(db, run_id, generation, row["revision"])

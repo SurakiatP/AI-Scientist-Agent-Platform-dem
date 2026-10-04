@@ -908,3 +908,52 @@ def test_recover_cancel_requested_moves_reserved_operation_to_unknown(db, projec
     assert supervisor.recover(db, run.run_id).state == "canceled"
     after = _ops_and_budget(db, run.run_id)
     assert after[0][0] == "unknown" and after[0][1:] == before[0][1:] and after[1] == before[1] == 7
+
+
+def test_restore_reraises_storage_outage_but_corruption_stays_integrity(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    from scientist.auth import DomainError
+    run = _prepare_recovery_run(db, project_session, object_fixture, tmp_path)
+    manifest = checkpoints.CheckpointManifest.model_validate(db.execute(
+        text("SELECT manifest FROM checkpoints WHERE run_id=:run"), {"run": run.run_id}).scalar_one())
+    good = objects._client
+
+    def outage():
+        raise ConnectionError("storage down")
+
+    monkeypatch.setattr(objects, "_client", outage)
+    with pytest.raises(DomainError) as outage_error:
+        checkpoints.restore(db, manifest, tmp_path / "r1")
+    assert outage_error.value.code == "storage_unavailable"
+    monkeypatch.setattr(objects, "_client", good)
+    object_fixture.data[(objects.BUCKET, manifest.workspace[0].key)] = b"corrupt"
+    with pytest.raises(checkpoints.CheckpointIntegrityError):
+        checkpoints.restore(db, manifest, tmp_path / "r2")
+
+
+def test_recover_during_storage_outage_waits_then_requeues_after_it_returns(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    run = _prepare_recovery_run(db, project_session, object_fixture, tmp_path)
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=object(), dispatch=object()))
+    good = objects._client
+
+    def outage():
+        raise ConnectionError("storage down")
+
+    monkeypatch.setattr(objects, "_client", outage)
+    recovered = supervisor.recover(db, run.run_id)
+    assert (recovered.state, recovered.waiting_reason) == ("waiting_input", "storage_unavailable")
+    monkeypatch.setattr(objects, "_client", good)
+    recovered = supervisor.recover(db, run.run_id)
+    assert (recovered.state, recovered.waiting_reason) == ("queued", None)
+
+
+def test_restore_missing_object_is_integrity_not_outage(db, project_session, object_fixture, tmp_path):
+    run = _prepare_recovery_run(db, project_session, object_fixture, tmp_path)
+    manifest = checkpoints.CheckpointManifest.model_validate(db.execute(
+        text("SELECT manifest FROM checkpoints WHERE run_id=:run"), {"run": run.run_id}).scalar_one())
+    del object_fixture.data[(objects.BUCKET, manifest.workspace[0].key)]
+    with pytest.raises(checkpoints.CheckpointIntegrityError):
+        checkpoints.restore(db, manifest, tmp_path / "r")

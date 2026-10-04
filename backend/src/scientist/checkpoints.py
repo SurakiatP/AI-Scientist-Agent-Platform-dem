@@ -15,6 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scientist import objects
+from scientist.auth import DomainError
 from scientist.contracts import CheckpointManifest, ObjectRef
 from scientist.runtime_contracts import (
     MAX_CONTEXT_BYTES,
@@ -245,10 +246,21 @@ def restore(db: Session, manifest: CheckpointManifest, workspace_dir: Path) -> b
         return context_bytes
     except CheckpointIntegrityError:
         raise
+    except DomainError as exc:
+        if exc.code == "storage_unavailable" and not _object_missing(exc.__cause__):
+            raise  # An outage is not corruption; callers wait instead of failing closed.
+        raise CheckpointIntegrityError("checkpoint restore validation failed") from exc
     except Exception as exc:
         # Validation, storage and filesystem errors fail closed before any runtime
         # is allowed to import or execute restored state.
         raise CheckpointIntegrityError("checkpoint restore validation failed") from exc
+
+
+def _object_missing(cause: BaseException | None) -> bool:
+    """A 404 from the object store means the checkpoint object is gone (integrity), not an outage."""
+    error = getattr(cause, "response", None)
+    error = error if isinstance(error, dict) else {}
+    return str(error.get("Error", {}).get("Code")) in {"404", "NoSuchKey", "NotFound"}
 
 
 def _read_workspace(root: Path) -> tuple[list[tuple[str, str, bytes]], int]:
