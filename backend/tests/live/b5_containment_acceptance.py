@@ -185,11 +185,40 @@ def exec_python(cid: str, code: str, *args: str, timeout: int = 20) -> str:
     return docker("exec", cid, "/opt/python/bin/python3.14", "-c", code, *args, timeout=timeout)
 
 
+def pick_free_third_octet(start: int, used: set[int]) -> int:
+    """First unused 172.29.<third>.0/29 octet in 32..221, scanning from `start`."""
+    for offset in range(190):
+        third = 32 + (start + offset) % 190
+        if third not in used:
+            return third
+    raise HarnessError("no free 172.29.x subnet for the acceptance network")
+
+
+def used_third_octets() -> set[int]:
+    """172.29.x subnets already held by any Docker network (same scan as supervisor.create_run_network)."""
+    used: set[int] = set()
+    for network_id in docker("network", "ls", "-q").splitlines():
+        if not network_id:
+            continue
+        try:
+            configs = json.loads(docker("network", "inspect", "--format", "{{json .IPAM.Config}}", network_id))
+        except Exception:
+            continue
+        for config in configs or []:
+            subnet = config.get("Subnet") or ""
+            if subnet.startswith("172.29."):
+                try:
+                    used.add(int(subnet.split(".")[2]))
+                except (IndexError, ValueError):
+                    continue
+    return used
+
+
 def create_network(run_id: uuid.UUID, project_id: uuid.UUID, suffix: str,
                    owned_networks: list[str]) -> tuple[str, ipaddress.IPv4Network, ipaddress.IPv6Network]:
-    # UUID-derived /29 and /64 avoid fixed-subnet collisions; Docker validates overlap.
+    # UUID-derived start, advanced past subnets other networks already use. Never deletes networks.
     digest = hashlib.sha256(run_id.bytes + suffix.encode()).digest()
-    v4 = ipaddress.ip_network(f"172.29.{32 + (digest[0] % 190)}.0/29")
+    v4 = ipaddress.ip_network(f"172.29.{pick_free_third_octet(digest[0] % 190, used_third_octets())}.0/29")
     v6 = ipaddress.ip_network(f"fd42:{digest[1]:x}{digest[2]:x}:{digest[3]:x}::/64")
     name = f"b5-accept-{run_id.hex[:12]}-{suffix}"
     docker("network", "create", "--driver", "bridge", "--internal", "--ipv6",

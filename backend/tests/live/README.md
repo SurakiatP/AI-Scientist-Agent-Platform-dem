@@ -35,6 +35,8 @@ Per-run dispatch template and launch files are written under private_dir and rem
 
 ## Provenance (original under ignored `.local/` -> here, sha256 of the original)
 
+Deliberate divergences: `b5_containment_acceptance.py` now differs from the reviewed original (its sha256 below no longer matches). `create_network` skips 172.29.x subnets already used by existing Docker networks instead of trusting the UUID-derived one. `b5_matrix_checkpoint_faults.py` and `b5_supervisor_matrix.py` also differ: a storage outage now expects `storage_unavailable` and no `reason_fixture_attested`.
+
 | Original | New | sha256 |
 |---|---|---|
 | `b5_matrix_run_serial.sh` | `b5_matrix_run_serial.sh` | `d58a36eda57e0a7f2cba0f130dd5af3a4389c514c040570c674e66ad333bc246` |

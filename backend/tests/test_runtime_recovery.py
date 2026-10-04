@@ -950,6 +950,23 @@ def test_recover_during_storage_outage_waits_then_requeues_after_it_returns(
     assert (recovered.state, recovered.waiting_reason) == ("queued", None)
 
 
+def test_containment_network_pick_skips_used_subnets(monkeypatch):
+    import sys
+    from unittest.mock import MagicMock
+    monkeypatch.syspath_prepend(str(Path(__file__).parent / "live"))
+    monkeypatch.setitem(sys.modules, "b5_live_config", MagicMock())
+    sys.modules.pop("b5_containment_acceptance", None)
+    import b5_containment_acceptance as live
+    try:
+        assert live.pick_free_third_octet(0, set()) == 32
+        assert live.pick_free_third_octet(5, {37, 38}) == 39
+        assert live.pick_free_third_octet(189, {221}) == 32  # wraps
+        with pytest.raises(live.HarnessError):
+            live.pick_free_third_octet(0, set(range(32, 222)))
+    finally:
+        sys.modules.pop("b5_containment_acceptance", None)
+
+
 def test_restore_missing_object_is_integrity_not_outage(db, project_session, object_fixture, tmp_path):
     run = _prepare_recovery_run(db, project_session, object_fixture, tmp_path)
     manifest = checkpoints.CheckpointManifest.model_validate(db.execute(
