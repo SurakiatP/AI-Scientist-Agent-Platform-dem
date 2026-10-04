@@ -49,6 +49,10 @@ _EXEC_LABEL = "scientist.platform/executor"
 _KIND_LABEL = "scientist.platform/kind"
 
 
+class DispatchPreLaunchRejected(RuntimeError):
+    """Affirmative immutable-validation rejection raised before any launch intent."""
+
+
 @dataclass(frozen=True)
 class ExecutorRef:
     """Immutable physical identity used when proving an executor inactive."""
@@ -74,6 +78,7 @@ class DispatchRuntime(Protocol):
     def start(
         self, db: Session, run_id: UUID, generation: int, network: str,
         broker_ip: str, executor_id: UUID, process_incarnation: UUID,
+        *, before_mutation: Callable[[str, str | None], None],
     ) -> ExecutorRef: ...
 
     def find(
@@ -283,13 +288,49 @@ def start(db: Session, run_id: UUID, generation: int) -> str:
     engine_id = cfg.engine.engine_id()
     _bind_engine(db, worker_id, engine_id)
     dispatch_attempted = False
+    dispatch_intent = False
+    dispatch_rejected = False
+
+    def _identity_proof(source: str, **extra) -> str:
+        return json.dumps({"source": source, "run_id": str(run_id), "generation": generation,
+                           "executor_id": str(dispatch_id),
+                           "process_incarnation": str(dispatch_incarnation), **extra}, sort_keys=True)
+
+    def before_mutation(dispatch_engine_id: str, _container_id: str | None = None) -> None:
+        # Durable intent precedes every dispatch create/start/connect; failure aborts them.
+        nonlocal dispatch_intent
+        if not dispatch_engine_id or len(dispatch_engine_id) > 200:
+            raise RuntimeError("engine identity is invalid")
+        try:
+            changed = db.execute(text("""
+                UPDATE runtime_executors SET engine_id=:engine, proof=CAST(:proof AS jsonb), updated_at=now()
+                WHERE id=:id AND run_id=:run AND generation=:generation AND kind='dispatch'
+                  AND process_incarnation=:incarnation AND state='starting' AND container_id IS NULL
+                  AND proof='{}'::jsonb AND (engine_id IS NULL OR engine_id=:engine)
+            """), {"engine": dispatch_engine_id, "id": dispatch_id, "run": run_id,
+                    "generation": generation, "incarnation": dispatch_incarnation,
+                    "proof": _identity_proof("dispatch-launch-intent", engine_id=dispatch_engine_id)}).rowcount
+            if changed != 1:
+                raise RuntimeError("dispatch launch intent was not durably recorded")
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            raise RuntimeError("dispatch launch intent was not durably recorded") from exc
+        dispatch_intent = True
     worker_create_attempted = False
     try:
         network, broker_ip = cfg.engine.create_run_network(run_id, generation, worker_id)
         dispatch_attempted = True
-        dispatch_ref = cfg.dispatch.start(
-            db, run_id, generation, network, broker_ip, dispatch_id, dispatch_incarnation,
-        )
+        try:
+            dispatch_ref = cfg.dispatch.start(
+                db, run_id, generation, network, broker_ip, dispatch_id, dispatch_incarnation,
+                before_mutation=before_mutation,
+            )
+        except DispatchPreLaunchRejected:
+            dispatch_rejected = True
+            raise
+        if not dispatch_intent:
+            raise RuntimeError("dispatch adapter returned without recording launch intent")
         if (dispatch_ref.executor_id, dispatch_ref.process_incarnation, dispatch_ref.run_id,
                 dispatch_ref.generation, dispatch_ref.kind) != (
                 dispatch_id, dispatch_incarnation, run_id, generation, "dispatch"):
@@ -343,12 +384,13 @@ def start(db: Session, run_id: UUID, generation: int) -> str:
         # A partial launch is fenced by exact physical identities before any new
         # generation can obtain authority. Unknown inspection remains paused.
         try:
-            if not dispatch_attempted:
+            if not dispatch_attempted or (dispatch_rejected and not dispatch_intent):
                 db.execute(text("""
                     UPDATE runtime_executors SET state='inactive',
-                        proof='{"source":"dispatch-launch-not-attempted"}'::jsonb,
-                        updated_at=now() WHERE id=:id AND state='starting'
-                """), {"id": dispatch_id})
+                        proof=CAST(:proof AS jsonb), updated_at=now()
+                    WHERE id=:id AND state='starting' AND proof='{}'::jsonb
+                      AND container_id IS NULL AND engine_id IS NULL
+                """), {"id": dispatch_id, "proof": _identity_proof("dispatch-launch-not-attempted")})
                 db.commit()
             if not worker_create_attempted:
                 db.execute(text("""
@@ -985,7 +1027,7 @@ class DockerWorkerEngine:
             (raw_image and image == image_digest)
             or (named_image and named_image.group(1) == image_digest)
         ):
-            raise RuntimeError("worker image does not match configured immutable digest")
+            raise DispatchPreLaunchRejected("worker image does not match configured immutable digest")
         raw = self._docker(
             "image", "inspect", "--format", "{{.Id}}|{{json .RepoDigests}}", image
         )
@@ -997,9 +1039,12 @@ class DockerWorkerEngine:
         if not re.fullmatch(r"sha256:[a-f0-9]{64}", image_id):
             raise RuntimeError("worker image inspection has no immutable image ID")
         if image_id != image_digest:
-            raise RuntimeError("worker image does not match configured immutable digest")
-        if named_image and (not isinstance(repo_digests, list) or image not in repo_digests):
-            raise RuntimeError("worker image does not match configured immutable digest")
+            raise DispatchPreLaunchRejected("worker image does not match configured immutable digest")
+        if named_image:
+            if not isinstance(repo_digests, list):
+                raise RuntimeError("worker image inspection is invalid")
+            if image not in repo_digests:
+                raise DispatchPreLaunchRejected("worker image does not match configured immutable digest")
         return image_id
 
     def create_worker(
