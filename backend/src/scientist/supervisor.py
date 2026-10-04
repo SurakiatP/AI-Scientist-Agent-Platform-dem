@@ -25,7 +25,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from scientist import checkpoints
+from scientist import broker, checkpoints
+from scientist.db import session as database_session
 from scientist.auth import DomainError
 from scientist.contracts import CheckpointManifest, RunView
 from scientist.domain import _event, _run_view
@@ -254,6 +255,23 @@ def configure(
         image_digest=image_digest, skills_digest=skills_digest,
         environment_digest=environment_digest, runtime_commit=runtime_commit,
     )
+    broker.configure_dispatch_inactivity(_dispatch_inactivity_proof)
+
+
+def _dispatch_inactivity_proof(run_id: UUID, operation_id: str, generation: int) -> bool:
+    """Exact proof for one operation: its bound dispatch executor must be durably dead. Fails closed."""
+    try:
+        with database_session() as db:
+            row = db.execute(text("""
+                SELECT e.* FROM operation_executors o JOIN runtime_executors e
+                  ON e.id=o.executor_id AND e.run_id=o.run_id AND e.generation=o.generation
+                WHERE o.run_id=:run AND o.operation_id=:op AND o.generation=:generation
+            """), {"run": run_id, "op": operation_id, "generation": generation}).mappings().one_or_none()
+            if row is None:
+                return False
+            return _dispatch_operation_is_inactive(db, _require_config().dispatch, _executor_ref(row), operation_id)
+    except Exception:
+        return False
 
 
 def claim(db: Session, max_active: int) -> tuple[UUID, int] | None:
@@ -501,7 +519,7 @@ def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
     return _run_view(db, run_id)
 
 
-def recover(db: Session, run_id: UUID) -> RunView:
+def recover(db: Session, run_id: UUID, *, budget_resume: bool = False) -> RunView:
     """Reap exact old worker and broker executors before queueing continuation."""
     cfg = _require_config()
     db.execute(text("SELECT pg_advisory_xact_lock(hashtext('scientist.supervisor.claim'))"))
@@ -509,6 +527,10 @@ def recover(db: Session, run_id: UUID) -> RunView:
     if row is None:
         raise DomainError("not_found", 404)
     if row["state"] in {"completed", "failed", "canceled", "rejected"}:
+        return _run_view(db, run_id)
+    if budget_resume and (row["state"] != "waiting_input" or row["waiting_reason"] != "budget_exhausted"
+                          or row["budget_decision_id"] is not None or row["cancel_requested"]):
+        db.rollback()  # the wait was cleared, superseded or stopped before this resume got the lock
         return _run_view(db, run_id)
     generation = row["generation"]
     executors = db.execute(text("""
@@ -672,6 +694,8 @@ def recover(db: Session, run_id: UUID) -> RunView:
                 lease_expires_at=NULL WHERE id=:run
         """), {"run": run_id, "reason": reason})
         _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
+        if reason == "unknown_outcome":
+            _issue_unknown_decisions(db, run_id, row["revision"])
     else:
         limits.settle_active_interval(db, run_id)
         # Reserved effects have no completed response. The broker must reconcile
@@ -685,6 +709,7 @@ def recover(db: Session, run_id: UUID) -> RunView:
             db.execute(text("UPDATE runs SET state='waiting_input', waiting_reason='unknown_outcome', lease_expires_at=NULL WHERE id=:run"),
                        {"run": run_id})
             _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
+            _issue_unknown_decisions(db, run_id, row["revision"])
         else:
             has_effects = db.execute(text("SELECT 1 FROM operations WHERE run_id=:run LIMIT 1"),
                                      {"run": run_id}).scalar_one_or_none() is not None
@@ -747,6 +772,16 @@ def recover(db: Session, run_id: UUID) -> RunView:
                 _queue_recovered_run(db, run_id, generation, row["revision"])
     db.commit()
     return _run_view(db, run_id)
+
+
+def _issue_unknown_decisions(db: Session, run_id: UUID, revision: int) -> None:
+    """Bind a decision to every undecided, unstaged unknown operation (idempotent)."""
+    for (operation_id,) in db.execute(text("""
+        SELECT operation_id FROM operations WHERE run_id=:run AND state='unknown'
+          AND NOT COALESCE(result ? 'retry_identity', false)
+          AND NOT (COALESCE(result ->> 'usage_known', 'false') = 'true' AND result ? 'ref')
+    """), {"run": run_id}).all():
+        broker._issue_unknown_decision(db, run_id, revision, operation_id)
 
 
 def _queue_recovered_run(db: Session, run_id: UUID, generation: int, revision: int) -> None:

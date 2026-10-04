@@ -13,7 +13,7 @@ usage-ceiling-extension:
      (no second row/event). A second fresh process recovers and the run completes.
   elapsed_extension_event_count = usage.updated events emitted by extension #2's own call (sequence watermark).
 owner-retry: lost response -> unknown_outcome -> restart -> fresh recover (still unknown, no resend) ->
-  broker.resolve_unknown(db, owner, run_id, operation_id, "retry", None) -> claim/start replacement worker ->
+  POST /runs/{id}/decisions (REST, queued retry only) -> claim/start replacement worker ->
   exactly two provider attempts (lost + owner retry), original stays unknown, retry op committed, run completes.
 """
 from __future__ import annotations
@@ -175,9 +175,8 @@ def owner_retry() -> None:
             assert_no_resend(db, h.run_id, base)
         h.stage = "owner_retry"
         h.configure(counter, "retry-owner")
-        with c.session() as db:
-            view = broker.resolve_unknown(db, h.owner, h.run_id, base["operation_id"], "retry", None)
-        need(view.state == "queued", "owner retry did not queue the replacement")
+        view = h.rest_decide("retry", "owner-retry-1")  # REST host only queues; the supervisor/worker path dispatches
+        need(view["state"] == "queued", "owner retry did not queue the replacement")
         gen, worker = h.claim_start()
         code = h.wait(worker)
         need(gen == 2 and code == 0 and h.recover().state == "completed", "replacement worker did not complete")

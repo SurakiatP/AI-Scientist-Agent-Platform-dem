@@ -166,6 +166,16 @@ export interface MessageView {
   run_id?: null | string;
 }
 
+export interface DecisionSubmit {
+  decision_id: string;
+  expected_revision: number;
+  idempotency_key: string;
+  choice: "verified_result" | "retry" | "stop" | "extend";
+  result?: ObjectRef | null;
+  add_tokens?: null | number;
+  add_elapsed_ms?: null | number;
+}
+
 export interface PlanReadyPayload {
   plan_digest: string;
 }

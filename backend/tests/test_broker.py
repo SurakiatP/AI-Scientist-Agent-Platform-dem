@@ -1212,7 +1212,7 @@ def test_unknown_retry_keeps_original_reservation_and_links_new_identity(broker_
     transport.lose_response = True
     original = broker.execute(db, capability, request(run_id))
     transport.lose_response = False
-    resolved = broker.resolve_unknown(db, owner, run_id, "operation-1", "retry", None)
+    resolved = broker.resolve_unknown(db, owner, run_id, "operation-1", "retry", None, queued_only=False)
     rows = db.execute(text("SELECT operation_id, state, reserve_tokens, result FROM operations WHERE run_id = :run ORDER BY created_at, operation_id"),
                       {"run": run_id}).all()
     assert resolved.state == "running"

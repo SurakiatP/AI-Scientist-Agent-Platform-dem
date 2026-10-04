@@ -309,15 +309,11 @@ def test_sse_emits_heartbeat_then_closes_at_bound(client, db, monkeypatch):
     assert ": heartbeat" in raw and "data:" not in raw
 
 
-def test_control_routes_are_separate_stubs_and_nothing_is_mounted():
+def test_control_routes_are_separate_and_nothing_is_mounted():
     paths = {r.path for r in api.router.routes}
     assert not {"/api/v1/runs/{run_id}/approve", "/api/v1/runs/{run_id}/stop", "/api/v1/runs/{run_id}/decisions"} & paths
     control = {r.path: r for r in api.control_router.routes}
     assert set(control) == {"/api/v1/runs/{run_id}/approve", "/api/v1/runs/{run_id}/stop", "/api/v1/runs/{run_id}/decisions"}
-    for route in control.values():
-        with pytest.raises(NotImplementedError):
-            import asyncio
-            asyncio.run(route.endpoint(uuid4()))
 
 
 def test_chunked_upload_over_bound_is_rejected_and_leaves_no_row(client, db, monkeypatch):
@@ -414,6 +410,134 @@ def test_list_runs_orders_by_creation_then_id_and_messages_match_view(client, db
     db.commit()
     (message,) = client.get(f"/api/v1/sessions/{session['id']}/messages").json()
     assert MessageView.model_validate(message).run_id is None
+
+
+# --- Wave 5b control routes: queued-only owner retry through the real REST host ---
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
+
+from scientist import broker, supervisor  # noqa: E402
+from test_broker import broker_fixture, request as op_request  # noqa: E402,F401
+from test_owner_decisions import bind_executor, dispatch, make_unknown  # noqa: E402,F401
+
+
+@pytest.fixture
+def control_client(db, storage):
+    token = token_urlsafe(32)
+    app = create_app(bootstrap_token=token)
+    app.include_router(api.router)
+    app.include_router(api.control_router)
+    c = make_client(app)
+    resp = c.post("/api/v1/bootstrap", headers={"host": "localhost", "origin": "http://localhost"}, json={"token": token})
+    c.headers.update({"host": "localhost", "origin": "http://localhost", "x-csrf-token": resp.json()["csrf_token"]})
+    return c
+
+
+def _decide(c, run_id, decision_id, revision, key="k1", choice="retry", **extra):
+    return c.post(f"/api/v1/runs/{run_id}/decisions", json={
+        "decision_id": str(decision_id), "expected_revision": revision, "idempotency_key": key, "choice": choice, **extra})
+
+
+def _revision(db, run_id):
+    return db.execute(text("SELECT revision FROM runs WHERE id=:r"), {"r": run_id}).scalar_one()
+
+
+def test_rest_retry_queues_and_the_host_never_calls_the_provider(broker_fixture, dispatch, control_client):
+    db, _, run_id, transport, _ = broker_fixture
+    decision_id = make_unknown(db, transport, run_id)
+    assert broker._dispatch_is_inactive is None  # only supervisor.configure registered a proof
+    db.execute(text("UPDATE runs SET lease_expires_at = now() + interval '1 hour' WHERE id=:r"), {"r": run_id})
+    db.commit()  # lease alive: only queued_only keeps the host from dispatching in-process
+    calls = transport.calls
+    r = _decide(control_client, run_id, decision_id, _revision(db, run_id))
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "queued"
+    assert transport.calls == calls
+    row = db.execute(text("SELECT state, result FROM operations WHERE run_id=:r AND operation_id='operation-1'"), {"r": run_id}).one()
+    assert row.state == "unknown" and row.result["retry_identity"] == row.result["retry_request"]["operation_id"]
+    assert row.result["retry_request"]["generation"] == 1 + 1
+    assert db.execute(text("SELECT reserved_tokens FROM runs WHERE id=:r"), {"r": run_id}).scalar_one() == 5
+    assert db.execute(text("SELECT count(*) FROM operations WHERE run_id=:r"), {"r": run_id}).scalar_one() == 1
+
+
+def test_rest_retry_negatives(broker_fixture, dispatch, control_client):
+    db, _, run_id, transport, _ = broker_fixture
+    decision_id = make_unknown(db, transport, run_id, bind=False)
+    rev = _revision(db, run_id)
+    assert _decide(control_client, run_id, decision_id, rev).status_code == 409  # no binding row
+    bind_executor(db, run_id)
+    dispatch.inactive_result = False
+    assert _decide(control_client, run_id, decision_id, rev).status_code == 409  # executor not inactive
+    dispatch.inactive_result = True
+    assert _decide(control_client, run_id, decision_id, rev + 5).status_code == 409  # stale revision
+    assert _decide(control_client, run_id, uuid4(), rev).status_code == 404  # wrong decision
+    assert db.execute(text("SELECT state FROM owner_decisions WHERE decision_id=:d"), {"d": decision_id}).scalar_one() == "pending"
+
+
+def test_rest_two_pending_candidates_conflict(broker_fixture, dispatch, control_client):
+    db, _, run_id, transport, _ = broker_fixture
+    first = make_unknown(db, transport, run_id)
+    db.execute(text("UPDATE runs SET state='running', waiting_reason=NULL, lease_expires_at = now() + interval '1 hour' WHERE id=:r"), {"r": run_id})
+    db.commit()
+    make_unknown(db, transport, run_id, operation_id="operation-2")
+    r = _decide(control_client, run_id, first, _revision(db, run_id))
+    assert r.status_code == 409 and r.json()["code"] == "decision_ambiguous"
+
+
+def test_rest_decision_idempotency(broker_fixture, dispatch, control_client):
+    db, _, run_id, transport, _ = broker_fixture
+    decision_id = make_unknown(db, transport, run_id)
+    rev = _revision(db, run_id)
+    first = _decide(control_client, run_id, decision_id, rev)
+    second = _decide(control_client, run_id, decision_id, rev)  # double click / response-loss replay
+    assert first.status_code == second.status_code == 200 and first.json() == second.json()
+    conflict = _decide(control_client, run_id, decision_id, rev, choice="stop")
+    assert conflict.status_code == 409 and conflict.json()["code"] == "idempotency_conflict"
+    assert db.execute(text("SELECT count(*) FROM owner_decisions WHERE run_id=:r AND state='resolved'"), {"r": run_id}).scalar_one() == 1
+    assert transport.calls == 1
+
+
+def test_rest_concurrent_decisions_make_one_retry(broker_fixture, dispatch, control_client):
+    db, _, run_id, transport, _ = broker_fixture
+    decision_id = make_unknown(db, transport, run_id)
+    rev = _revision(db, run_id)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        codes = [f.result(timeout=20).status_code for f in [pool.submit(_decide, control_client, run_id, decision_id, rev) for _ in range(2)]]
+    assert codes == [200, 200]
+    assert db.execute(text("SELECT count(*) FROM owner_decisions WHERE run_id=:r AND state='resolved'"), {"r": run_id}).scalar_one() == 1
+    assert transport.calls == 1
+
+
+def test_rest_stop_uses_supervisor_fencing(broker_fixture, dispatch, control_client):
+    db, _, run_id, _, _ = broker_fixture
+    r = control_client.post(f"/api/v1/runs/{run_id}/stop")
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] in {"canceled", "stopping", "waiting_input"}
+    assert control_client.post(f"/api/v1/runs/{uuid4()}/stop").status_code == 404
+
+
+def test_rest_approve_route(control_client, db):
+    pid = control_client.post("/api/v1/projects", json={"name": "p", "instructions": ""}).json()["id"]
+    r = control_client.post(f"/api/v1/runs/{uuid4()}/approve", json={"expected_revision": 1, "plan_digest": "x"})
+    assert r.status_code == 404
+    assert control_client.post(f"/api/v1/runs/{uuid4()}/approve", json={}).status_code == 422
+
+
+def test_rest_budget_extend_resumes_and_replays_without_second_extension(broker_fixture, dispatch, control_client):
+    db, _, run_id, _, _ = broker_fixture
+    db.execute(text("UPDATE runs SET token_limit = 10, usage_tokens = 8 WHERE id=:r"), {"r": run_id})
+    db.commit()
+    with pytest.raises(DomainError):
+        broker.execute(db, broker.issue_capability(db, run_id, 1, 300), op_request(run_id, reserve_tokens=5))
+    row = db.execute(text("SELECT budget_decision_id, revision, token_limit FROM runs WHERE id=:r"), {"r": run_id}).one()
+    send = lambda: _decide(control_client, run_id, row.budget_decision_id, row.revision, key="b1", choice="extend",
+                           add_tokens=100, add_elapsed_ms=0)
+    first = send()
+    assert first.status_code == 200, first.text
+    assert first.json()["state"] == "queued" and first.json()["token_limit"] == row.token_limit + 100
+    again = send()  # response-loss replay of the same client body
+    assert again.status_code == 200 and again.json() == first.json()
+    assert db.execute(text("SELECT count(*) FROM run_budget_extensions WHERE run_id=:r"), {"r": run_id}).scalar_one() == 1
+    assert db.execute(text("SELECT token_limit FROM runs WHERE id=:r"), {"r": run_id}).scalar_one() == row.token_limit + 100
 
 
 def test_patch_plan_cannot_add_unconfigured_recipient(client, db, monkeypatch):

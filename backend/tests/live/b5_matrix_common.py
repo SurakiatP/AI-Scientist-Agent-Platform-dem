@@ -55,7 +55,7 @@ import boto3  # noqa: E402
 from botocore.config import Config  # noqa: E402
 from sqlalchemy import create_engine, text  # noqa: E402
 
-from scientist import broker, checkpoints, dispatch_authority, objects, secrets, supervisor  # noqa: E402
+from scientist import broker, checkpoints, objects, secrets, supervisor  # noqa: E402
 from scientist import db as scientist_db  # noqa: E402
 from scientist.contracts import CheckpointManifest, ObjectRef, PlanSpec, Principal  # noqa: E402
 from scientist.db import create_project, create_session, migrate, session  # noqa: E402
@@ -276,16 +276,9 @@ class H:
             launcher_dir=str(self.launch_root / label))
         dispatch = DockerDispatchRuntime(service, engine=self.eng)
 
-        def inactive(run_id: UUID, operation_id: str, generation: int) -> bool:
-            # Trusted physical-death proof for owner decisions (broker._quiescent): exact dispatch executor row +
-            # fresh engine probe of that incarnation/container.
-            with session() as probe_db:
-                return dispatch_authority.dispatch_is_inactive(
-                    probe_db, run_id, operation_id, generation, probe=dispatch._probe_inactive)
-
         broker.configure(capability_key=(PRIVATE / "broker_capability_key").read_bytes().strip(),
                          provider_destinations={str(self.provider_id): "https://research.example"},
-                         resolver=lambda host, port: ["8.8.8.8"], dispatch_is_inactive=inactive)
+                         resolver=lambda host, port: ["8.8.8.8"])
         supervisor.configure(
             image=WORKER_IMAGE, image_digest=WORKER_IMAGE, broker_url="http://127.0.0.1:8123",
             broker_ip="172.29.32.2", broker_port=8123, runtime_commit=RUNTIME_COMMIT,
@@ -293,6 +286,32 @@ class H:
             bootstrap_factory=self._bootstrap,
             capability_factory=lambda db, run, gen: broker.issue_capability(db, run, gen, 300),
             dispatch=dispatch, engine=self.eng)
+        # supervisor.configure registers the exact dispatch-inactivity proof; owner retry needs no direct broker wiring.
+        if broker._dispatch_inactivity_proof is None:
+            raise RuntimeError("supervisor.configure did not register the dispatch inactivity proof")
+
+    def rest_decide(self, choice: str, key: str) -> dict:
+        """Submit an owner decision through the real REST host (bootstrap, cookie, CSRF), as the browser does."""
+        from secrets import token_urlsafe
+        from fastapi.testclient import TestClient
+        from scientist import api
+        from scientist.app import create_app
+        token = token_urlsafe(32)
+        app = create_app(bootstrap_token=token)
+        app.include_router(api.router)
+        app.include_router(api.control_router)
+        client = TestClient(app, client=("127.0.0.1", 12345))
+        headers = {"host": "localhost", "origin": "http://localhost"}
+        boot = client.post("/api/v1/bootstrap", headers=headers, json={"token": token})
+        client.headers.update({**headers, "x-csrf-token": boot.json()["csrf_token"]})
+        with session() as db:
+            row = db.execute(text("""SELECT d.decision_id, r.revision FROM owner_decisions d JOIN runs r ON r.id = d.run_id
+                                     WHERE d.run_id = :run AND d.state = 'pending'"""), {"run": self.run_id}).one()
+        resp = client.post(f"/api/v1/runs/{self.run_id}/decisions", json={
+            "decision_id": str(row.decision_id), "expected_revision": row.revision, "idempotency_key": key, "choice": choice})
+        if resp.status_code != 200:
+            raise RuntimeError(f"decision rejected: {resp.status_code} {resp.text}")
+        return resp.json()
 
     def _bootstrap(self, db, run_id, generation) -> WorkerBootstrap:
         # Contract (supervisor.continuation_bootstrap): fresh context is lawful only with no checkpoint AND no operation rows.

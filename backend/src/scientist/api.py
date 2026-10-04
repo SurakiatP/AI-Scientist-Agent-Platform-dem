@@ -15,9 +15,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import text
 from pydantic import BaseModel, ConfigDict, Field
 
-from scientist import domain, files, objects, research
+from scientist import domain, files, objects, research, supervisor
 from scientist.auth import DomainError, authenticate_owner_session
-from scientist.contracts import ObjectRef, PlanSpec, Principal
+from scientist.contracts import DecisionSubmit, ObjectRef, PlanSpec, Principal
 from scientist.db import session as database_session
 
 MAX_UPLOAD_BYTES = objects.MAX_UPLOAD_BYTES
@@ -388,16 +388,42 @@ def _download(ref: ObjectRef, content_type: str, name: str) -> Response:
         "Content-Disposition": f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{quote(name[:100], safe='')}", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
 
+class ApproveBody(Body):
+    expected_revision: int
+    plan_digest: str
+
+
+STOP_GRACE_SECONDS = 10
+
+
 @control_router.post("/runs/{run_id}/approve")
-async def approve_run(run_id: UUID):
-    raise NotImplementedError("wave 5b")
+def approve_run(request: Request, run_id: UUID, body: ApproveBody):
+    with database_session() as db:
+        run = domain.approve_run(db, _principal(request), run_id, body.expected_revision, body.plan_digest)
+        db.commit()
+        return run
 
 
 @control_router.post("/runs/{run_id}/stop")
-async def stop_run(run_id: UUID):
-    raise NotImplementedError("wave 5b")
+def stop_run(request: Request, run_id: UUID):
+    with database_session() as db:
+        domain.authorize_stop(db, _principal(request), run_id)
+        db.rollback()  # release the authorization lock; supervisor.stop takes its own fenced lock
+        return supervisor.stop(db, run_id, STOP_GRACE_SECONDS)
 
 
 @control_router.post("/runs/{run_id}/decisions")
-async def decide_run(run_id: UUID):
-    raise NotImplementedError("wave 5b")
+def decide_run(request: Request, run_id: UUID, body: DecisionSubmit):
+    with database_session() as db:
+        try:
+            run = domain.submit_decision(db, _principal(request), run_id, body)
+        except DomainError:
+            db.rollback()
+            raise
+        db.commit()
+        if body.choice == "stop":
+            return supervisor.stop(db, run_id, STOP_GRACE_SECONDS)  # fenced finish; idempotent on replay
+        if body.choice == "extend" and run.state == "waiting_input" and run.waiting_reason == "budget_exhausted":
+            # Existing recover path (executor reaping, checkpoint check, budget re-check); it only queues.
+            return supervisor.recover(db, run_id, budget_resume=True)
+        return run
