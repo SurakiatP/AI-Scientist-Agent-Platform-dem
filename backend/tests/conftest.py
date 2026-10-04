@@ -8,6 +8,7 @@ from sqlalchemy.engine import make_url
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+collect_ignore = ["live"]
 
 
 def validate_test_database_url(raw_url: str) -> str:
