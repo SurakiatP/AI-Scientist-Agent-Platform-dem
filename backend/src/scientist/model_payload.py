@@ -396,3 +396,15 @@ def serialized_input_bytes(messages: list, **controls: Any) -> int:
     if len(encoded) > _MAX_BODY_BYTES:
         raise ModelPayloadError("Chat Completions input exceeds the 245760 byte limit")
     return len(encoded)
+
+
+LLM_PROTOCOL_OVERHEAD_TOKENS = 64
+
+
+def llm_input_reserve(messages: list, **controls: Any) -> int:
+    """Input share of every LLM reservation: serialized input plus protocol overhead.
+
+    The broker validates `reserve_tokens >= llm_input_reserve(...) + max_output` and the
+    worker derives its output allowance from the same value (ADR-012); keep them shared.
+    """
+    return serialized_input_bytes(messages, **controls) + LLM_PROTOCOL_OVERHEAD_TOKENS

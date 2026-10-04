@@ -77,6 +77,12 @@ def budget_exhausted(db: Session, run: Any, *, reserve_tokens: int = 0) -> bool:
         _field(run, "elapsed_limit_ms")
     )
 
+def remaining_tokens(run: Any) -> int:
+    """ADR-012 snapshot: effective token limit minus usage minus held reservations."""
+    return max(0, int(_field(run, "token_limit")) - int(_field(run, "usage_tokens"))
+               - int(_field(run, "reserved_tokens")))
+
+
 def mark_budget_wait(
     db: Session,
     run_id: UUID,

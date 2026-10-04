@@ -238,6 +238,18 @@ class RuntimeContextV1(RuntimeRecord):
     operation_mappings: list[OperationMapping] = Field(max_length=256)
     operation_sequence: Nonnegative
     workspace_manifest: list[WorkspaceEntry] = Field(max_length=MAX_WORKSPACE_FILES)
+    budget_remaining_tokens: Nonnegative | None = None
+    """ADR-012 trusted per-generation budget snapshot (advisory to the worker).
+
+    max(0, runs.token_limit - usage_tokens - reserved_tokens) read from the ledger by
+    the controller. Only server code sets it: supervisor.start overwrites whatever the
+    bootstrap factory supplied, WorkerController.bootstrap_context rebinds it on every
+    continuation and boundary() stores the ledger value, so a worker value is never
+    trusted or persisted. The approved plan (and plan.token_limit) is never changed.
+    Additive optional field, so schema_version stays 1 (same convention as
+    native_message_metadata); pre-ADR checkpoints parse as None and are rebound at
+    bootstrap. A worker that receives None fails closed before any I/O.
+    """
 
     @model_validator(mode="before")
     @classmethod

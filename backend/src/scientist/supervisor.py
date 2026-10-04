@@ -17,9 +17,9 @@ import base64
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Callable, Protocol, Sequence
+from typing import TYPE_CHECKING, Callable, Protocol, Sequence
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -37,6 +37,10 @@ from scientist.runtime_contracts import (
     RuntimeContextV1,
     WorkspaceFile as BoundaryWorkspaceFile,
 )
+
+
+if TYPE_CHECKING:
+    from scientist.private_worker_api import WorkerController
 
 
 _DOCKER_CONTEXT = "colima-scientist-platform-test"
@@ -72,6 +76,34 @@ class WorkerBootstrap:
     context: bytes
     workspace: Sequence[BoundaryWorkspaceFile]
     metadata: BootstrapMetadata
+
+
+def continuation_bootstrap(db: Session, run_id: UUID, generation: int, controller: WorkerController) -> WorkerBootstrap:
+    """Fail-closed bootstrap for a claimed generation > first: latest verified checkpoint, rebound.
+
+    Never falls back to a fresh context. Raises on no checkpoint, integrity failure
+    or a generation/revision the controller does not accept. Never touches usage or operations.
+    A fresh context is lawful only when the run has no checkpoint AND no operation rows;
+    callers must choose this function in every other case.
+    """
+    row = db.execute(text("SELECT manifest FROM checkpoints WHERE run_id=:run ORDER BY revision DESC LIMIT 1"),
+                     {"run": run_id}).mappings().one_or_none()
+    if row is None:
+        raise RuntimeError("no checkpoint to continue from")
+    manifest = CheckpointManifest.model_validate(row["manifest"])
+    with tempfile.TemporaryDirectory(prefix="scientist-continuation-") as directory:
+        raw = checkpoints.restore(db, manifest, Path(directory))
+        saved = RuntimeContextV1.model_validate_json(raw)
+        files = []
+        for entry in saved.workspace_manifest:
+            data = (Path(directory) / entry.path).read_bytes()
+            files.append(BoundaryWorkspaceFile(
+                path=entry.path, sha256=entry.sha256, size=entry.size,
+                data_base64=base64.b64encode(data).decode("ascii")))
+    context = controller.bootstrap_context(db, raw, run_id, generation)
+    return WorkerBootstrap(
+        context=context.model_dump_json().encode(), workspace=files,
+        metadata=BootstrapMetadata(schema_version=1, checkpoint_revision=manifest.revision))
 
 
 class DispatchRuntime(Protocol):
@@ -248,7 +280,7 @@ def claim(db: Session, max_active: int) -> tuple[UUID, int] | None:
     if row is None:
         db.rollback()
         return None
-    if limits.budget_exhausted(db, row):
+    if row["budget_decision_id"] is not None or limits.budget_exhausted(db, row):
         limits.mark_budget_wait(db, row["id"], row["revision"], _event)
         db.commit()
         return None
@@ -340,6 +372,7 @@ def start(db: Session, run_id: UUID, generation: int) -> str:
                    {"id": dispatch_id})
         db.commit()
         bootstrap = cfg.bootstrap_factory(db, run_id, generation)
+        db.commit()  # bootstrap writes nothing; release the run-row lock it may hold
         context = RuntimeContextV1.model_validate_json(bootstrap.context)
         if (context.run_id != run_id or context.generation != generation
                 or context.revision != run["revision"]
@@ -348,6 +381,14 @@ def start(db: Session, run_id: UUID, generation: int) -> str:
                 or context.skills_digest != cfg.skills_digest
                 or context.environment_digest != cfg.environment_digest):
             raise RuntimeError("trusted bootstrap identity differs from run pins")
+        # ADR-012: every bootstrap path (fresh factory or continuation) gets the ledger
+        # snapshot here; whatever the factory supplied is discarded.
+        ledger = db.execute(text("SELECT token_limit, usage_tokens, reserved_tokens FROM runs WHERE id=:run"),
+                            {"run": run_id}).mappings().one()
+        # model_dump_json keeps UTF-8 (no \u escapes), so the worker's 1 MiB read cap still holds.
+        bootstrap = replace(bootstrap, context=context.model_copy(
+            update={"budget_remaining_tokens": limits.remaining_tokens(ledger)}).model_dump_json().encode())
+        RuntimeContextV1.model_validate_json(bootstrap.context)
         checkpoint_revision = db.execute(
             text("SELECT COALESCE(MAX(revision), 0) FROM checkpoints WHERE run_id=:run"),
             {"run": run_id},
@@ -443,11 +484,15 @@ def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
         db.rollback()
         return _run_view(db, run_id)
     limits.settle_active_interval(db, run_id)
-    db.execute(text("""
+    # Executors are fenced, so no reply can arrive; provider outcome stays uncertain. Keep reservation.
+    db.execute(text("UPDATE operations SET state='unknown' WHERE run_id=:run AND state='reserved'"), {"run": run_id})
+    canceled = db.execute(text("""
         UPDATE runs SET state='canceled', lease_expires_at=NULL,
             waiting_reason=NULL, error_code=NULL
         WHERE id=:run AND state='stopping' AND generation=:generation
-    """), {"run": run_id, "generation": row["generation"]})
+    """), {"run": run_id, "generation": row["generation"]}).rowcount
+    if canceled == 1:
+        _event(db, run_id, row["revision"], "run.state", {"state": "canceled"})
     db.commit()
     return _run_view(db, run_id)
 
@@ -597,7 +642,7 @@ def recover(db: Session, run_id: UUID) -> RunView:
         db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
                    {"id": executor["id"]})
     pending_unknown = db.execute(text("""
-        SELECT 1 FROM operations WHERE run_id=:run AND state='unknown' LIMIT 1
+        SELECT 1 FROM operations WHERE run_id=:run AND state='unknown' AND NOT COALESCE(result ? 'retry_identity', false) LIMIT 1
     """), {"run": run_id}).scalar_one_or_none() is not None
     if uncertain:
         reason = "executor_quiescence_unproven"
@@ -608,6 +653,8 @@ def recover(db: Session, run_id: UUID) -> RunView:
         _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
     elif row["cancel_requested"]:
         limits.settle_active_interval(db, run_id)
+        db.execute(text("UPDATE operations SET state='unknown' WHERE run_id=:run AND state='reserved'"),
+                   {"run": run_id})
         db.execute(text("""
             UPDATE runs SET state='canceled', waiting_reason=NULL,
                 lease_expires_at=NULL WHERE id=:run
@@ -703,7 +750,11 @@ def _queue_recovered_run(db: Session, run_id: UUID, generation: int, revision: i
     ).mappings().one_or_none()
     if current is None:
         return
-    if limits.budget_exhausted(db, current):
+    # A set budget_decision_id means an owner decision is pending (extension clears it).
+    if current["budget_decision_id"] is not None or limits.budget_exhausted(db, current):
+        if current["state"] == "waiting_input" and current["waiting_reason"] != "budget_exhausted":
+            # Quiescence and checkpoint are proven here; earlier recover steps only masked the wait.
+            db.execute(text("UPDATE runs SET waiting_reason='budget_exhausted' WHERE id=:run"), {"run": run_id})
         limits.mark_budget_wait(db, run_id, revision, _event)
         return
     changed = db.execute(text("""

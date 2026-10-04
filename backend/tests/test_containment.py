@@ -195,14 +195,22 @@ def test_three_run_networks_have_disjoint_internal_address_spaces(monkeypatch):
 
     def docker(*args, **kwargs):
         if args[:2] == ("network", "ls"):
-            return ""
+            return "\n".join(f"network-{i + 1}" for i in range(len(created)))
+        if args[:2] == ("network", "inspect"):
+            command = created[int(args[-1].rsplit("-", 1)[1]) - 1]
+            return json.dumps([{"Subnet": command[i + 1]} for i, a in enumerate(command) if a == "--subnet"])
         if args[:2] == ("network", "create"):
             created.append(args)
             return f"network-{len(created)}"
         raise AssertionError(f"unexpected Docker command: {args}")
 
     monkeypatch.setattr(engine, "_docker", docker)
-    result = [engine.create_run_network(supervisor.uuid4(), 1, supervisor.uuid4()) for _ in range(3)]
+    # Three runs whose digests start at the same subnet slot force the dedup path.
+    slot = lambda r: hashlib.sha256(f"{r}:1".encode()).digest()[0] % 190
+    runs = [supervisor.UUID(int=i << 80) for i in range(1, 2000)]
+    colliding = [r for r in runs if slot(r) == slot(runs[0])][:3]
+    assert len(colliding) == 3
+    result = [engine.create_run_network(r, 1, supervisor.uuid4()) for r in colliding]
 
     assert len({network for network, _ in result}) == 3
     assert len({command[command.index("--subnet") + 1] for command in created}) == 3

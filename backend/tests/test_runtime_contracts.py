@@ -15,7 +15,7 @@ def canonical(value):
 def context_data():
     provider=uuid4()
     plan=PlanSpec(input_snapshot_digest='a'*64,provider_id=provider,model='fixture',stages=['search'],allowed_ops=['llm','search'],data_recipients=['https://research.example'],packages=[],token_limit=100000,elapsed_limit_ms=60000)
-    return dict(schema_version=1,run_id=str(uuid4()),project_id=str(uuid4()),generation=1,revision=3,input_snapshot_digest='a'*64,plan_digest=sha256(canonical(plan.model_dump(mode='json'))).hexdigest(),runtime_commit='bd0affe5e5f723579df8902852f5d0c47795f355',image_digest='sha256:'+'b'*64,skills_digest='c'*64,environment_digest='d'*64,provider_id=str(provider),provider_endpoint='https://research.example',model='fixture',plan=plan.model_dump(mode='json'),turn_id=str(uuid4()),system_prompt='Owned research assistant',messages=[{'role':'user','content':'Find fixture papers'}],todo={'todos':[],'revision':0},compacted_context=None,boundary='before_model',pending_assistant=None,operation_mappings=[],operation_sequence=0,workspace_manifest=[])
+    return dict(schema_version=1,run_id=str(uuid4()),project_id=str(uuid4()),generation=1,revision=3,input_snapshot_digest='a'*64,plan_digest=sha256(canonical(plan.model_dump(mode='json'))).hexdigest(),runtime_commit='bd0affe5e5f723579df8902852f5d0c47795f355',image_digest='sha256:'+'b'*64,skills_digest='c'*64,environment_digest='d'*64,provider_id=str(provider),provider_endpoint='https://research.example',model='fixture',plan=plan.model_dump(mode='json'),turn_id=str(uuid4()),system_prompt='Owned research assistant',messages=[{'role':'user','content':'Find fixture papers'}],todo={'todos':[],'revision':0},compacted_context=None,boundary='before_model',pending_assistant=None,operation_mappings=[],operation_sequence=0,workspace_manifest=[],budget_remaining_tokens=100000)
 
 def test_context_json_roundtrip_preserves_immutable_identity(context_data):
     parsed=RuntimeContextV1.model_validate(context_data)
@@ -218,5 +218,17 @@ def test_current_turn_anchor_must_reference_primary_user(context_data):
     context_data['messages'].append({'role':'assistant','content':'done'})
     for anchor in (True, -1, 1, 2):
         context_data['current_turn_user_index'] = anchor
+        with pytest.raises(ValidationError):
+            RuntimeContextV1.model_validate(context_data)
+
+
+def test_budget_snapshot_is_additive_v1_field_and_strictly_nonnegative(context_data):
+    # ADR-012: schema_version stays 1; pre-ADR checkpoints (no key) still parse as None.
+    del context_data['budget_remaining_tokens']
+    assert RuntimeContextV1.model_validate(context_data).budget_remaining_tokens is None
+    context_data['budget_remaining_tokens']=0
+    assert RuntimeContextV1.model_validate(context_data).budget_remaining_tokens == 0
+    for invalid in (-1,True,1.5,'7'):
+        context_data['budget_remaining_tokens']=invalid
         with pytest.raises(ValidationError):
             RuntimeContextV1.model_validate(context_data)

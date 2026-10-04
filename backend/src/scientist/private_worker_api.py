@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from scientist import broker, broker_api, objects
+from scientist import broker, broker_api, limits, objects
 from scientist.auth import DomainError
 from scientist.contracts import CheckpointManifest, ObjectRef
 from scientist.db import session
@@ -131,7 +131,9 @@ class WorkerController:
                 or saved.revision > row.revision):
             raise DomainError("forbidden", 403)
         data = saved.model_dump(mode="json")
-        data.update(generation=generation, revision=row.revision)
+        # ADR-012: the snapshot comes from the ledger, never from checkpoint bytes.
+        data.update(generation=generation, revision=row.revision,
+                    budget_remaining_tokens=limits.remaining_tokens(row))
         for mapping in data["operation_mappings"]:
             operation = db.execute(text("SELECT generation FROM operations WHERE run_id=:run AND operation_id=:op"),
                                    {"run":run_id,"op":mapping["operation_id"]}).one_or_none()
@@ -165,6 +167,7 @@ class WorkerController:
             **request.context.model_dump(mode="json"),
             "workspace_manifest":[WorkspaceEntry(path=entry.path, sha256=entry.sha256, size=entry.size).model_dump()
                                   for entry in files],
+            "budget_remaining_tokens": limits.remaining_tokens(row),
         })
         context_bytes = authoritative_context.model_dump_json().encode()
         with tempfile.TemporaryDirectory(prefix="scientist-boundary-") as staging:
@@ -208,8 +211,7 @@ class WorkerController:
         row = self._run(db, capability, lock=False)
         if not operation_id or len(operation_id) > 200:
             raise DomainError("forbidden", 403)
-        operation = db.execute(text("SELECT * FROM operations WHERE run_id=:run AND operation_id=:op"),
-                               {"run":row.id,"op":operation_id}).one_or_none()
+        operation, _ = broker.effective_operation(db, row.id, operation_id)
         if operation is None or operation.state != "committed":
             raise DomainError("result_unavailable", 409)
         ref = broker._operation_result(operation).result
