@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { PROJECT_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
+import { DECISION_BUDGET, DECISION_UNKNOWN, PROJECT_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
 
 test('expanded artifact preserves controls and focus', async ({ page }) => {
   await installResearchFixtureRoutes(page);
@@ -37,7 +37,7 @@ test('approving an edited plan sends its exact new revision and digest', async (
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Is the reference real?');
   await page.getByRole('button', { name: 'Review plan' }).click();
-  await expect(page.getByText('fixture-provider / fixture-model')).toBeVisible();
+  await expect(page.getByText('Fixture / fixture-model')).toBeVisible();
   await expect(page.getByText('numpy 2.0.0')).toBeVisible();
   await page.getByLabel('Research stages (one per line)').fill('search_literature');
   await expect(page.getByRole('button', { name: 'Approve plan' })).toBeDisabled();
@@ -76,17 +76,17 @@ test('run states render distinctly with confirmed stage counts only', async ({ p
   await expect(page.getByText('Current stage: Verify references')).toBeVisible();
   await expect(page.getByText('%')).toHaveCount(0);
 
-  fixture.pushEvents(event(4, 'decision.required', { decision_id: '1', reason: 'budget_exhausted', required_tokens: 37, required_elapsed_ms: null }));
+  fixture.pushEvents(event(4, 'decision.required', { decision_id: DECISION_BUDGET, reason: 'budget_exhausted', required_tokens: 37, required_elapsed_ms: null }));
   fixture.setRun({ state: 'waiting_input', reserved_tokens: 5 });
   await expect(page.getByRole('heading', { name: 'Waiting for your decision' })).toBeVisible();
   await expect(page.getByText('Required to continue: 37 more tokens.')).toBeVisible();
 
-  fixture.pushEvents(event(5, 'decision.required', { decision_id: '2', reason: 'unknown_outcome' }));
+  fixture.pushEvents(event(5, 'decision.required', { decision_id: DECISION_UNKNOWN, reason: 'unknown_outcome' }));
   await expect(page.getByText(/5 reserved tokens are retained/)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Use a verified result' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Use a verified result' })).toBeDisabled();
   await expect(page.getByRole('button', { name: /Retry \(may duplicate cost\)/ })).toBeVisible();
   await page.getByRole('button', { name: /Retry \(may duplicate cost\)/ }).click();
-  await expect.poll(() => fixture.writes.find((w) => w.path.endsWith('/decisions'))?.body).toMatchObject({ decision_id: '2', choice: 'retry' });
+  await expect.poll(() => fixture.writes.find((w) => w.path.endsWith('/decisions'))?.body).toMatchObject({ decision_id: DECISION_UNKNOWN, choice: 'retry' });
 
   fixture.pushEvents(event(6, 'stage.completed', { stage: 'verify_references', outcome: 'failed' }));
   fixture.setRun({ state: 'failed', error_code: 'storage_unavailable', artifacts: [{ ...report, partial: true }] });
@@ -183,7 +183,7 @@ test('reports expose copyable code and selectable equation source', async ({ pag
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await installResearchFixtureRoutes(page);
   await page.goto(SESSION_URL);
-  await expect(page.getByText('E = mc^2')).toBeVisible();
+  await expect(page.locator('.report-text .katex annotation')).toHaveText('E = mc^2');
   await page.getByRole('button', { name: 'Copy code' }).click();
   await expect(page.getByText('Copied', { exact: true })).toBeVisible();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('print("diffusion")');
@@ -218,20 +218,83 @@ test('event paging drains every page after the run is terminal and never fetches
   expect(fixture.pageRequests()).toEqual([0, 1, 2]);
 });
 
-test('an expired cursor resets from the returned snapshot', async ({ page }) => {
+test('an expired cursor re-pages from cursor 0 because events are never deleted', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', artifacts: [] }), expireCursorOnce: true });
   fixture.pushEvents(event(1, 'stage.started', { stage: 'search_literature' }));
   await page.goto(SESSION_URL);
   await expect(page.getByRole('listitem').filter({ hasText: 'Search literature' })).toBeVisible();
   fixture.pushEvents(event(2, 'stage.completed', { stage: 'search_literature', outcome: 'completed' }));
+  await expect.poll(() => fixture.pageRequests().filter((n) => n === 0).length).toBeGreaterThanOrEqual(2);
   await expect(page.getByText('Connected', { exact: true })).toBeVisible();
-  await expect.poll(() => fixture.pageRequests().includes(9)).toBe(true);
-  await expect(page.getByRole('listitem').filter({ hasText: 'Search literature' })).toHaveCount(0);
+  await expect(page.getByText('1 stages completed')).toBeVisible();
+  await expect(page.getByRole('listitem').filter({ hasText: 'Search literature' })).toHaveCount(1);
+});
+
+test('a stale snapshot is ignored by latest_cursor, not revision', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', artifacts: [], latest_cursor: 5 }) });
+  await page.goto(SESSION_URL);
+  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
+  fixture.setRun({ latest_cursor: 2, state: 'waiting_input' });
+  const seen = fixture.pageRequests().length;
+  await expect.poll(() => fixture.pageRequests().length).toBeGreaterThan(seen + 2);
+  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
+  fixture.setRun({ latest_cursor: 6 });
+  await expect(page.getByRole('heading', { name: 'Waiting for your decision' })).toBeVisible();
+});
+
+test('stop and its acknowledgement never change the revision, and 422 uses detail', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', artifacts: [] }) });
+  await page.goto(SESSION_URL);
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+  await expect.poll(() => fixture.writes.some((w) => w.path.endsWith('/stop'))).toBe(true);
+  const snapshot = await page.evaluate(async (id) => (await fetch(`/api/v1/runs/${id}`)).json(), makeRun().run_id);
+  expect(snapshot.revision).toBe(1);
+  fixture.acknowledgeStop();
+  expect((await page.evaluate(async (id) => (await fetch(`/api/v1/runs/${id}`)).json(), makeRun().run_id)).revision).toBe(1);
+  const bad = await page.evaluate(async (id) => { const r = await fetch(`/api/v1/runs/${id}/decisions`, { method: 'POST', body: '{"x":1}', headers: { 'Content-Type': 'application/json' } }); return r.json(); }, makeRun().run_id);
+  expect(Array.isArray(bad.detail)).toBe(true);
+});
+
+test('budget decision sends the required amounts, revision and one reused key', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'waiting_input', artifacts: [], revision: 4 }), failFirstDecision: true });
+  fixture.pushEvents(event(1, 'decision.required', { decision_id: DECISION_BUDGET, reason: 'budget_exhausted', required_tokens: 37, required_elapsed_ms: 2500 }));
+  await page.goto(SESSION_URL);
+  const extend = page.getByRole('button', { name: 'Extend limit and continue' });
+  await extend.click();
+  await expect(page.getByRole('alert')).toBeVisible();
+  await extend.click();
+  await expect(page.getByRole('heading', { name: 'Queued to start' })).toBeVisible();
+  const calls = fixture.writes.filter((w) => w.path.endsWith('/decisions'));
+  expect(calls).toHaveLength(2);
+  expect(calls[0].body).toEqual({ decision_id: DECISION_BUDGET, expected_revision: 4, idempotency_key: expect.stringMatching(/^[0-9a-f-]{36}$/), choice: 'extend', add_tokens: 37, add_elapsed_ms: 2500 });
+  expect(calls[1].body.idempotency_key).toBe(calls[0].body.idempotency_key);
+});
+
+test('double-click on a decision sends one request', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'waiting_input', artifacts: [] }) });
+  fixture.pushEvents(event(1, 'decision.required', { decision_id: DECISION_UNKNOWN, reason: 'unknown_outcome' }));
+  await page.goto(SESSION_URL);
+  await page.getByRole('button', { name: /Retry \(may duplicate cost\)/ }).dblclick();
+  await expect(page.getByRole('heading', { name: 'Queued to start' })).toBeVisible();
+  expect(fixture.writes.filter((w) => w.path.endsWith('/decisions'))).toHaveLength(1);
+});
+
+test('unknown outcome offers retry and stop; verified result stays disabled with a reason', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'waiting_input', artifacts: [] }) });
+  fixture.pushEvents(event(1, 'decision.required', { decision_id: DECISION_UNKNOWN, reason: 'unknown_outcome' }));
+  await page.goto(SESSION_URL);
+  await expect(page.getByRole('button', { name: 'Use a verified result' })).toBeDisabled();
+  await expect(page.getByText(/not available yet/)).toBeVisible();
+  await page.getByRole('button', { name: 'Stop without retrying' }).click();
+  await expect(page.getByRole('heading', { name: 'Stopping, waiting for confirmation' })).toBeVisible();
+  const body = fixture.writes.find((w) => w.path.endsWith('/decisions'))!.body;
+  expect(body).toMatchObject({ decision_id: DECISION_UNKNOWN, choice: 'stop' });
+  expect(body).not.toHaveProperty('add_tokens');
 });
 
 test('a zero required amount is not shown', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'waiting_input', artifacts: [] }) });
-  fixture.pushEvents(event(1, 'decision.required', { decision_id: '1', reason: 'budget_exhausted', required_tokens: 0, required_elapsed_ms: 0 }));
+  fixture.pushEvents(event(1, 'decision.required', { decision_id: DECISION_BUDGET, reason: 'budget_exhausted', required_tokens: 0, required_elapsed_ms: 0 }));
   await page.goto(SESSION_URL);
   await expect(page.getByText('The approved usage limit has been reached.')).toBeVisible();
   await expect(page.getByText(/Required/)).toHaveCount(0);

@@ -4,6 +4,7 @@ import type { ArtifactView, ConnectionView, FileView, PlanView, RunEvent, RunVie
 import { ApiError, apiErrorMessage, request } from './api';
 import { useAppPreferences } from './App';
 import { ArtifactCard, ArtifactViewer, INITIAL_VISUAL_STATE, type VisualState } from './ArtifactViewer';
+import type { DecisionRequiredPayload } from '../../../contracts/api-types';
 import { RunProgress, type DecisionChoice } from './RunProgress';
 import './research.css';
 
@@ -27,8 +28,8 @@ function readDraft(key: string): { question: string; selected: string[] } {
 const TERMINAL = ['completed', 'failed', 'canceled', 'rejected'];
 const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
-// TODO(contract): decision request bodies are pending owner decisions; this is the only place that sends them.
-const submitDecision = (runId: string, decisionId: string, choice: DecisionChoice) => request<RunView>(`/api/v1/runs/${runId}/decisions`, json({ decision_id: decisionId, choice }));
+type DecisionBody = { decision_id: string; expected_revision: number; idempotency_key: string; choice: DecisionChoice; add_tokens?: number; add_elapsed_ms?: number };
+const submitDecision = (runId: string, body: DecisionBody) => request<RunView>(`/api/v1/runs/${runId}/decisions`, json(body));
 
 type EventPageResult = { expired: false; events: RunEvent[]; latest_cursor: number } | { expired: true; snapshot: RunView };
 // Raw fetch: request() drops the 410 body that carries the resync snapshot. /events is SSE and is never fetched here.
@@ -57,12 +58,12 @@ function usePolledRun(initial: RunView | null, pollMs: number) {
       try {
         const snapshot = await request<RunView>(`/api/v1/runs/${runId}`, { signal: controller.signal });
         if (controller.signal.aborted) return;
-        setRun((old) => old && old.run_id === snapshot.run_id && snapshot.revision < old.revision ? old : snapshot); // ignore stale snapshots
+        setRun((old) => old && old.run_id === snapshot.run_id && snapshot.latest_cursor < old.latest_cursor ? old : snapshot); // ignore stale snapshots (the cursor only grows; revision can stay equal)
         let latest = snapshot.latest_cursor;
         do { // keep paging until caught up, even once the run is terminal
           const page = await fetchEventPage(runId, cursor.current, controller.signal);
           if (controller.signal.aborted) return;
-          if (page.expired) { setRun(page.snapshot); setEvents([]); cursor.current = page.snapshot.latest_cursor; latest = page.snapshot.latest_cursor; break; }
+          if (page.expired) { setRun(page.snapshot); setEvents([]); cursor.current = 0; break; } // events are never deleted: re-page from the start
           latest = Math.max(latest, page.latest_cursor);
           if (page.events.length) {
             cursor.current = Math.max(cursor.current, ...page.events.map((e) => e.sequence));
@@ -174,7 +175,21 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     try { return await action(); } catch (reason) { setError(apiErrorMessage(reason, language)); return undefined; }
   }
   const stop = async () => { if (!run) return; setStopPending(true); const next = await guarded(() => request<RunView>(`/api/v1/runs/${run.run_id}/stop`, json({}))); if (next) setRun(next); else setStopPending(false); };
-  const decide = async (decisionId: string, choice: DecisionChoice) => { if (!run) return; const next = await guarded(() => submitDecision(run.run_id, decisionId, choice)); if (next) setRun(next); };
+  const decisionKeys = useRef(new Map<string, string>()); // one idempotency key per decision payload; reused on retry and double-click
+  const deciding = useRef(false);
+  const decide = async (decision: DecisionRequiredPayload, choice: DecisionChoice) => {
+    if (!run || deciding.current) return;
+    const body: Omit<DecisionBody, 'idempotency_key'> = { decision_id: decision.decision_id, expected_revision: run.revision, choice };
+    if (choice === 'extend') {
+      if ((decision.required_tokens ?? 0) > 0) body.add_tokens = decision.required_tokens!;
+      if ((decision.required_elapsed_ms ?? 0) > 0) body.add_elapsed_ms = decision.required_elapsed_ms!;
+    }
+    const signature = JSON.stringify(body);
+    const idempotency_key = decisionKeys.current.get(signature) ?? newKey();
+    decisionKeys.current.set(signature, idempotency_key);
+    deciding.current = true;
+    try { const next = await guarded(() => submitDecision(run.run_id, { ...body, idempotency_key })); if (next) setRun(next); } finally { deciding.current = false; }
+  };
   const dirty = plan !== null && stagesText.trim() !== plan.plan.stages.join('\n');
   async function savePlan() {
     if (!plan) return;
@@ -204,10 +219,10 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     <div className="page-heading"><p className="eyebrow">{text(language, 'Research conversation', 'บทสนทนาวิจัย')}</p><h1 className="route-heading" tabIndex={-1}>{text(language, 'Research chat', 'แชตวิจัย')}</h1>
       <p><Link to={`/projects/${projectId}`}>{text(language, 'Project details', 'รายละเอียดโครงการ')}</Link></p></div>
     <section aria-label={text(language, 'Conversation', 'บทสนทนา')}><ol>{messages.map((m) => <li key={m.id}><strong>{m.role === 'assistant' ? text(language, 'Assistant', 'ผู้ช่วย') : text(language, 'You', 'คุณ')}:</strong> <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span></li>)}</ol></section>
-    {run && <RunProgress run={run} events={events} connected={connected} onStop={() => void stop()} stopPending={stopPending} onDecision={(id, choice) => void decide(id, choice)} onRetry={retry} />}
+    {run && <RunProgress run={run} events={events} connected={connected} onStop={() => void stop()} stopPending={stopPending} onDecision={(d, choice) => void decide(d, choice)} onRetry={retry} />}
     {plan && run?.state === 'awaiting_approval' && <section aria-label={text(language, 'Plan review', 'ตรวจทานแผน')}>
       <h2>{text(language, 'Review the plan', 'ตรวจทานแผน')}</h2>
-      <dl><dt>{text(language, 'Model', 'โมเดล')}</dt><dd>{plan.plan.provider_id} / {plan.plan.model}</dd>
+      <dl><dt>{text(language, 'Model', 'โมเดล')}</dt><dd>{connections?.find((c) => c.id === plan.plan.provider_id)?.label ?? text(language, 'Selected connection', 'การเชื่อมต่อที่เลือก')} / {plan.plan.model}</dd>
         <dt>{text(language, 'Data recipients', 'ผู้รับข้อมูล')}</dt><dd>{plan.plan.data_recipients.join(', ') || text(language, 'None', 'ไม่มี')}</dd>
         <dt>{text(language, 'Packages', 'แพ็กเกจ')}</dt><dd>{plan.plan.packages.map((p) => `${p.name} ${p.version}`).join(', ') || text(language, 'None', 'ไม่มี')}</dd>
         <dt>{text(language, 'Limits', 'ขีดจำกัด')}</dt><dd>{plan.plan.token_limit} {text(language, 'tokens', 'โทเคน')} · {Math.round(plan.plan.elapsed_limit_ms / 1000)} {text(language, 's', 'วินาที')}</dd></dl>

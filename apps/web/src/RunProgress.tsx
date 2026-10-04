@@ -20,7 +20,7 @@ const TERMINAL = ['completed', 'failed', 'canceled', 'rejected'];
 
 export function RunProgress({ run, events, connected, onStop, stopPending = false, onDecision, onRetry }: {
   run: RunView; events: RunEvent[]; connected: boolean; onStop: () => void; stopPending?: boolean;
-  onDecision?: (decisionId: string, choice: DecisionChoice) => void; onRetry?: () => void;
+  onDecision?: (decision: DecisionRequiredPayload, choice: DecisionChoice) => void; onRetry?: () => void;
 }) {
   const { language } = useAppPreferences();
   const terminal = TERMINAL.includes(run.state);
@@ -42,10 +42,12 @@ export function RunProgress({ run, events, connected, onStop, stopPending = fals
       {decision?.reason === 'budget_exhausted' && <><p>{text(language, 'The approved usage limit has been reached.', 'ถึงขีดจำกัดการใช้งานที่อนุมัติแล้ว')}
         {(decision.required_tokens ?? 0) > 0 && <> {text(language, `Required to continue: ${decision.required_tokens} more tokens.`, `ต้องเพิ่มอีก ${decision.required_tokens} โทเคนจึงจะดำเนินการต่อได้`)}</>}
         {(decision.required_elapsed_ms ?? 0) > 0 && <> {text(language, `Required: ${Math.ceil(decision.required_elapsed_ms! / 1000)} more seconds.`, `ต้องเพิ่มอีก ${Math.ceil(decision.required_elapsed_ms! / 1000)} วินาที`)}</>}</p>
-        <button type="button" className="button button-small" onClick={() => onDecision?.(decision.decision_id, 'extend')}>{text(language, 'Extend limit and continue', 'ขยายขีดจำกัดและดำเนินการต่อ')}</button></>}
+        {((decision.required_tokens ?? 0) > 0 || (decision.required_elapsed_ms ?? 0) > 0) && <button type="button" className="button button-small" onClick={() => onDecision?.(decision, 'extend')}>{text(language, 'Extend limit and continue', 'ขยายขีดจำกัดและดำเนินการต่อ')}</button>}</>}
       {decision?.reason === 'unknown_outcome' && <><p>{text(language, `An external step may or may not have completed. ${run.reserved_tokens} reserved tokens are retained until this is resolved.`, `ขั้นตอนภายนอกอาจเสร็จหรือไม่เสร็จก็ได้ โทเคนที่สำรองไว้ ${run.reserved_tokens} จะถูกกันไว้จนกว่าจะแก้ไข`)}</p>
-        <button type="button" className="button button-small" onClick={() => onDecision?.(decision.decision_id, 'verified_result')}>{text(language, 'Use a verified result', 'ใช้ผลลัพธ์ที่ตรวจสอบแล้ว')}</button>
-        <button type="button" className="button button-quiet button-small" onClick={() => onDecision?.(decision.decision_id, 'retry')}>{text(language, 'Retry (may duplicate cost)', 'ลองใหม่ (อาจมีค่าใช้จ่ายซ้ำ)')}</button></>}
+        <button type="button" className="button button-small" disabled aria-describedby="verified-result-note">{text(language, 'Use a verified result', 'ใช้ผลลัพธ์ที่ตรวจสอบแล้ว')}</button>
+        <span id="verified-result-note"> {text(language, 'Choosing a verified result is not available yet.', 'การเลือกผลลัพธ์ที่ตรวจสอบแล้วยังไม่พร้อมใช้งาน')}</span>
+        <button type="button" className="button button-quiet button-small" onClick={() => onDecision?.(decision, 'retry')}>{text(language, 'Retry (may duplicate cost)', 'ลองใหม่ (อาจมีค่าใช้จ่ายซ้ำ)')}</button>
+        <button type="button" className="button button-quiet button-small" onClick={() => onDecision?.(decision, 'stop')}>{text(language, 'Stop without retrying', 'หยุดโดยไม่ลองใหม่')}</button></>}
       {decision && decision.reason !== 'budget_exhausted' && decision.reason !== 'unknown_outcome' && <p>{text(language, 'Your review is needed before work can continue.', 'ต้องได้รับการตรวจสอบจากคุณก่อนจึงจะทำต่อได้')}</p>}
     </div>}
     {terminal && run.state !== 'completed' && <p role="alert">{failedStage ? `${stageLabel(failedStage, language)}: ` : ''}{run.error_code ? apiCodeLabel(run.error_code, language) : label}{run.artifacts.length > 0 ? ` · ${text(language, 'Partial outputs are kept below.', 'เก็บผลลัพธ์บางส่วนไว้ด้านล่าง')}` : ''}</p>}
