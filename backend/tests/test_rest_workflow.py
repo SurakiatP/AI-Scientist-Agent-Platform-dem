@@ -49,7 +49,6 @@ def make_client(app: FastAPI) -> TestClient:
 def client(db, storage):
     token = token_urlsafe(32)
     app = create_app(bootstrap_token=token)
-    app.include_router(api.router)
     c = make_client(app)
     resp = c.post("/api/v1/bootstrap", headers={"host": "localhost", "origin": "http://localhost"}, json={"token": token})
     assert resp.status_code == 200
@@ -424,8 +423,6 @@ from test_owner_decisions import bind_executor, dispatch, make_unknown  # noqa: 
 def control_client(db, storage):
     token = token_urlsafe(32)
     app = create_app(bootstrap_token=token)
-    app.include_router(api.router)
-    app.include_router(api.control_router)
     c = make_client(app)
     resp = c.post("/api/v1/bootstrap", headers={"host": "localhost", "origin": "http://localhost"}, json={"token": token})
     c.headers.update({"host": "localhost", "origin": "http://localhost", "x-csrf-token": resp.json()["csrf_token"]})
@@ -551,3 +548,18 @@ def test_patch_plan_cannot_add_unconfigured_recipient(client, db, monkeypatch):
     assert (bad.status_code, bad.json()["code"]) == (409, "data_destinations_not_configured")
     ok = client.patch(f"/api/v1/runs/{run['run_id']}/plan", json={"expected_revision": 1, "plan": {**plan, "data_recipients": ["https://llm.example", "peer:x"]}})
     assert ok.status_code == 200
+
+
+def test_create_app_mounts_resource_and_control_routes():
+    paths = set(create_app(bootstrap_token=token_urlsafe(32)).openapi()["paths"])
+    assert {"/api/v1/projects", "/api/v1/runs/{run_id}/events", "/api/v1/runs/{run_id}/stop", "/api/v1/runs/{run_id}/decisions"} <= paths
+
+
+def test_stop_and_runtime_decisions_fail_closed_without_a_configured_supervisor(control_client, monkeypatch):
+    monkeypatch.setattr(supervisor, "_config", None)
+    run_id = "00000000-0000-4000-8000-000000000001"
+    resp = control_client.post(f"/api/v1/runs/{run_id}/stop")
+    assert (resp.status_code, resp.json()["code"]) == (503, "runtime_unavailable")
+    resp = control_client.post(f"/api/v1/runs/{run_id}/decisions", json={
+        "decision_id": run_id, "expected_revision": 1, "idempotency_key": "k", "choice": "stop"})
+    assert (resp.status_code, resp.json()["code"]) == (503, "runtime_unavailable")

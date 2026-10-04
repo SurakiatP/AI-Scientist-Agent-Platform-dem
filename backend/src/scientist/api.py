@@ -396,6 +396,12 @@ class ApproveBody(Body):
 STOP_GRACE_SECONDS = 10
 
 
+def _require_runtime() -> None:
+    # Stop and budget resume need the trusted supervisor; fail closed until the host configures it.
+    if supervisor._config is None:
+        raise DomainError("runtime_unavailable", 503)
+
+
 @control_router.post("/runs/{run_id}/approve")
 def approve_run(request: Request, run_id: UUID, body: ApproveBody):
     with database_session() as db:
@@ -406,6 +412,7 @@ def approve_run(request: Request, run_id: UUID, body: ApproveBody):
 
 @control_router.post("/runs/{run_id}/stop")
 def stop_run(request: Request, run_id: UUID):
+    _require_runtime()
     with database_session() as db:
         domain.authorize_stop(db, _principal(request), run_id)
         db.rollback()  # release the authorization lock; supervisor.stop takes its own fenced lock
@@ -414,6 +421,8 @@ def stop_run(request: Request, run_id: UUID):
 
 @control_router.post("/runs/{run_id}/decisions")
 def decide_run(request: Request, run_id: UUID, body: DecisionSubmit):
+    if body.choice in ("stop", "extend", "retry"):
+        _require_runtime()  # check before committing a decision the host could not act on
     with database_session() as db:
         try:
             run = domain.submit_decision(db, _principal(request), run_id, body)

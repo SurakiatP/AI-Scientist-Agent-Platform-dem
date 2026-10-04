@@ -17,7 +17,7 @@ from scientist.db import session as database_session
 def create_app(*, bootstrap_token: str, bootstrap_expires_at: datetime | None = None) -> FastAPI:
     if len(bootstrap_token) < 32:
         raise ValueError("bootstrap token must contain at least 32 characters")
-    app = FastAPI()
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)  # no unguarded schema/docs endpoints
     state_lock = Lock()
     consumed = False
     expiry = bootstrap_expires_at or datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -98,6 +98,9 @@ def create_app(*, bootstrap_token: str, bootstrap_expires_at: datetime | None = 
             return _error(401, "forbidden", request.state.request_id)
         return {"identity": str(principal.identity), "kind": "external"}
 
+    from scientist import api  # deferred: api imports domain modules that need the database settings
+    app.include_router(api.router)
+    app.include_router(api.control_router)
     return app
 
 
@@ -136,4 +139,6 @@ def _message(code: str) -> str:
             "revision_conflict": "The item changed. Reload and try again.", "idempotency_conflict": "This request key was already used with different content.",
             "approval_required": "Owner approval is required.", "cursor_expired": "The event cursor or page size is invalid.",
             "budget_exhausted": "The approved usage limit has been reached.", "storage_unavailable": "Secure storage is unavailable.",
-            "request_too_large": "The captured research context is too large."}.get(code, "The request could not be completed.")
+            "request_too_large": "The captured research context is too large.", "runtime_unavailable": "The run service is not available.",
+            "decision_ambiguous": "More than one step needs a decision. Reload and try again.",
+            "data_destinations_not_configured": "Research data destinations are not configured."}.get(code, "The request could not be completed.")

@@ -294,12 +294,9 @@ class H:
         """Submit an owner decision through the real REST host (bootstrap, cookie, CSRF), as the browser does."""
         from secrets import token_urlsafe
         from fastapi.testclient import TestClient
-        from scientist import api
         from scientist.app import create_app
         token = token_urlsafe(32)
         app = create_app(bootstrap_token=token)
-        app.include_router(api.router)
-        app.include_router(api.control_router)
         client = TestClient(app, client=("127.0.0.1", 12345))
         headers = {"host": "localhost", "origin": "http://localhost"}
         boot = client.post("/api/v1/bootstrap", headers=headers, json={"token": token})
