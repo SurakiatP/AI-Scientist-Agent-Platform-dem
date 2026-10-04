@@ -2,9 +2,9 @@
 
 Date: 2026-10-03 (Asia/Bangkok)
 
-Status: Record of the architectural direction, policies, and workflow approved in conversation. Detailed backend contracts and recovery behavior are still being designed. This document has not yet completed written-spec review and does not authorize product implementation.
+Status: Record of the approved architectural direction, policies, and workflow. The owner approved the written companion system specification on 2026-10-03. Implementation-plan review and runtime verification remain outstanding; this document alone does not authorize product implementation.
 
-The companion [runtime and integration specification](2026-10-03-platform-runtime-design.md) records source-inspected constraints, proposed operational contracts, security acceptance checks, and the owner's subsequent choices of MinIO AIStor Free single-node and pausing unknown-outcome steps for an owner decision. It is prepared for written review; runtime verification remains an implementation prerequisite before dependent features are accepted.
+The companion [runtime and integration specification](2026-10-03-platform-runtime-design.md) records source-inspected constraints, reviewed operational contracts, security acceptance checks, and the owner's subsequent choices of local open-source MinIO single-node (superseding AIStor Free) and pausing unknown-outcome steps for an owner decision. Written review is approved; runtime verification remains an implementation prerequisite before dependent features are accepted. The staged [implementation plan](../plans/2026-10-03-platform-build.md) now awaits review.
 
 ## Intended outcome
 

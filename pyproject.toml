@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-scientist-agent-platform"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "pydantic>=2.11",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "fastapi>=0.142.2",
+    "uvicorn>=0.54.0",
+    "httpx>=0.28.1",
+    "cryptography>=50.0.2",
+    "boto3>=1.43.108",
+    "pypdf>=6.19.0",
+    "openpyxl>=3.1.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["backend/src"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.26.0",
+    "pytest>=9.1.1",
+]

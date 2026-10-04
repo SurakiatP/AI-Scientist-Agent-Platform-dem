@@ -1,0 +1,17 @@
+a76f53ca6612e7b3828eec2311098675b7f9849ae4169a8bcef6302aec02a6c0  public/fonts/ibm-plex-mono-medium.woff2
+c36f509c0a8f9f85f29cb44bc8701d8a9e0b14c499e77a884f789ead7093a7ac  public/fonts/ibm-plex-mono-regular.woff2
+056e4e2459f57a0033c8c9c844ff19d6e42ac8602027803d4345823bcc939818  public/fonts/ibm-plex-sans-latin.woff2
+379cbfeb4c03a551180cb870124b2fcf1e7373bdaa10553328c1538f69352f73  public/fonts/ibm-plex-sans-thai-400.woff2
+254142e33d3fb74303ad01746155b7b0fd206790146d340656451bd1805006f6  public/fonts/ibm-plex-sans-thai-500.woff2
+e64e3cc6ea406c333b5d041f0e0d7cc83525e5a2f0215726c704473d205c738c  public/fonts/ibm-plex-sans-thai-600.woff2
+4a3c3b1a15d2d27a3382a9fa5d49d539757b7d1ff386041d0ed2e70001ad4d42  public/fonts/ibm-plex-sans-thai-latin-400.woff2
+22905c0923fa4be05bf547703d855df7ae1fe545ee63f4a8141fa2d11ce338c8  public/fonts/ibm-plex-sans-thai-latin-500.woff2
+4fba46b856402e41a0489770475fd4f4b240338f7ecd213e82d3dbc19cf33b24  public/fonts/ibm-plex-sans-thai-latin-600.woff2
+1d75a0cb3bb76e6f59ba85bae7f31b33d5c8c020d33e1b499580957172a82f03  public/fonts/noto-serif-thai-latin.woff2
+a6e0d661ce53d7f1e7b873e9dd79e018148874f031b75fcd65eacda5a808da12  public/fonts/noto-serif-thai.woff2
+2a24bad466f09b88b8e9cbc488bf774117c912e66374c57bf4716855849143f8  public/fonts/source-serif-4-latin.woff2
+7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da  public/fonts/OFL-IBM-Plex-Mono.txt
+7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da  public/fonts/OFL-IBM-Plex-Thai.txt
+7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da  public/fonts/OFL-IBM-Plex.txt
+2e98fd23a52d253db8612cd5942c8f2ff4111b21d2367050fdca91d8ccc374a0  public/fonts/OFL-Noto-Serif-Thai.txt
+5f94c3fd3a23131a417ab5a0c8452de57e70c3cfb9f604d88241f7065ebf9fd9  public/fonts/OFL-Source-Serif-4.txt

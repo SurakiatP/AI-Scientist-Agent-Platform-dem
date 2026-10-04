@@ -31,3 +31,12 @@ htmlcov/
 /.integration-hub/
 /AGENTS.md
 /CLAUDE.md
+
+# Local test services and generated evidence
+/.local/
+
+# Frontend dependencies and generated browser evidence
+node_modules/
+*.tsbuildinfo
+playwright-report/
+test-results/

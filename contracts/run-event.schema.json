@@ -1,0 +1,564 @@
+{
+  "$defs": {
+    "ArtifactReadyPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactView"
+        }
+      },
+      "required": [
+        "artifact"
+      ],
+      "title": "ArtifactReadyPayload",
+      "type": "object"
+    },
+    "ArtifactView": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "format": "uuid",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "content_type": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Content Type",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "report",
+            "table",
+            "plot",
+            "file"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "partial": {
+          "title": "Partial",
+          "type": "boolean"
+        },
+        "project_id": {
+          "format": "uuid",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[a-fA-F0-9]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size": {
+          "minimum": 0,
+          "title": "Size",
+          "type": "integer"
+        },
+        "title": {
+          "maxLength": 300,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "project_id",
+        "run_id",
+        "title",
+        "kind",
+        "sha256",
+        "size",
+        "content_type",
+        "partial"
+      ],
+      "title": "ArtifactView",
+      "type": "object"
+    },
+    "DecisionRequiredPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "decision_id": {
+          "format": "uuid",
+          "title": "Decision Id",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "budget_exhausted",
+            "unknown_outcome",
+            "data_scope",
+            "plan_change"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision_id",
+        "reason"
+      ],
+      "title": "DecisionRequiredPayload",
+      "type": "object"
+    },
+    "PlanReadyPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "plan_digest": {
+          "pattern": "^[a-fA-F0-9]{64}$",
+          "title": "Plan Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan_digest"
+      ],
+      "title": "PlanReadyPayload",
+      "type": "object"
+    },
+    "RunStatePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": [
+            "planning",
+            "awaiting_approval",
+            "queued",
+            "running",
+            "waiting_input",
+            "recovering",
+            "stopping",
+            "completed",
+            "failed",
+            "canceled",
+            "rejected"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "title": "RunStatePayload",
+      "type": "object"
+    },
+    "StageCompletedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "outcome": {
+          "enum": [
+            "completed",
+            "partial",
+            "failed"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "stage": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Stage",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stage",
+        "outcome"
+      ],
+      "title": "StageCompletedPayload",
+      "type": "object"
+    },
+    "StageStartedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "stage": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Stage",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stage"
+      ],
+      "title": "StageStartedPayload",
+      "type": "object"
+    },
+    "UsageUpdatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "reserved_tokens": {
+          "minimum": 0,
+          "title": "Reserved Tokens",
+          "type": "integer"
+        },
+        "token_limit": {
+          "minimum": 0,
+          "title": "Token Limit",
+          "type": "integer"
+        },
+        "usage_tokens": {
+          "minimum": 0,
+          "title": "Usage Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "usage_tokens",
+        "reserved_tokens",
+        "token_limit"
+      ],
+      "title": "UsageUpdatedPayload",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "plan.ready",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/PlanReadyPayload"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "sequence",
+        "revision",
+        "occurred_at",
+        "kind",
+        "payload"
+      ],
+      "title": "PlanReadyPayloadEvent",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "run.state",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/RunStatePayload"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "sequence",
+        "revision",
+        "occurred_at",
+        "kind",
+        "payload"
+      ],
+      "title": "RunStatePayloadEvent",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "stage.started",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/StageStartedPayload"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "sequence",
+        "revision",
+        "occurred_at",
+        "kind",
+        "payload"
+      ],
+      "title": "StageStartedPayloadEvent",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "stage.completed",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/StageCompletedPayload"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "sequence",
+        "revision",
+        "occurred_at",
+        "kind",
+        "payload"
+      ],
+      "title": "StageCompletedPayloadEvent",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "artifact.ready",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ArtifactReadyPayload"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "sequence",
+        "revision",
+        "occurred_at",
+        "kind",
+        "payload"
+      ],
+      "title": "ArtifactReadyPayloadEvent",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "decision.required",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/DecisionRequiredPayload"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "sequence",
+        "revision",
+        "occurred_at",
+        "kind",
+        "payload"
+      ],
+      "title": "DecisionRequiredPayloadEvent",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "usage.updated",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/UsageUpdatedPayload"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "sequence",
+        "revision",
+        "occurred_at",
+        "kind",
+        "payload"
+      ],
+      "title": "UsageUpdatedPayloadEvent",
+      "type": "object"
+    }
+  ],
+  "title": "RunEvent",
+  "type": "object"
+}

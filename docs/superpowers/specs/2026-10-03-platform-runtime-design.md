@@ -2,7 +2,7 @@
 
 Date: 2026-10-03 (Asia/Bangkok)
 
-Status: Technical specification prepared for owner review. The owner selected MinIO AIStor Free single-node and pausing only an unknown-outcome step for an owner decision. Written-spec and implementation-plan review remain outstanding. Runtime feasibility and acceptance must be demonstrated during implementation; no product implementation or deployment is authorized by this document alone.
+Status: Written specification approved by the owner on 2026-10-03. The owner selected local open-source MinIO single-node and pausing only an unknown-outcome step for an owner decision. Implementation-plan review remains outstanding. Runtime feasibility and acceptance must be demonstrated during implementation; no product implementation or deployment is authorized by this document alone.
 
 ## Scope and authoritative documents
 
@@ -23,7 +23,7 @@ Use React/TypeScript/Vite for the frontend and a Python 3.13 application package
 | Broker | Execute approved LLM, scholarly, package and peer requests | Selected credentials and outbound policy; no owner approval authority |
 | Run worker | Pinned runtime, reviewed skills, local computation | Its immutable inputs and writable run workspace only |
 | PostgreSQL | State, grants, approvals, queue leases, operation ledger, budgets, events | Authoritative application records |
-| AIStor Free | Input/output/checkpoint bytes under immutable keys | Storage service only; no public bucket or worker credentials |
+| Open-source MinIO | Input/output/checkpoint bytes under immutable keys | Storage service only; no public bucket or worker credentials |
 
 Docker access belongs only to the supervisor. Neither the public API nor a worker receives the Docker socket. The supervisor's Docker authority is equivalent to host administration and must not be exposed as a public API.
 
@@ -47,7 +47,7 @@ DESIGN.md                    Frontend source of truth
 
 One backend package is sufficient; no independently versioned microservices or generic plugin framework. Keep production data, environments, license files, generated artifacts and credentials outside Git. Maintain Python and JavaScript lockfiles and immutable deployment image references.
 
-The existing `.venv` reports Python 3.9.6, while `.python-version` selects 3.13.6. Recreate the environment with the selected compatible interpreter during the approved implementation setup; do not treat the existing virtual environment as runtime-ready. The inspected Hermes revision declares Python `>=3.11,<3.15`.
+The application uses patched Python 3.13.14 in the recreated `.venv`. The pinned Hermes package declares Python `>=3.11,<3.15`, but its core dependency markers and lock select Python 3.14. Build a separate patched, pinned Python 3.14 worker image; do not install its core dependency set into the application environment. Use the upstream core lock (Git blob `98e0d350cf7996ea174d7a4bf38e1d333468a954`) without development or optional extras, then scan the actual resolved worker image.
 
 ## Durable records and concurrency
 
@@ -77,6 +77,12 @@ Errors retain verified partial outputs and a public actionable error category. R
 
 Pin Hermes to commit `bd0affe5e5f723579df8902852f5d0c47795f355` as the inspected candidate. Instantiate `run_agent.AIAgent` inside each run worker with a private `HERMES_HOME`. Its private SQLite persistence may exist within that worker; it is not the platform database and is not authoritative for approval or recovery.
 
+Set private `HOME` and `HERMES_HOME` before importing the runtime. Disable context-file discovery, soul identity, memory, background review, fallback models, credential pools, native checkpoints, trajectory saving and native protocol gateways. Expose only the platform science toolset. The immutable image contains pinned source, required MIT/Apache notices and reviewed skill resources, without Git/updater markers or host configuration mounts.
+
+The pinned runtime reconstructs model clients from `_client_kwargs`; replacing only an existing client is insufficient. Override both primary and auxiliary model-client factories with an owned `httpx.BaseTransport` that submits journaled operations to the internal broker. Restrict the initial model binding to Chat Completions and disable SDK retries. The worker holds only a run capability, never a provider key. Compression uses the same broker accounting path; background/title/vision/delegation paths remain disabled until separately integrated. These private seams are pinned implementation dependencies requiring executable B5 regression coverage.
+
+Use the pinned `_execute_tool_calls` dispatch seam to preserve original assistant/tool-call identities, enforce the explicit tool allowlist and sequence operations. Registry handlers alone do not receive the original tool-call ID. No upstream skill's direct `curl` or `requests` instruction authorizes network access; platform scholarly adapters route retrieval through the broker.
+
 Use a non-root container with a read-only root filesystem, read-only input mount, bounded writable workspace, dropped capabilities, no privileged mode, no host mounts, and enforced CPU/memory/PID/disk limits. Check actual engine enforcement before execution; reject a run if required limits cannot be enforced. Use a dedicated bounded workspace volume/filesystem when the storage driver cannot enforce a container disk limit.
 
 Workers use an isolated internal network, with no direct internet, host/LAN, PostgreSQL, storage, metadata-service or Docker access. A dedicated broker endpoint is their only authorized network interface. Validate isolation with direct IPv4/IPv6, DNS, redirects and alternate endpoints; a runtime profile is not proof of containment.
@@ -92,6 +98,8 @@ Endpoint validation must reject local/private/link-local targets for ordinary sc
 ## Checkpoint capture and restart recovery
 
 Recovery means continuation from committed operation boundaries. It does not restore an arbitrary Python instruction pointer, dead process, or native filesystem rollback checkpoint.
+
+Native `run_conversation()` starts a new user turn; supplying saved history alone does not resume pending tools. At quiescent boundaries, capture canonical or compacted messages, the bound system prompt, Todo state, pending raw assistant/tool-call identities, operation mappings and version hashes. Recovery first reconciles committed model responses and tool results from the ledger, resolves the pending tool boundary without resending known effects, and only then starts any explicitly recorded continuation turn. Prove this against the pinned runtime; a newly repeated original prompt is not successful recovery.
 
 A platform checkpoint contains schema/runtime/image/skills hashes, approved plan and snapshot digests, conversation/context needed for continuation (including compressed context), current stage, recorded tool-call and broker-operation identities, workspace manifest, artifact references, environment/package manifest, and consumed/reserved usage. Runtime-private state may supplement this checkpoint but cannot override it.
 
@@ -113,21 +121,11 @@ Enforce approved elapsed-execution and LLM-usage limits across recovery. Waiting
 
 ## Storage, credentials and deployment prerequisites
 
-Use **MinIO AIStor Free single-node**, selected by the owner, rather than the archived Community distribution. The inspected Community advisory affects all releases through the final release; the named fix is AIStor `RELEASE.2026-04-11T03-20-12Z`.
+Use **local open-source MinIO single-node**, superseding the earlier AIStor Free choice by owner instruction on 2026-10-03. The selected maintained AGPL-3.0 source is [Chainguard EmeritOSS MinIO](https://github.com/chainguard-forks/minio), release `RELEASE.2026-09-22T19-25-18Z`, exact commit `df34868a88cc8c396807e04a7e220810b321bdaa`. This is a maintained fork of MinIO with best-effort support, not original vendor AIStor. No AIStor license acquisition or proprietary terms apply. Preserve license and attribution in built distributions.
 
-Verified distribution candidate: `RELEASE.2026-09-19T17-05-25Z`, advertised by the official release API on 2026-10-03. OCI index reference:
+Source inspection found fixes for CVE-2026-41145 (query credentials), CVE-2026-40344 (Snowball signature verification), CVE-2026-39414 (bounded CSV records), and a replication-metadata guard for CVE-2026-34204. That guard checks header presence, so it does not alone prove replication authorization: actual tests must cover forged true/false markers and prove the typed storage broker never forwards replication/SSE-injection headers or exposes direct store access. Record this as a verified boundary mitigation only after those checks pass. GitHub reports a verified source commit signature; build execution must independently validate source provenance. The release provides no verified binary/image assets or SBOM. Build unchanged pinned source with a pinned maintained Go toolchain and runtime base; record resulting image digest, generate SBOM, run regression checks and dated transitive/OS scans. Do not use the fork's mutable Dockerfile or world-writable /usr/bin packaging. Source fix review is not a clean-image claim. Archived original Community does not satisfy the unchanged safety gate without a separately demonstrated mitigation.
 
-```text
-quay.io/minio/aistor/minio@sha256:107cf2014a9583c74c11e3cdbd6903d89c2244355886b89ce532f4ecae9c23f3
-```
-
-This is an inspected candidate, not an installed or scanned image. Resolve release notes/hotfixes and rescan exact artifacts before deployment.
-
-The owner obtains the Free license from the vendor and accepts its terms directly. Do not download/install the software, submit the acquisition form, or accept vendor terms on the owner's behalf during design. Mount the license read-only into storage only; never send it to workers, source, logs or local Hub. Reference the official image in deployment instructions rather than bundling/redistributing the vendor software.
-
-Free excludes native SSE/KMS encryption, replication, lifecycle transitions and version-specific deletion. Use application-level logical versions in PostgreSQL bound to immutable object keys and SHA-256 hashes. Do not enable native object versioning as a required dependency. Ordinary authorized PUT/GET/DELETE operates on those immutable keys; owner deletion first creates a logical tombstone, then deletes only unreferenced objects after retention checks.
-
-Require an encrypted operator-managed host volume for real research data; do not label this native S3 encryption. Backups include both database and object bytes, encrypted separately. License availability, allowed features, renewal and expiry affect readiness; do not assume unlimited offline operation. Surface storage unavailable before accepting execution if S3 access is blocked.
+Use application-level logical versions in PostgreSQL bound to immutable object keys and SHA-256 hashes. Native object versioning, LDAP/OIDC/STS, replication, distributed operation and S3 Select are not required and remain disabled/unexposed. Ordinary authorized PUT/GET/DELETE operates on immutable keys; owner deletion first creates a logical tombstone, then deletes only unreferenced objects after retention checks. Require an encrypted operator-managed host volume for real research data; do not label this native S3 encryption. Backups include both database and object bytes, encrypted separately. Surface storage unavailable before accepting execution if authenticated S3 access fails; readiness includes the selected immutable source/image provenance and vulnerability gate rather than vendor-license state.
 
 Storage uses generated credentials, private buckets and loopback/private-service administration. Workers never receive S3 keys or unrestricted object URLs. Downloads use the authenticated application gateway, with project/run authorization on every request and safe filenames/content types. Treat uploaded archives and reports as untrusted: reject path traversal, links escaping the workspace, decompression bombs and executable HTML previews. Keep downloaded research content outside the application origin when rendered.
 
@@ -217,7 +215,7 @@ The first implementation tranche must prove the pinned runtime's broker-only exe
 - [MCP specification release](https://github.com/modelcontextprotocol/modelcontextprotocol/releases/tag/2026-07-28) and [SDK release](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.3.0).
 - [A2A specification](https://github.com/a2aproject/A2A/tree/v1.0.1) and [Python SDK](https://github.com/a2aproject/a2a-python/tree/v1.2.1).
 - [MinIO Community advisory CVE-2026-41145](https://github.com/minio/minio/security/advisories/GHSA-hv4r-mvr4-25vw).
-- [AIStor Free Agreement](https://www.min.io/legal/aistor-free-agreement), [license/features documentation](https://docs.min.io/aistor/operations/licenses/), [container installation](https://docs.min.io/aistor/installation/container/install/), [release API](https://dl.min.io/api/releases/aistor/latest), and [release artifacts/SBOM documentation](https://docs.min.io/aistor/operations/release-artifacts/).
+- [Pinned AGPL MinIO release](https://github.com/chainguard-forks/minio/releases/tag/RELEASE.2026-09-22T19-25-18Z), [license](https://github.com/chainguard-forks/minio/blob/df34868a88cc8c396807e04a7e220810b321bdaa/LICENSE), and [security policy](https://github.com/chainguard-forks/minio/blob/df34868a88cc8c396807e04a7e220810b321bdaa/SECURITY.md).
 - [Docker Engine advisory CVE-2026-92543](https://github.com/moby/moby/security/advisories/GHSA-7cfq-22r6-qp73).
 
 All upstream checks were read-only. No image was pulled, vendor agreement accepted, product dependency installed, paid API called, or runtime acceptance test executed during this design phase.
