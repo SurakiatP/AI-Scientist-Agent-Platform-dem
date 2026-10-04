@@ -476,11 +476,15 @@ def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
         db.rollback()
         return _run_view(db, run_id)
     limits.settle_active_interval(db, run_id)
-    db.execute(text("""
+    # Executors are fenced, so no reply can arrive; provider outcome stays uncertain. Keep reservation.
+    db.execute(text("UPDATE operations SET state='unknown' WHERE run_id=:run AND state='reserved'"), {"run": run_id})
+    canceled = db.execute(text("""
         UPDATE runs SET state='canceled', lease_expires_at=NULL,
             waiting_reason=NULL, error_code=NULL
         WHERE id=:run AND state='stopping' AND generation=:generation
-    """), {"run": run_id, "generation": row["generation"]})
+    """), {"run": run_id, "generation": row["generation"]}).rowcount
+    if canceled == 1:
+        _event(db, run_id, row["revision"], "run.state", {"state": "canceled"})
     db.commit()
     return _run_view(db, run_id)
 
@@ -641,6 +645,8 @@ def recover(db: Session, run_id: UUID) -> RunView:
         _event(db, run_id, row["revision"], "run.state", {"state": "waiting_input"})
     elif row["cancel_requested"]:
         limits.settle_active_interval(db, run_id)
+        db.execute(text("UPDATE operations SET state='unknown' WHERE run_id=:run AND state='reserved'"),
+                   {"run": run_id})
         db.execute(text("""
             UPDATE runs SET state='canceled', waiting_reason=NULL,
                 lease_expires_at=NULL WHERE id=:run

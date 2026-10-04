@@ -14,7 +14,7 @@ from sqlalchemy.pool import NullPool
 
 from scientist import checkpoints, objects
 from scientist.contracts import PlanSpec, Principal
-from scientist.db import create_project, create_session, engine, migrate
+from scientist.db import create_project, create_session, engine, migrate, session
 from scientist.domain import approve_run, revise_plan, submit_run
 from scientist.runtime_contracts import RuntimeContextV1, RUNTIME_COMMIT
 from scientist import supervisor
@@ -820,3 +820,91 @@ def test_claim_refuses_queued_run_with_pending_budget_decision():
         isolated.dispose()
         with engine().begin() as connection:
             connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+
+
+def _reserved_stop_run(db, project_session, monkeypatch, *, worker_ok=True, dispatch_ok=True):
+    run, _ = _approved_run(db, project_session)
+    db.execute(text("UPDATE runs SET state='running', generation=1, reserved_tokens=7 WHERE id=:run"),
+               {"run": run.run_id})
+    worker_ref = ExecutorRef(uuid4(), run.run_id, 1, "worker", None, uuid4(), "engine-test", "1" * 64)
+    dispatch_ref = ExecutorRef(uuid4(), run.run_id, 1, "dispatch", None, uuid4(), "engine-test", "2" * 64)
+    _insert_executor(db, run.run_id, worker_ref, "active", bound=True)
+    _insert_executor(db, run.run_id, dispatch_ref, "active", bound=True)
+    db.execute(text("""
+        INSERT INTO operations(id, run_id, operation_id, generation, kind, payload_hash, state, reserve_tokens)
+        VALUES (:id, :run, 'hung-stop-op', 1, 'search', :hash, 'reserved', 7)
+    """), {"id": uuid4(), "run": run.run_id, "hash": "e" * 64})
+    db.execute(text("""INSERT INTO operation_executors(run_id, operation_id, generation, executor_id)
+        VALUES (:run, 'hung-stop-op', 1, :executor)"""), {"run": run.run_id, "executor": dispatch_ref.executor_id})
+    db.commit()
+    flags = SimpleNamespace(worker_ok=worker_ok, dispatch_ok=dispatch_ok, during_stop=None)
+
+    class Engine:
+        def stop_worker(self, ref, grace_seconds):
+            return flags.worker_ok
+
+    class Dispatch:
+        def stop(self, db, ref, grace_seconds):
+            if flags.during_stop:
+                flags.during_stop()
+            return flags.dispatch_ok
+
+        def inactive(self, db, ref, operation_id):
+            return True
+
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=Engine(), dispatch=Dispatch()))
+    return run, flags
+
+
+def _ops_and_budget(db, run_id):
+    op = db.execute(text("SELECT state, reserve_tokens, usage_tokens, result FROM operations WHERE run_id=:run"),
+                    {"run": run_id}).one()
+    return tuple(op), db.execute(text("SELECT reserved_tokens FROM runs WHERE id=:run"), {"run": run_id}).scalar_one()
+
+
+def test_stop_moves_reserved_operation_to_unknown_and_keeps_reservation(db, project_session, monkeypatch):
+    run, _ = _reserved_stop_run(db, project_session, monkeypatch)
+    before = _ops_and_budget(db, run.run_id)
+    assert supervisor.stop(db, run.run_id, 0).state == "canceled"
+    state, reserve, usage, result = _ops_and_budget(db, run.run_id)[0]
+    assert (state, reserve, usage, result) == ("unknown", *before[0][1:])
+    assert _ops_and_budget(db, run.run_id)[1] == before[1] == 7
+    assert db.execute(text("SELECT count(*) FROM events WHERE run_id=:run AND kind='run.state' "
+                           "AND payload->>'state'='canceled'"), {"run": run.run_id}).scalar_one() == 1
+
+
+def test_stop_emits_no_canceled_event_when_run_left_stopping_during_grace(db, project_session, monkeypatch):
+    run, flags = _reserved_stop_run(db, project_session, monkeypatch)
+
+    def dying_dispatch_records_unknown():
+        with session() as other:
+            other.execute(text("UPDATE runs SET state='waiting_input', waiting_reason='unknown_outcome' WHERE id=:run"),
+                          {"run": run.run_id})
+            other.commit()
+
+    flags.during_stop = dying_dispatch_records_unknown
+    assert supervisor.stop(db, run.run_id, 0).state == "waiting_input"
+    assert db.execute(text("SELECT count(*) FROM events WHERE run_id=:run AND kind='run.state' "
+                           "AND payload->>'state'='canceled'"), {"run": run.run_id}).scalar_one() == 0
+
+
+@pytest.mark.parametrize("fail", ["worker", "dispatch"])
+def test_stop_keeps_reserved_operation_when_fence_unproven(db, project_session, monkeypatch, fail):
+    run, _ = _reserved_stop_run(db, project_session, monkeypatch,
+                                worker_ok=fail != "worker", dispatch_ok=fail != "dispatch")
+    before = _ops_and_budget(db, run.run_id)
+    stopped = supervisor.stop(db, run.run_id, 0)
+    assert (stopped.state, stopped.waiting_reason) == ("waiting_input", "executor_quiescence_unproven")
+    assert _ops_and_budget(db, run.run_id) == before
+    assert before[0][0] == "reserved"
+
+
+def test_recover_cancel_requested_moves_reserved_operation_to_unknown(db, project_session, monkeypatch):
+    run, flags = _reserved_stop_run(db, project_session, monkeypatch, dispatch_ok=False)
+    before = _ops_and_budget(db, run.run_id)
+    assert supervisor.stop(db, run.run_id, 0).state == "waiting_input"
+    assert _ops_and_budget(db, run.run_id) == before
+    flags.dispatch_ok = True
+    assert supervisor.recover(db, run.run_id).state == "canceled"
+    after = _ops_and_budget(db, run.run_id)
+    assert after[0][0] == "unknown" and after[0][1:] == before[0][1:] and after[1] == before[1] == 7
