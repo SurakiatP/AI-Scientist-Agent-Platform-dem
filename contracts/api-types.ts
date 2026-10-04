@@ -157,6 +157,25 @@ export interface ConnectionView {
   has_secret: boolean;
 }
 
+export interface MessageView {
+  id: string;
+  sequence: number;
+  role: string;
+  content: string;
+  created_at: string;
+  run_id?: null | string;
+}
+
+export interface DecisionSubmit {
+  decision_id: string;
+  expected_revision: number;
+  idempotency_key: string;
+  choice: "verified_result" | "retry" | "stop" | "extend";
+  result?: ObjectRef | null;
+  add_tokens?: null | number;
+  add_elapsed_ms?: null | number;
+}
+
 export interface PlanReadyPayload {
   plan_digest: string;
 }
@@ -181,6 +200,8 @@ export interface ArtifactReadyPayload {
 export interface DecisionRequiredPayload {
   decision_id: string;
   reason: "budget_exhausted" | "unknown_outcome" | "data_scope" | "plan_change";
+  required_tokens?: null | number;
+  required_elapsed_ms?: null | number;
 }
 
 export interface UsageUpdatedPayload {

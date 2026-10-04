@@ -525,3 +525,85 @@ def test_unknown_outcome_is_not_resumed_by_budget_extension(run_limits_context):
     assert (after["state"], after["waiting_reason"], after["reserved_tokens"]) == (
         "waiting_input", "unknown_outcome", 7,
     )
+
+
+def _decision_payload(context: RunLimitsContext) -> dict:
+    with context.sql_engine.connect() as connection:
+        return connection.execute(text("""
+            SELECT payload FROM events WHERE run_id=:run AND kind='decision.required'
+            ORDER BY sequence DESC LIMIT 1
+        """), {"run": context.run_id}).scalar_one()
+
+
+def _extend_and_resume(context: RunLimitsContext, *, token_add: int = 0, elapsed_add: int = 0) -> None:
+    from scientist.domain import extend_run_budget
+    row = context.db.execute(text("SELECT revision, token_limit, elapsed_limit_ms, budget_decision_id FROM runs WHERE id=:r"),
+                             {"r": context.run_id}).one()
+    extend_run_budget(context.db, context.owner, context.run_id, row.revision, row.budget_decision_id, "ext-exact",
+                      row.token_limit + token_add, row.elapsed_limit_ms + elapsed_add)
+    context.db.execute(text("""
+        UPDATE runs SET state='running', waiting_reason=NULL, lease_expires_at=clock_timestamp()+interval '1 hour'
+        WHERE id=:r
+    """), {"r": context.run_id})
+    context.db.commit()
+
+
+def test_budget_wait_reports_token_amount_and_exact_extension_admits_request(run_limits_context):
+    context = run_limits_context
+    context.db.execute(text("UPDATE runs SET usage_tokens=299, reserved_tokens=0 WHERE id=:r"), {"r": context.run_id})
+    context.db.commit()
+    with pytest.raises(DomainError, match="budget_exhausted"):
+        broker.execute(context.db, context.capability, _request(context, reserve_tokens=200))
+    payload = _decision_payload(context)
+    assert payload["required_tokens"] == 299 + 0 + 200 - 300
+    assert payload["required_elapsed_ms"] == 0
+    assert context.transport.calls == 0
+
+    _extend_and_resume(context, token_add=payload["required_tokens"])
+    result = broker.execute(context.db, context.capability, _request(context, reserve_tokens=200))
+    assert result.state == "committed"
+    assert context.transport.calls == 1
+
+
+def test_budget_wait_reports_elapsed_amount_and_exact_extension_admits_request(run_limits_context):
+    context = run_limits_context
+    context.db.execute(text("""
+        UPDATE runs SET elapsed_used_ms=elapsed_limit_ms+7, elapsed_active_since=NULL WHERE id=:r
+    """), {"r": context.run_id})
+    context.db.commit()
+    with pytest.raises(DomainError, match="budget_exhausted"):
+        broker.execute(context.db, context.capability, _request(context, reserve_tokens=200))
+    payload = _decision_payload(context)
+    assert payload["required_elapsed_ms"] == 8
+    assert payload["required_tokens"] == 0
+
+    _extend_and_resume(context, elapsed_add=payload["required_elapsed_ms"])
+    assert broker.execute(context.db, context.capability, _request(context, reserve_tokens=200)).state == "committed"
+    assert context.transport.calls == 1
+
+
+def test_unknown_outcome_decision_has_no_required_amounts(run_limits_context, monkeypatch):
+    context = run_limits_context
+
+    def lost(_request, _target):
+        raise TimeoutError("lost")
+
+    monkeypatch.setattr(broker, "_transport", lost)
+    assert broker.execute(context.db, context.capability, _request(context, reserve_tokens=200)).state == "unknown"
+    payload = _decision_payload(context)
+    assert payload["reason"] == "unknown_outcome"
+    assert payload.get("required_tokens") is None and payload.get("required_elapsed_ms") is None
+
+
+def test_unrecordable_budget_refusal_is_forbidden_not_a_silent_409(run_limits_context, monkeypatch):
+    context = run_limits_context
+    monkeypatch.setattr(limits, "budget_exhausted", lambda *a, **k: False)
+    context.db.execute(text("UPDATE runs SET usage_tokens=token_limit WHERE id=:r"), {"r": context.run_id})
+    context.db.commit()
+    with pytest.raises(DomainError) as refused:
+        broker.execute(context.db, context.capability, _request(context, reserve_tokens=200))
+    assert (refused.value.code, refused.value.status) == ("forbidden", 403)
+    assert context.transport.calls == 0
+    with context.sql_engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM events WHERE run_id=:r AND kind='decision.required'"),
+                                  {"r": context.run_id}).scalar_one() == 0

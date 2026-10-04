@@ -1212,7 +1212,7 @@ def test_unknown_retry_keeps_original_reservation_and_links_new_identity(broker_
     transport.lose_response = True
     original = broker.execute(db, capability, request(run_id))
     transport.lose_response = False
-    resolved = broker.resolve_unknown(db, owner, run_id, "operation-1", "retry", None)
+    resolved = broker.resolve_unknown(db, owner, run_id, "operation-1", "retry", None, queued_only=False)
     rows = db.execute(text("SELECT operation_id, state, reserve_tokens, result FROM operations WHERE run_id = :run ORDER BY created_at, operation_id"),
                       {"run": run_id}).all()
     assert resolved.state == "running"
@@ -1259,3 +1259,86 @@ def test_arbitrary_object_reference_cannot_resolve_unknown_outcome(broker_fixtur
     arbitrary = ObjectRef(project_id=project_id, key="asserted", sha256="a" * 64, size=1, content_type="application/json")
     with pytest.raises(DomainError, match="forbidden"):
         broker.resolve_unknown(db, owner, run_id, "operation-1", "verified_result", arbitrary)
+
+
+def _decisions(db, run_id) -> int:
+    return db.execute(text("SELECT count(*) FROM events WHERE run_id=:r AND kind='decision.required'"),
+                      {"r": run_id}).scalar_one()
+
+
+def _lost_reserved_op(broker_fixture):
+    """An operation left in 'reserved' with the run reset to running, quiescence proven."""
+    db, _, run_id, transport, _ = broker_fixture
+    transport.lose_response = True
+    broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id))
+    db.execute(text("UPDATE operations SET state='reserved' WHERE run_id=:r"), {"r": run_id})
+    db.execute(text("UPDATE runs SET state='running', waiting_reason=NULL WHERE id=:r"), {"r": run_id})
+    db.commit()
+    return db, run_id
+
+
+@pytest.mark.parametrize("terminal", ["canceled", "completed"])
+def test_reconcile_keeps_terminal_run_terminal(broker_fixture, terminal):
+    db, run_id = _lost_reserved_op(broker_fixture)
+    db.execute(text("UPDATE runs SET state=:s WHERE id=:r"), {"s": terminal, "r": run_id})
+    db.commit()
+    before = _decisions(db, run_id)
+    result = broker.reconcile(db, run_id, "operation-1")
+    assert result.state == "unknown"
+    assert db.execute(text("SELECT state FROM runs WHERE id=:r"), {"r": run_id}).scalar_one() == terminal
+    assert _decisions(db, run_id) == before
+
+
+def test_reconcile_does_not_preempt_stopping(broker_fixture):
+    db, run_id = _lost_reserved_op(broker_fixture)
+    db.execute(text("UPDATE runs SET state='stopping', cancel_requested=true WHERE id=:r"), {"r": run_id})
+    db.commit()
+    before = _decisions(db, run_id)
+    assert broker.reconcile(db, run_id, "operation-1").state == "unknown"
+    assert db.execute(text("SELECT state FROM runs WHERE id=:r"), {"r": run_id}).scalar_one() == "stopping"
+    assert _decisions(db, run_id) == before
+
+
+@pytest.mark.parametrize("target", ["canceled", "stopping"])
+def test_record_unknown_respects_stop(broker_fixture, target):
+    db, _, run_id, transport, _ = broker_fixture
+
+    def cancel_then_fail(req, tgt):
+        with database_session() as other:
+            other.execute(text("UPDATE runs SET state=:s, cancel_requested=true WHERE id=:r"),
+                          {"s": target, "r": run_id})
+            other.commit()
+        raise TimeoutError("lost")
+
+    broker.configure(transport=cancel_then_fail, persist_result=broker._persist_result, capability_key=b"b" * 32,
+                     resolver=lambda host, port: ["8.8.8.8"],
+                     provider_destinations=dict(broker._provider_destinations))
+    result = broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id))
+    assert result.state == "unknown"
+    run = db.execute(text("SELECT state, reserved_tokens FROM runs WHERE id=:r"), {"r": run_id}).one()
+    assert (run.state, run.reserved_tokens) == (target, 5)
+    assert _decisions(db, run_id) == 0
+
+
+def test_stop_queued_with_reserved_op_fences(broker_fixture, monkeypatch):
+    from scientist import supervisor
+    db, run_id = _lost_reserved_op(broker_fixture)
+    db.execute(text("UPDATE runs SET state='queued', lease_expires_at=NULL WHERE id=:r"), {"r": run_id})
+    db.commit()
+    calls = []
+    monkeypatch.setattr(supervisor, "_fence_generation", lambda *a: calls.append(a) or True)
+    view = supervisor.stop(db, run_id, 1)
+    assert len(calls) == 1
+    assert view.state == "canceled"
+    assert db.execute(text("SELECT state FROM operations WHERE run_id=:r"), {"r": run_id}).scalar_one() == "unknown"
+
+
+def test_stop_queued_with_reserved_op_unproven_fence_waits(broker_fixture, monkeypatch):
+    from scientist import supervisor
+    db, run_id = _lost_reserved_op(broker_fixture)
+    db.execute(text("UPDATE runs SET state='queued', lease_expires_at=NULL WHERE id=:r"), {"r": run_id})
+    db.commit()
+    monkeypatch.setattr(supervisor, "_fence_generation", lambda *a: False)
+    supervisor.stop(db, run_id, 1)
+    run = db.execute(text("SELECT state, waiting_reason FROM runs WHERE id=:r"), {"r": run_id}).one()
+    assert (run.state, run.waiting_reason) == ("waiting_input", "executor_quiescence_unproven")

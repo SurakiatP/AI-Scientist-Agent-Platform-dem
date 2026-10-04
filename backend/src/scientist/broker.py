@@ -64,6 +64,7 @@ _resolver: Resolver = lambda host, port: [item[4][0] for item in socket.getaddri
 _peer_destinations: dict[str, str] = {}
 _provider_destinations: dict[str, str] = {}
 _dispatch_is_inactive: DispatchInactivityProof | None = None
+_dispatch_inactivity_proof: DispatchInactivityProof | None = None  # host-registered; survives configure()
 _inactive_dispatches: set[tuple[UUID, str, int]] = set()
 _active_operations: set[tuple[UUID, str, int]] = set()
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -99,6 +100,12 @@ def configure(
     _peer_destinations = dict(peer_destinations or {})
     _provider_destinations = dict(provider_destinations or {})
     _dispatch_is_inactive = dispatch_is_inactive
+
+
+def configure_dispatch_inactivity(proof: DispatchInactivityProof | None) -> None:
+    """Register the host's exact dispatch-inactivity proof; configure() never resets it."""
+    global _dispatch_inactivity_proof
+    _dispatch_inactivity_proof = proof
 
 
 def issue_capability(db: Session, run_id: UUID, generation: int, ttl_seconds: int) -> str:
@@ -145,7 +152,7 @@ def execute(db: Session, worker_capability: str, request: OperationRequest) -> O
             return _continue_owner_retry(db, row, existing, request)
         return _operation_result(existing)
     if limits.budget_exhausted(db, row, reserve_tokens=request.reserve_tokens):
-        decision_id = limits.mark_budget_wait(db, request.run_id, row.revision, _event)
+        decision_id = limits.mark_budget_wait(db, request.run_id, row.revision, _event, reserve_tokens=request.reserve_tokens)
         if decision_id is None:
             db.rollback()
             raise DomainError("forbidden", 403)
@@ -169,13 +176,14 @@ def execute(db: Session, worker_capability: str, request: OperationRequest) -> O
         if current.generation != request.generation or current.state != "running" or current.lease_expires_at is None or current.lease_expires_at <= datetime.now(timezone.utc):
             raise DomainError("forbidden", 403)
         if limits.budget_exhausted(db, current, reserve_tokens=request.reserve_tokens):
-            decision_id = limits.mark_budget_wait(db, request.run_id, current.revision, _event)
+            decision_id = limits.mark_budget_wait(db, request.run_id, current.revision, _event, reserve_tokens=request.reserve_tokens)
             if decision_id is not None:
                 db.commit()
                 raise DomainError("budget_exhausted", 409)
             db.rollback()
             raise DomainError("forbidden", 403)
-        raise DomainError("budget_exhausted", 409)
+        # No decision can be recorded here, so a 409 would leave the adapter waiting forever.
+        raise DomainError("forbidden", 403)
     db.execute(text("""
         INSERT INTO operations (id, run_id, operation_id, generation, kind, payload_hash, state, reserve_tokens, result)
         VALUES (:id, :run, :operation, :generation, :kind, :hash, 'reserved', :reserve, CAST(:result AS jsonb))
@@ -339,18 +347,32 @@ def _record_unknown(db: Session, request: OperationRequest, revision: int, *, us
            "run": request.run_id, "operation": request.operation_id})
     if usage_tokens is not None:
         db.execute(text("""
-            UPDATE runs SET reserved_tokens = reserved_tokens - :reserve,
-                usage_tokens = usage_tokens + :usage,
-                state = 'waiting_input', waiting_reason = 'unknown_outcome'
+            UPDATE runs SET reserved_tokens = reserved_tokens - :reserve, usage_tokens = usage_tokens + :usage
             WHERE id = :run
         """), {"reserve": request.reserve_tokens, "usage": usage_tokens, "run": request.run_id})
         _emit_usage_event(db, request.run_id, revision)
-    else:
-        db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"),
-                   {"run": request.run_id})
-    _event(db, request.run_id, revision, "decision.required", {"decision_id": str(uuid4()), "reason": "unknown_outcome"})
+    # A concurrent stop/cancel/terminal transition wins; the reservation stays held either way.
+    waiting = db.execute(text("""
+        UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome'
+        WHERE id = :run AND state NOT IN ('completed', 'failed', 'canceled', 'rejected')
+          AND NOT cancel_requested
+    """), {"run": request.run_id}).rowcount
+    if waiting == 1:
+        _issue_unknown_decision(db, request.run_id, revision, request.operation_id)
     db.commit()
     return OperationResult(operation_id=request.operation_id, state="unknown", result=None, usage_tokens=usage_tokens)
+
+
+def _issue_unknown_decision(db: Session, run_id: UUID, revision: int, operation_id: str) -> None:
+    """Bind a decision_id to the operation and emit decision.required in the caller's transaction."""
+    decision_id = db.execute(text("""
+        INSERT INTO owner_decisions (decision_id, run_id, operation_id, reason)
+        VALUES (:id, :run, :operation, 'unknown_outcome')
+        ON CONFLICT (run_id, operation_id) WHERE state = 'pending' AND reason = 'unknown_outcome' DO NOTHING
+        RETURNING decision_id
+    """), {"id": uuid4(), "run": run_id, "operation": operation_id}).scalar_one_or_none()
+    if decision_id is not None:
+        _event(db, run_id, revision, "decision.required", {"decision_id": str(decision_id), "reason": "unknown_outcome"})
 
 
 def _emit_usage_event(db: Session, run_id: UUID, revision: int) -> None:
@@ -375,16 +397,19 @@ def reconcile(db: Session, run_id: UUID, operation_id: str) -> OperationResult:
     if row.state in {"reserved", "unknown"}:
         if not _quiescent(run, row):
             raise DomainError("revision_conflict", 409)
+    stopped = run.state in limits._TERMINAL or run.cancel_requested
     if row.state == "reserved":
         db.execute(text("UPDATE operations SET state = 'unknown' WHERE id = :id AND state = 'reserved'"), {"id": row.id})
-        if run.state != "waiting_input" or run.waiting_reason != "unknown_outcome":
-            db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})
-            _event(db, run_id, run.revision, "decision.required", {"decision_id": str(uuid4()), "reason": "unknown_outcome"})
+        if not stopped:
+            if run.state != "waiting_input" or run.waiting_reason != "unknown_outcome":
+                db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})
+            _issue_unknown_decision(db, run_id, run.revision, operation_id)
         db.commit()
         row = db.execute(text("SELECT * FROM operations WHERE id = :id"), {"id": row.id}).one()
-    elif row.state == "unknown" and not pending.get("retry_identity") and (run.state != "waiting_input" or run.waiting_reason != "unknown_outcome"):
-        db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})
-        _event(db, run_id, run.revision, "decision.required", {"decision_id": str(uuid4()), "reason": "unknown_outcome"})
+    elif row.state == "unknown" and not stopped and not pending.get("retry_identity"):
+        if run.state != "waiting_input" or run.waiting_reason != "unknown_outcome":
+            db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})
+        _issue_unknown_decision(db, run_id, run.revision, operation_id)
         db.commit()
     return _operation_result(row)
 
@@ -396,7 +421,14 @@ def resolve_unknown(
     operation_id: str,
     decision: Literal["verified_result", "retry", "stop"],
     result: ObjectRef | None,
+    *,
+    queued_only: bool = True,
+    receipt: tuple[str, str] | None = None,
 ) -> RunView:
+    """queued_only (default) forces a retry through the supervisor queue (never dispatched in this process);
+    queued_only=False keeps the lease-alive in-process dispatch for the legacy worker-embedded tests only.
+
+    receipt=(idempotency_key, payload_hash) is committed atomically with the resolution."""
     if owner.kind != "owner":
         raise DomainError("forbidden", 403)
     run = _load_run(db, run_id, lock=True)
@@ -420,7 +452,8 @@ def resolve_unknown(
             original = OperationRequest.model_validate(pending["request"])
         except (KeyError, ValueError) as exc:
             raise DomainError("storage_unavailable", 503) from exc
-        retry_now = run.lease_expires_at is not None and run.lease_expires_at > datetime.now(timezone.utc)
+        retry_now = (not queued_only and run.lease_expires_at is not None
+                     and run.lease_expires_at > datetime.now(timezone.utc))
         retry_generation = run.generation if retry_now else run.generation + 1
         retry_request = original.model_copy(update={"operation_id": retry_id, "generation": retry_generation})
         pending["retry_identity"] = retry_id
@@ -474,6 +507,12 @@ def resolve_unknown(
                    {"state": next_state, "run": run_id})
     else:
         db.execute(text("UPDATE runs SET state = 'stopping', cancel_requested = true, waiting_reason = NULL WHERE id = :run"), {"run": run_id})
+    db.execute(text("""
+        UPDATE owner_decisions SET state = 'resolved', resolved_at = now(), resolution = CAST(:resolution AS jsonb),
+            idempotency_key = :key, payload_hash = :hash
+        WHERE run_id = :run AND operation_id = :operation AND state = 'pending' AND reason = 'unknown_outcome'
+    """), {"resolution": json.dumps({"choice": decision}), "key": receipt[0] if receipt else None,
+           "hash": receipt[1] if receipt else None, "run": run_id, "operation": operation_id})
     db.commit()
     if retry_request is not None and retry_now:
         try:
@@ -488,7 +527,7 @@ def resolve_unknown(
             if exc.code != "budget_exhausted":
                 raise
             db.rollback()
-            limits.mark_budget_wait(db, run_id, run.revision, _event)  # no-op if execute already marked it
+            limits.mark_budget_wait(db, run_id, run.revision, _event, reserve_tokens=retry_request.reserve_tokens)  # no-op if execute already marked it
             db.commit()
     return _run_view(db, run_id)
 
@@ -831,12 +870,15 @@ def _quiescent(run, operation) -> bool:
     identity = (original.run_id, original.operation_id, original.generation)
     if identity in _active_operations:
         return False
-    if identity in _inactive_dispatches:
-        return True
-    if _dispatch_is_inactive is None:
+    proof = _dispatch_inactivity_proof  # registered exact proof takes precedence over every test shortcut
+    if proof is None:
+        if identity in _inactive_dispatches:
+            return True
+        proof = _dispatch_is_inactive
+    if proof is None:
         return False
     try:
-        return bool(_dispatch_is_inactive(*identity))
+        return bool(proof(*identity))
     except Exception:
         return False
 

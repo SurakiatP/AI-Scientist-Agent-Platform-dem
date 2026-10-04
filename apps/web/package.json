@@ -11,9 +11,13 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "6.1.1",
+    "katex": "0.19.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "react-markdown": "10.1.0",
     "react-router-dom": "7.18.4",
+    "rehype-katex": "7.0.1",
+    "remark-math": "6.0.0",
     "typescript": "7.0.2",
     "vite": "8.3.2"
   },

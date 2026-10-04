@@ -11,8 +11,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scientist.auth import DomainError, authorize
-from scientist.contracts import ArtifactView, PlanSpec, PlanView, Principal, RunEvent, RunView
-from scientist import limits
+from scientist.contracts import ArtifactView, CitationView, DecisionSubmit, FileView, FindingView, PlanSpec, PlanView, MessageView, Principal, ProjectView, RunEvent, RunView, SessionView
+from scientist import limits, settings
 
 _SNAPSHOT_MAX_BYTES = 1024 * 1024
 
@@ -77,6 +77,9 @@ def revise_plan(db: Session, owner: Principal, run_id: UUID, expected_revision: 
     snapshot_digest = db.execute(text("SELECT digest FROM input_snapshots WHERE run_id = :run"), {"run": run_id}).scalar_one()
     if plan.input_snapshot_digest != snapshot_digest:
         raise DomainError("revision_conflict", 409)
+    allowed = settings.allowed_recipients()  # data_recipients come from configuration only; peers are checked by the broker
+    if any(r not in allowed and not r.startswith("peer:") for r in plan.data_recipients):
+        raise DomainError("data_destinations_not_configured", 409)
     digest = _plan_digest(plan)
     revision = row.revision + 1
     db.execute(text("UPDATE runs SET revision = :revision, plan_digest = :digest WHERE id = :run"), {
@@ -213,15 +216,78 @@ def extend_run_budget(
     return _run_view(db, run_id)
 
 
-def request_stop(db: Session, principal: Principal, run_id: UUID) -> RunView:
+def authorize_stop(db: Session, principal: Principal, run_id: UUID):
+    """work:cancel plus the external own-submission rule; returns the locked run row."""
     row = _locked_run(db, principal, run_id, "work:cancel")
     if principal.kind == "external" and row.caller_identity != principal.identity:
         raise DomainError("forbidden", 403)
+    return row
+
+
+def request_stop(db: Session, principal: Principal, run_id: UUID) -> RunView:
+    row = authorize_stop(db, principal, run_id)
     if row.state not in {"completed", "failed", "canceled", "rejected"}:
         db.execute(text("UPDATE runs SET cancel_requested = true, state = 'stopping' WHERE id = :run"), {"run": run_id})
         if row.state != "stopping":
             _event(db, run_id, row.revision, "run.state", {"state": "stopping"})
     return _run_view(db, run_id)
+
+
+def submit_decision(db: Session, principal: Principal, run_id: UUID, body: DecisionSubmit) -> RunView:
+    """Resolve one owner decision exactly once; the receipt commits with the resolution (D1-D3)."""
+    from scientist import broker  # deferred: broker imports this module
+    if principal.kind != "owner":
+        raise DomainError("forbidden", 403)
+    run = _load_run(db, run_id, lock=True)
+    payload_hash = _digest({"run_id": str(run_id), **body.model_dump(mode="json", exclude={"idempotency_key"})})
+    receipt = db.execute(text("SELECT payload_hash FROM owner_decisions WHERE run_id = :run AND idempotency_key = :key"),
+                         {"run": run_id, "key": body.idempotency_key}).scalar_one_or_none()
+    if receipt is not None:
+        if receipt.strip() != payload_hash:
+            raise DomainError("idempotency_conflict", 409)
+        # D3 replay returns the CURRENT RunView; side effects (retry, extension) are never repeated.
+        return _run_view(db, run_id)
+    mapped = db.execute(text("SELECT * FROM owner_decisions WHERE decision_id = :id AND run_id = :run FOR UPDATE"),
+                        {"id": body.decision_id, "run": run_id}).one_or_none()
+    budget = mapped is None and run.budget_decision_id == body.decision_id
+    if mapped is None and not budget:
+        raise DomainError("not_found", 404)
+    if mapped is not None and mapped.state != "pending":
+        raise DomainError("revision_conflict", 409)
+    if run.revision != body.expected_revision:
+        raise DomainError("revision_conflict", 409)
+    if not budget:
+        if body.choice == "extend":
+            raise DomainError("forbidden", 400)
+        candidates = db.execute(text("""
+            SELECT count(*) FROM operations WHERE run_id = :run AND state = 'unknown'
+              AND NOT COALESCE(result ? 'retry_identity', false)
+              AND NOT (COALESCE(result ->> 'usage_known', 'false') = 'true' AND result ? 'ref')
+        """), {"run": run_id}).scalar_one()
+        if candidates > 1:
+            raise DomainError("decision_ambiguous", 409)
+        return broker.resolve_unknown(db, principal, run_id, mapped.operation_id, body.choice, body.result,
+                                      queued_only=True, receipt=(body.idempotency_key, payload_hash))
+    if body.choice not in {"extend", "stop"}:
+        raise DomainError("forbidden", 400)
+    if run.state != "waiting_input" or run.waiting_reason != "budget_exhausted":
+        raise DomainError("revision_conflict", 409)
+    db.execute(text("""
+        INSERT INTO owner_decisions (decision_id, run_id, reason, state, resolution, idempotency_key, payload_hash, resolved_at)
+        VALUES (:id, :run, 'budget_exhausted', 'resolved', CAST(:resolution AS jsonb), :key, :hash, now())
+    """), {"id": body.decision_id, "run": run_id, "resolution": json.dumps({"choice": body.choice}),
+           "key": body.idempotency_key, "hash": payload_hash})
+    if body.choice == "stop":
+        db.execute(text("UPDATE runs SET cancel_requested = true, state = 'stopping', waiting_reason = NULL WHERE id = :run"), {"run": run_id})
+        _event(db, run_id, run.revision, "run.state", {"state": "stopping"})
+        db.commit()
+        return _run_view(db, run_id)
+    try:
+        return extend_run_budget(db, principal, run_id, body.expected_revision, body.decision_id, body.idempotency_key,
+                                 run.token_limit + body.add_tokens, run.elapsed_limit_ms + body.add_elapsed_ms)
+    except Exception:
+        db.rollback()
+        raise
 
 
 def get_run(db: Session, principal: Principal, run_id: UUID) -> RunView:
@@ -443,3 +509,199 @@ def _capture_snapshot(db: Session, project_id: UUID, session_id: UUID, request: 
         "question": request["question"], "provider_id": request["provider_id"], "model": request["model"],
         "conversation": conversation, "findings": findings, "files": captured_files,
     }
+
+
+# --- Project resources (single policy source for REST and later protocol adapters) ---
+
+def _project_access(db: Session, principal: Principal, action: str, project_id: UUID) -> None:
+    """Missing and ungranted projects look identical to external callers."""
+    exists = db.execute(text("SELECT 1 FROM projects WHERE id = :id"), {"id": project_id}).scalar_one_or_none()
+    if not exists:
+        raise DomainError("not_found", 404)
+    _authorize_run(db, principal, action, project_id)
+
+
+def _project_view(row) -> ProjectView:
+    return ProjectView(id=row.id, name=row.name, revision=row.revision, instructions=row.instructions)
+
+
+def list_projects(db: Session, principal: Principal, after: UUID | None, limit: int = 100) -> list[ProjectView]:
+    if not 1 <= limit <= 200:
+        raise DomainError("cursor_expired", 400)
+    if principal.kind == "owner":
+        scope, params = "TRUE", {}
+    elif principal.kind == "external":
+        scope = """id IN (SELECT g.project_id FROM access_grants g JOIN access_tokens t ON t.id = g.token_id
+                          WHERE t.id = :token AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now())
+                            AND 'project:read' = ANY(g.actions))"""
+        params = {"token": principal.identity}
+    else:
+        raise DomainError("forbidden", 403)
+    rows = db.execute(text(f"SELECT id, name, revision, instructions FROM projects WHERE {scope} "
+                           "AND (CAST(:after AS uuid) IS NULL OR id > CAST(:after AS uuid)) ORDER BY id LIMIT :limit"),
+                      {**params, "after": after, "limit": limit}).all()
+    return [_project_view(r) for r in rows]
+
+
+def create_project(db: Session, owner: Principal, name: str, instructions: str = "") -> ProjectView:
+    if owner.kind != "owner":
+        raise DomainError("forbidden", 403)
+    if not name.strip() or len(name) > 200 or len(instructions) > 100000:
+        raise DomainError("forbidden", 400)
+    project_id = uuid4()
+    db.execute(text("INSERT INTO projects (id, name, instructions) VALUES (:id, :name, :instructions)"),
+               {"id": project_id, "name": name, "instructions": instructions})
+    return get_project(db, owner, project_id)
+
+
+def get_project(db: Session, principal: Principal, project_id: UUID) -> ProjectView:
+    _project_access(db, principal, "project:read", project_id)
+    return _project_view(db.execute(text("SELECT id, name, revision, instructions FROM projects WHERE id = :id"), {"id": project_id}).one())
+
+
+def update_project(db: Session, owner: Principal, project_id: UUID, expected_revision: int,
+                   name: str | None = None, instructions: str | None = None) -> ProjectView:
+    if owner.kind != "owner":
+        raise DomainError("forbidden", 403)
+    if (name is not None and (not name.strip() or len(name) > 200)) or (instructions is not None and len(instructions) > 100000):
+        raise DomainError("forbidden", 400)
+    row = db.execute(text("SELECT revision FROM projects WHERE id = :id FOR UPDATE"), {"id": project_id}).one_or_none()
+    if row is None:
+        raise DomainError("not_found", 404)
+    if row.revision != expected_revision:
+        raise DomainError("revision_conflict", 409)
+    db.execute(text("UPDATE projects SET name = COALESCE(:name, name), instructions = COALESCE(:instructions, instructions), "
+                    "revision = revision + 1 WHERE id = :id"), {"id": project_id, "name": name, "instructions": instructions})
+    return get_project(db, owner, project_id)
+
+
+def list_sessions(db: Session, principal: Principal, project_id: UUID) -> list[SessionView]:
+    _project_access(db, principal, "project:read", project_id)
+    return [SessionView(id=r.id, project_id=r.project_id, title=r.title) for r in db.execute(
+        text("SELECT id, project_id, title FROM sessions WHERE project_id = :p ORDER BY created_at, id"), {"p": project_id})]
+
+
+def create_session(db: Session, owner: Principal, project_id: UUID, title: str) -> SessionView:
+    if owner.kind != "owner":
+        raise DomainError("forbidden", 403)
+    if not title.strip() or len(title) > 200:
+        raise DomainError("forbidden", 400)
+    _project_access(db, owner, "project:read", project_id)
+    session_id = uuid4()
+    db.execute(text("INSERT INTO sessions (id, project_id, title) VALUES (:id, :p, :title)"), {"id": session_id, "p": project_id, "title": title})
+    return SessionView(id=session_id, project_id=project_id, title=title)
+
+
+def session_project(db: Session, principal: Principal, session_id: UUID, action: str = "project:read") -> UUID:
+    """Resolve and authorize in one step so missing and ungranted sessions look identical."""
+    project_id = db.execute(text("SELECT project_id FROM sessions WHERE id = :id"), {"id": session_id}).scalar_one_or_none()
+    if project_id is None:
+        raise DomainError("not_found", 404)
+    _project_access(db, principal, action, project_id)
+    return project_id
+
+
+def list_messages(db: Session, principal: Principal, session_id: UUID, after_sequence: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+    if after_sequence < 0 or not 1 <= limit <= 500:
+        raise DomainError("cursor_expired", 400)
+    session_project(db, principal, session_id)
+    return [MessageView(id=r.id, sequence=r.sequence, role=r.role, content=r.content, created_at=r.created_at.astimezone(timezone.utc)).model_dump(mode="json")
+            for r in db.execute(text("SELECT id, sequence, role, content, created_at FROM messages WHERE session_id = :s AND sequence > :a ORDER BY sequence LIMIT :l"),
+                                {"s": session_id, "a": after_sequence, "l": limit})]
+
+
+def list_runs(db: Session, principal: Principal, project_id: UUID) -> list[RunView]:
+    _project_access(db, principal, "result:read", project_id)
+    ids = db.execute(text("SELECT id FROM runs WHERE project_id = :p ORDER BY (SELECT min(occurred_at) FROM events WHERE run_id = runs.id), id"), {"p": project_id}).scalars().all()
+    return [_run_view(db, i) for i in ids]
+
+
+def list_files(db: Session, principal: Principal, project_id: UUID) -> list[FileView]:
+    _project_access(db, principal, "project:read", project_id)
+    return [FileView(id=r.id, project_id=r.project_id, filename=r.filename, size=r.size, content_type=r.content_type, state=r.state, error_code=r.error_code)
+            for r in db.execute(text("SELECT id, project_id, filename, size, content_type, state, error_code FROM file_versions "
+                                     "WHERE project_id = :p AND tombstoned_at IS NULL ORDER BY created_at, id"), {"p": project_id})]
+
+
+def get_file(db: Session, principal: Principal, project_id: UUID, file_id: UUID):
+    """Row of an untombstoned file version, only when it belongs to the addressed project."""
+    _project_access(db, principal, "project:read", project_id)
+    row = db.execute(text("SELECT id, project_id, filename, object_key, sha256, size, content_type, state FROM file_versions "
+                          "WHERE id = :id AND project_id = :p AND tombstoned_at IS NULL"), {"id": file_id, "p": project_id}).one_or_none()
+    if row is None:
+        raise DomainError("not_found", 404)
+    return row
+
+
+def list_findings(db: Session, principal: Principal, project_id: UUID) -> list[FindingView]:
+    _project_access(db, principal, "project:read", project_id)
+    return [FindingView(id=r.id, project_id=r.project_id, session_id=r.session_id, artifact_id=r.artifact_id, text=r.text, citation_ids=list(r.citation_ids))
+            for r in db.execute(text("SELECT id, project_id, session_id, artifact_id, text, citation_ids FROM findings WHERE project_id = :p ORDER BY id"), {"p": project_id})]
+
+
+def save_finding(db: Session, owner: Principal, project_id: UUID, session_id: UUID, finding_text: str,
+                 artifact_id: UUID | None, citation_ids: list[UUID]) -> FindingView:
+    if owner.kind != "owner":
+        raise DomainError("forbidden", 403)
+    _project_access(db, owner, "project:read", project_id)
+    if not finding_text.strip() or len(finding_text) > 100000 or len(citation_ids) > 1000 or len(set(citation_ids)) != len(citation_ids):
+        raise DomainError("forbidden", 400)
+    # Every referenced object must live in the addressed project; foreign ids look nonexistent.
+    if not db.execute(text("SELECT 1 FROM sessions WHERE id = :s AND project_id = :p"), {"s": session_id, "p": project_id}).scalar_one_or_none():
+        raise DomainError("not_found", 404)
+    if artifact_id is not None and not db.execute(text("SELECT 1 FROM artifacts WHERE id = :a AND project_id = :p"), {"a": artifact_id, "p": project_id}).scalar_one_or_none():
+        raise DomainError("not_found", 404)
+    if citation_ids and db.execute(text("SELECT count(*) FROM citations WHERE project_id = :p AND id = ANY(:ids)"), {"p": project_id, "ids": citation_ids}).scalar_one() != len(citation_ids):
+        raise DomainError("not_found", 404)
+    finding_id = uuid4()
+    db.execute(text("INSERT INTO findings (id, project_id, session_id, artifact_id, text, citation_ids) VALUES (:id, :p, :s, :a, :t, :c)"),
+               {"id": finding_id, "p": project_id, "s": session_id, "a": artifact_id, "t": finding_text, "c": citation_ids})
+    for citation_id in citation_ids:
+        db.execute(text("INSERT INTO finding_citations (finding_id, citation_id, project_id) VALUES (:f, :c, :p)"), {"f": finding_id, "c": citation_id, "p": project_id})
+    return FindingView(id=finding_id, project_id=project_id, session_id=session_id, artifact_id=artifact_id, text=finding_text, citation_ids=citation_ids)
+
+
+def remove_finding(db: Session, owner: Principal, project_id: UUID, finding_id: UUID) -> None:
+    """Removes the shared finding for future runs; captured input snapshots stay immutable."""
+    if owner.kind != "owner":
+        raise DomainError("forbidden", 403)
+    _project_access(db, owner, "project:read", project_id)
+    if not db.execute(text("SELECT 1 FROM findings WHERE id = :f AND project_id = :p FOR UPDATE"), {"f": finding_id, "p": project_id}).scalar_one_or_none():
+        raise DomainError("not_found", 404)
+    db.execute(text("DELETE FROM finding_citations WHERE finding_id = :f"), {"f": finding_id})
+    db.execute(text("DELETE FROM findings WHERE id = :f"), {"f": finding_id})
+
+
+def _citation_view(r) -> CitationView:
+    return CitationView(id=r.id, title=r.title, authors=list(r.authors or []), year=r.year, identifier=r.identifier,
+                        original_url=r.original_url, access=r.access, verification=r.verification)
+
+
+_CITATION_COLUMNS = "id, title, authors, year, identifier, original_url, access, verification"
+
+
+def list_citations(db: Session, principal: Principal, project_id: UUID) -> list[CitationView]:
+    _project_access(db, principal, "project:read", project_id)
+    return [_citation_view(r) for r in db.execute(text(f"SELECT {_CITATION_COLUMNS} FROM citations WHERE project_id = :p ORDER BY id"), {"p": project_id})]
+
+
+def get_citation(db: Session, principal: Principal, citation_id: UUID) -> CitationView:
+    row = db.execute(text(f"SELECT project_id, {_CITATION_COLUMNS} FROM citations WHERE id = :id"), {"id": citation_id}).one_or_none()
+    if row is None:
+        raise DomainError("not_found", 404)
+    _project_access(db, principal, "project:read", row.project_id)
+    return _citation_view(row)
+
+
+def list_artifacts(db: Session, principal: Principal, run_id: UUID) -> list[ArtifactView]:
+    row = _load_run(db, run_id)
+    _authorize_run(db, principal, "result:read", row.project_id)
+    return _run_view(db, run_id).artifacts
+
+
+def get_artifact(db: Session, principal: Principal, artifact_id: UUID):
+    row = db.execute(text("SELECT id, project_id, object_key, sha256, size, content_type FROM artifacts WHERE id = :id"), {"id": artifact_id}).one_or_none()
+    if row is None:
+        raise DomainError("not_found", 404)
+    _authorize_run(db, principal, "result:read", row.project_id)
+    return row

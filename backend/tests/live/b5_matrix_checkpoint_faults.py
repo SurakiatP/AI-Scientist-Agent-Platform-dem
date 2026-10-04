@@ -67,8 +67,9 @@ def f_case(case: str) -> None:
                 c.container_state(c.MINIO_CONTAINER, "start", h.run_id)
                 c.wait_ready()
         h.stage = "verify"
-        need((view.state, view.waiting_reason) == ("waiting_input", "checkpoint_integrity_unproven"),
-             "checkpoint fault did not fail closed to checkpoint_integrity_unproven")
+        expected_reason = "storage_unavailable" if case == "storage-fault" else "checkpoint_integrity_unproven"
+        need((view.state, view.waiting_reason) == ("waiting_input", expected_reason),
+             f"checkpoint fault did not fail closed to {expected_reason}")
         run, executors = h.run_row(), h.executors()
         replacement = run["generation"] != 1 or any(e["generation"] != 1 for e in executors) or h.attempts() != before["attempts"]
         need(not replacement and len(h.ops()) == 1, "a replacement started or a provider request was resent")
@@ -79,10 +80,6 @@ def f_case(case: str) -> None:
             need(evidence["status_during_fault"] == "unavailable" and h.run_row()["state"] == "waiting_input",
                  "storage fault was not observed or the run auto-resumed")
         proof = {"checkpoint_rejected": True, "replacement_started": False, "reason": REASON[case]}
-        if case == "storage-fault":
-            # The product collapses an outage into checkpoint_integrity_unproven (known spec gap, parent-recorded);
-            # only this fixture knows the cause, so the reason is attested by the actor, not by the product.
-            proof["reason_fixture_attested"] = True
         if case == "corrupt":
             proof["workspace_preserved"] = workspace_intact(h, manifest)
             need(proof["workspace_preserved"], "workspace object changed")

@@ -99,6 +99,32 @@
           ],
           "title": "Reason",
           "type": "string"
+        },
+        "required_elapsed_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Required Elapsed Ms"
+        },
+        "required_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Required Tokens"
         }
       },
       "required": [

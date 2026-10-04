@@ -74,7 +74,7 @@ PROOF_KEYS: dict[str, set[str]] = {
     "checkpoint-missing": {"checkpoint_rejected", "replacement_started", "reason"},
     "checkpoint-incompatible": {"checkpoint_rejected", "replacement_started", "reason"},
     "checkpoint-corrupt": {"checkpoint_rejected", "replacement_started", "workspace_preserved", "reason"},
-    "checkpoint-storage-fault": {"checkpoint_rejected", "replacement_started", "reason", "reason_fixture_attested"},
+    "checkpoint-storage-fault": {"checkpoint_rejected", "replacement_started", "reason"},
     "usage-ceiling-extension": {"token_ceiling_enforced", "elapsed_ceiling_enforced", "active_elapsed_before_ms", "active_elapsed_after_ms", "elapsed_time_ledger_persisted", "elapsed_extension_event_count", "extension_decision_id", "extension_applied_once"},
 }
 
@@ -403,17 +403,13 @@ def _assert_case(case: str, before: dict[str, Any], after: dict[str, Any], proof
             raise AcceptanceError("checkpoint fault did not leave an actionable state without active executor")
         if run["generation"] != 1 or any(row["generation"] != 1 for row in after["executors"]):
             raise AcceptanceError("a replacement generation or executor exists after the checkpoint fault")
-        if case == "checkpoint-storage-fault":
-            if proof["reason_fixture_attested"] is not True:
-                raise AcceptanceError("storage-fault reason must be marked fixture-attested")
-            # Known spec gap (recorded by the parent): the product collapses a storage outage into
-            # checkpoint_integrity_unproven; only the fixture knows the outage was the cause.
         if proof["reason"] not in {"missing", "incompatible", "corrupt", "storage_unavailable"}:
             raise AcceptanceError("checkpoint fault reason is not in the accepted error vocabulary")
-        # Product fails closed to one reason for every verification failure. The storage fault is lifted
-        # before readback, so bytes must verify again; pin drift never touches stored bytes.
-        if run["waiting_reason"] != "checkpoint_integrity_unproven":
-            raise AcceptanceError("checkpoint fault did not fail closed to checkpoint_integrity_unproven")
+        # A storage outage waits as storage_unavailable; every other verification failure fails closed to
+        # checkpoint_integrity_unproven. The outage is lifted before readback, so bytes must verify again.
+        expected_reason = "storage_unavailable" if case == "checkpoint-storage-fault" else "checkpoint_integrity_unproven"
+        if run["waiting_reason"] != expected_reason:
+            raise AcceptanceError(f"checkpoint fault did not wait as {expected_reason}")
         expected_storage = {"checkpoint-missing": "missing", "checkpoint-corrupt": "mismatch",
                             "checkpoint-incompatible": "verified", "checkpoint-storage-fault": "verified"}.get(case)
         if expected_storage and after["storage"].get("status") != expected_storage:

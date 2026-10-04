@@ -88,10 +88,13 @@ def mark_budget_wait(
     run_id: UUID,
     revision: int,
     emit_event: EventWriter,
+    *,
+    reserve_tokens: int = 0,
 ) -> UUID | None:
     """Persist one owner decision request unless a stronger state already won."""
     row = db.execute(text("""
-        SELECT state, waiting_reason, cancel_requested, budget_decision_id
+        SELECT state, waiting_reason, cancel_requested, budget_decision_id,
+               usage_tokens, reserved_tokens, token_limit, elapsed_limit_ms
         FROM runs WHERE id=:run FOR UPDATE
     """), {"run": run_id}).mappings().one_or_none()
     if row is None or row["state"] in _TERMINAL or row["cancel_requested"]:
@@ -111,7 +114,15 @@ def mark_budget_wait(
     if not already_waiting:
         emit_event(db, run_id, revision, "run.state", {"state": "waiting_input"})
     if row["budget_decision_id"] is None:
+        # Amounts mirror budget_exhausted(). Known limits: a reserve-0 wait (claim, recover, finalize,
+        # post-extension re-check) cannot know the next request's reserve, so its amount restores only
+        # 1 token and the next refusal raises a fresh decision. required_elapsed_ms is sampled while the
+        # active interval may still be open (settled only after fencing), so it is a lower bound; an
+        # extension that falls short re-raises a fresh decision.
+        needed = reserve_tokens if reserve_tokens > 0 else 1
         emit_event(db, run_id, revision, "decision.required", {
             "decision_id": decision_id, "reason": "budget_exhausted",
+            "required_tokens": max(0, row["usage_tokens"] + row["reserved_tokens"] + needed - row["token_limit"]),
+            "required_elapsed_ms": max(0, effective_elapsed_ms(db, run_id) - row["elapsed_limit_ms"] + 1),
         })
     return decision_id

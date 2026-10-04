@@ -208,7 +208,7 @@ def test_retry_hitting_budget_wait_records_owner_decision(broker_fixture, monkey
         raise DomainError("budget_exhausted", 409)
 
     monkeypatch.setattr(broker, "execute", exhausted)
-    broker.resolve_unknown(db, owner, run_id, "operation-1", "retry", None)
+    broker.resolve_unknown(db, owner, run_id, "operation-1", "retry", None, queued_only=False)
     monkeypatch.undo()
 
     row = db.execute(text("""SELECT state, waiting_reason, budget_decision_id, lease_expires_at, revision,
