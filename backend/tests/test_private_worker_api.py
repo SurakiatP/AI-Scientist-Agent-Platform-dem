@@ -110,6 +110,17 @@ def test_boundary_commit_lost_reply_replays_identical_ack(controller_fixture):
         controller.boundary(db, token, stale)
 
 
+@pytest.mark.parametrize('forged', [None, 0, 10**12])
+def test_boundary_stores_ledger_budget_snapshot_not_worker_value(controller_fixture, forged):
+    db, run, token, boundary, controller, calls = controller_fixture
+    db.execute(text('UPDATE runs SET usage_tokens=30, reserved_tokens=20 WHERE id=:run'), {'run':run})
+    db.commit()
+    forged_context = boundary.context.model_copy(update={'budget_remaining_tokens':forged})
+    controller.boundary(db, token, boundary.model_copy(update={'context':forged_context}))
+    stored = RuntimeContextV1.model_validate_json(calls[0])
+    assert stored.budget_remaining_tokens == 2000 - 30 - 20
+
+
 @pytest.mark.parametrize('field,value', [('project_id',uuid4()),('image_digest','sha256:'+'e'*64),('environment_digest','e'*64)])
 def test_controller_binds_context_to_actual_run_and_trusted_pins(controller_fixture,field,value):
     db, run, token, boundary, controller, calls = controller_fixture

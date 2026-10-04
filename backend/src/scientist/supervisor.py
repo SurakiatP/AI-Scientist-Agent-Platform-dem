@@ -17,7 +17,7 @@ import base64
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Protocol, Sequence
 from uuid import UUID, uuid4
@@ -381,6 +381,14 @@ def start(db: Session, run_id: UUID, generation: int) -> str:
                 or context.skills_digest != cfg.skills_digest
                 or context.environment_digest != cfg.environment_digest):
             raise RuntimeError("trusted bootstrap identity differs from run pins")
+        # ADR-012: every bootstrap path (fresh factory or continuation) gets the ledger
+        # snapshot here; whatever the factory supplied is discarded.
+        ledger = db.execute(text("SELECT token_limit, usage_tokens, reserved_tokens FROM runs WHERE id=:run"),
+                            {"run": run_id}).mappings().one()
+        # model_dump_json keeps UTF-8 (no \u escapes), so the worker's 1 MiB read cap still holds.
+        bootstrap = replace(bootstrap, context=context.model_copy(
+            update={"budget_remaining_tokens": limits.remaining_tokens(ledger)}).model_dump_json().encode())
+        RuntimeContextV1.model_validate_json(bootstrap.context)
         checkpoint_revision = db.execute(
             text("SELECT COALESCE(MAX(revision), 0) FROM checkpoints WHERE run_id=:run"),
             {"run": run_id},

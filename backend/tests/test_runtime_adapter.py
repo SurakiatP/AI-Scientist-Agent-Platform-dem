@@ -20,8 +20,10 @@ from sqlalchemy import text
 from scientist.contracts import OperationRequest
 from scientist.contracts import PlanSpec
 from scientist import broker
+from scientist.model_payload import llm_input_reserve
 from scientist.runtime_adapter import (
     BrokerChatCompletionsTransport,
+    BudgetExhausted,
     EffectUnresolved,
     RuntimeAdapterError,
     RuntimeAdapter,
@@ -32,7 +34,7 @@ from scientist.runtime_adapter import (
 from scientist.auth import DomainError
 from scientist.private_worker_api import parse_boundary
 from scientist.runtime_contracts import operation_fingerprint
-from scientist.runtime_contracts import RuntimeContextV1
+from scientist.runtime_contracts import PendingAssistant, RuntimeContextV1
 from test_runtime_contracts import context_data
 
 _ENTRYPOINT_PATH = Path(__file__).resolve().parents[2] / "runtime" / "entrypoint.py"
@@ -286,12 +288,7 @@ def test_generated_model_mapping_passes_real_broker_scope_before_effect(
     assert checked_requests[0].payload["timeout_seconds"] <= 20
 
 
-def test_native_output_limit_defaults_caps_and_rejects_invalid_values(
-    tmp_path: Path, context_data: dict[str, Any]
-) -> None:
-    events: list[tuple[str, dict[str, Any] | None]] = []
-    response_bytes = _chat_completion("Bounded result")
-
+def _committing_broker(context_data: dict[str, Any], events: list, response_bytes: bytes):
     def broker(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         body = json.loads(request.content) if request.content else None
@@ -319,9 +316,61 @@ def test_native_output_limit_defaults_caps_and_rejects_invalid_values(
             return httpx.Response(200, content=response_bytes)
         raise AssertionError(f"unexpected broker route: {path}")
 
-    client = httpx.Client(transport=httpx.MockTransport(broker), trust_env=False)
+    return httpx.Client(transport=httpx.MockTransport(broker), trust_env=False)
+
+
+def test_native_output_limit_defaults_caps_and_rejects_invalid_values(
+    tmp_path: Path, context_data: dict[str, Any]
+) -> None:
+    """ADR-012: output = min(2048, snapshot remaining - broker input reserve), for
+    default and explicit limits alike; explicit values above it are clamped."""
+    events: list[tuple[str, dict[str, Any] | None]] = []
+    response_bytes = _chat_completion("Bounded result")
     context_data["compacted_context"] = None
     context_data["operation_sequence"] = 0
+
+    def posted(remaining: int, content: str, **limit: Any) -> OperationRequest:
+        context_data["budget_remaining_tokens"] = remaining
+        client = _committing_broker(context_data, events, response_bytes)
+        adapter = RuntimeAdapter(
+            context_data,
+            broker_url="http://172.30.0.2:8000",
+            capability="fixture-capability",
+            workspace_dir=tmp_path,
+            broker_client=client,
+        )
+        native = httpx.Client(transport=BrokerChatCompletionsTransport(adapter), trust_env=False)
+        try:
+            native.post(
+                "http://hermes.invalid/v1/chat/completions",
+                json={"model": "fixture", "messages": [{"role": "user", "content": content}], **limit},
+            )
+        finally:
+            native.close()
+            client.close()
+        operation = OperationRequest.model_validate([body for name, body in events if name == "effect"][-1])
+        assert operation.reserve_tokens == input_reserve(content) + operation.payload["max_output_tokens"]
+        return operation
+
+    def input_reserve(content: str) -> int:
+        return llm_input_reserve([{"role": "user", "content": content}])
+
+    ample = 10**6
+    assert posted(ample, "default").payload["max_output_tokens"] == 2048
+    assert posted(ample, "explicit above cap", max_tokens=4096).payload["max_output_tokens"] == 2048
+    assert posted(ample, "explicit below cap", max_tokens=100).payload["max_output_tokens"] == 100
+    assert posted(ample, "completion alias", max_completion_tokens=4096).payload["max_output_tokens"] == 2048
+    # A small snapshot (e.g. an owner extension of a plan approved at 0) bounds every request.
+    for content, limit in (("small default", {}), ("small explicit", {"max_tokens": 1500})):
+        operation = posted(input_reserve(content) + 700, content, **limit)
+        assert operation.payload["max_output_tokens"] == 700
+    assert posted(input_reserve("one") + 1, "one").payload["max_output_tokens"] == 1
+    assert posted(input_reserve("lower") + 700, "lower", max_tokens=300).payload["max_output_tokens"] == 300
+
+    # Earlier calls in the same generation reduce the advisory snapshot by their committed
+    # usage (11 here; the broker released the rest of the reservation).
+    context_data["budget_remaining_tokens"] = input_reserve("first") + 900 + input_reserve("second") + 300
+    client = _committing_broker(context_data, events, response_bytes)
     adapter = RuntimeAdapter(
         context_data,
         broker_url="http://172.30.0.2:8000",
@@ -330,37 +379,114 @@ def test_native_output_limit_defaults_caps_and_rejects_invalid_values(
         broker_client=client,
     )
     native = httpx.Client(transport=BrokerChatCompletionsTransport(adapter), trust_env=False)
-    base = {
-        "model": "fixture",
-        "messages": [{"role": "user", "content": "Bound the output."}],
-    }
-
-    native.post("http://hermes.invalid/v1/chat/completions", json=base)
-    default_operation = OperationRequest.model_validate(
-        next(body for name, body in events if name == "effect")
-    )
-    assert default_operation.payload["max_output_tokens"] == min(
-        2048, context_data["plan"]["token_limit"]
-    )
-
-    native.post(
-        "http://hermes.invalid/v1/chat/completions",
-        json={**base, "max_tokens": 4096},
-    )
-    capped_operation = OperationRequest.model_validate(
-        [body for name, body in events if name == "effect"][1]
-    )
-    assert capped_operation.payload["max_output_tokens"] == 2048
+    for content, limit in (("first", {"max_tokens": 900}), ("second", {})):
+        native.post(
+            "http://hermes.invalid/v1/chat/completions",
+            json={"model": "fixture", "messages": [{"role": "user", "content": content}], **limit},
+        )
+    first, second = [OperationRequest.model_validate(body) for name, body in events if name == "effect"][-2:]
+    assert first.payload["max_output_tokens"] == 900
+    assert second.payload["max_output_tokens"] == input_reserve("first") + 900 + 300 - 11
 
     event_count = len(events)
-    for invalid in (True, 1.5, 0, -1):
-        with pytest.raises(RuntimeAdapterError, match="output limit"):
-            native.post(
-                "http://hermes.invalid/v1/chat/completions",
-                json={**base, "max_tokens": invalid},
-            )
+    for invalid in (True, False, 1.5, 0, -1, "8"):
+        for field in ("max_tokens", "max_completion_tokens"):
+            with pytest.raises(RuntimeAdapterError, match="output limit"):
+                native.post(
+                    "http://hermes.invalid/v1/chat/completions",
+                    json={"model": "fixture", "messages": [{"role": "user", "content": "x"}], field: invalid},
+                )
     assert len(events) == event_count, "invalid caps must fail before checkpoint or broker I/O"
     native.close()
+    client.close()
+
+
+def test_missing_budget_snapshot_fails_closed_before_io(tmp_path: Path, context_data: dict[str, Any]) -> None:
+    events: list = []
+    context_data.pop("budget_remaining_tokens", None)
+    client = _committing_broker(context_data, events, _chat_completion("unused"))
+    adapter = RuntimeAdapter(
+        context_data,
+        broker_url="http://172.30.0.2:8000",
+        capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=client,
+    )
+    with pytest.raises(RuntimeAdapterError, match="budget snapshot"):
+        adapter.dispatch_chat_completion({"model": "fixture", "messages": [{"role": "user", "content": "x"}]})
+    assert events == []
+
+
+def test_insufficient_allowance_defers_to_broker_budget_wait_and_never_sends_zero_or_one(
+    tmp_path: Path, context_data: dict[str, Any]
+) -> None:
+    effects: list[dict] = []
+
+    def broker_endpoint(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path == "/control/boundary":
+            return httpx.Response(200, json=_checkpoint_ack(body))
+        if request.url.path == "/effects":
+            effects.append(body)
+            return httpx.Response(409, json={"detail": {"code": "budget_exhausted"}})
+        raise AssertionError(f"unexpected broker route: {request.url.path}")
+
+    messages = [{"role": "user", "content": "Too little budget."}]
+    context_data["budget_remaining_tokens"] = llm_input_reserve(messages)  # allowance 0
+    client = httpx.Client(transport=httpx.MockTransport(broker_endpoint), trust_env=False)
+    adapter = RuntimeAdapter(
+        context_data,
+        broker_url="http://172.30.0.2:8000",
+        capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=client,
+    )
+    with pytest.raises(BudgetExhausted):
+        adapter.dispatch_chat_completion({"model": "fixture", "messages": messages})
+    assert len(effects) == 1
+    # The broker, not the worker, decides: the unclamped native request, never 0 or a forced 1.
+    assert effects[0]["payload"]["max_output_tokens"] == 2048
+    assert adapter.budget_exhausted
+    with pytest.raises(BudgetExhausted):
+        adapter.dispatch_chat_completion({"model": "fixture", "messages": messages})
+    assert len(effects) == 1, "a broker budget wait is sticky for the rest of the generation"
+    client.close()
+
+
+def test_generation_two_replay_keeps_journaled_operation_despite_new_snapshot(
+    tmp_path: Path, context_data: dict[str, Any]
+) -> None:
+    messages = [{"role": "user", "content": "Replay me."}]
+    journaled = OperationRequest(
+        run_id=context_data["run_id"], generation=1, operation_id="journaled-model", kind="llm",
+        payload={
+            "provider_id": context_data["provider_id"], "model": "fixture",
+            "recipient": context_data["provider_endpoint"], "credential_id": context_data["provider_id"],
+            "max_output_tokens": 2048, "messages": messages, "timeout_seconds": 20,
+        },
+        reserve_tokens=llm_input_reserve(messages) + 2048,
+    )
+    context_data.update(
+        generation=2, messages=messages, operation_sequence=1, budget_remaining_tokens=llm_input_reserve(messages) + 5,
+        operation_mappings=[{
+            "operation_id": journaled.operation_id, "turn_id": context_data["turn_id"], "purpose": "model",
+            "model_sequence": 0, "tool_call_id": None, "request": journaled.model_dump(mode="json"),
+            "payload_hash": operation_fingerprint(journaled),
+        }],
+    )
+    events: list = []
+    client = _committing_broker(context_data, events, _chat_completion("Stored result"))
+    adapter = RuntimeAdapter(
+        context_data,
+        broker_url="http://172.30.0.2:8000",
+        capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=client,
+    )
+    adapter.dispatch_chat_completion({"model": "fixture", "messages": messages})
+    replayed = OperationRequest.model_validate(next(body for name, body in events if name == "effect"))
+    assert replayed == journaled.model_copy(update={"generation": 2})
+    assert [item.operation_id for item in adapter.context.operation_mappings] == ["journaled-model"]
     client.close()
 
 
@@ -575,6 +701,182 @@ def test_saved_turn_continuation_reuses_primary_history_without_admitting_a_user
     assert context.current_turn_user_idx == 0
     assert context.turn_id == str(adapter.context.turn_id)
     assert agent._current_turn_timestamp == 1791030000.25
+
+
+def _wrapped_budget_wait() -> Exception:
+    """A raised wrapper around BudgetExhausted (for paths that do re-raise). Pinned Hermes'
+    primary API loop instead returns a failed turn dict; see the failed-turn test below."""
+    try:
+        try:
+            raise BudgetExhausted("broker recorded an owner budget decision")
+        except BudgetExhausted as exc:
+            raise RuntimeAdapterError("Connection error.") from exc
+    except RuntimeAdapterError as wrapped:
+        return wrapped
+
+
+@pytest.mark.parametrize(
+    ("flag", "error", "clean"),
+    [
+        (True, _wrapped_budget_wait, True),
+        (True, lambda: BudgetExhausted("direct"), True),
+        (False, _wrapped_budget_wait, False),  # never trust the chain without the adapter flag
+        (False, lambda: RuntimeAdapterError("Connection error."), False),
+        (True, lambda: RuntimeAdapterError("unrelated failure after the wait"), False),
+    ],
+)
+def test_worker_exits_cleanly_only_for_a_broker_budget_wait(
+    tmp_path: Path, context_data: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], flag: bool, error: Any, clean: bool,
+) -> None:
+    capability = tmp_path / "capability"
+    capability.write_text("fixture-capability")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    entry = runtime_entrypoint
+    monkeypatch.setattr(entry, "wait_until_ready", lambda *_a, **_k: None)
+    monkeypatch.setattr(entry, "_sanitize_environment",
+                        lambda: (str(tmp_path), str(workspace), "http://172.30.0.2:8000", str(capability)))
+    monkeypatch.setattr(entry, "load_bootstrap", lambda _path: (
+        RuntimeContextV1.model_validate(context_data), [], SimpleNamespace(checkpoint_revision=0)))
+    monkeypatch.setattr(entry, "_pin_import_paths", lambda: None)
+
+    def hermes_raises(adapter: RuntimeAdapter, **_kwargs: Any) -> Any:
+        adapter.budget_exhausted = flag
+        raise error()
+
+    monkeypatch.setattr(entry, "build_native_agent", hermes_raises)
+    monkeypatch.chdir(tmp_path)
+    if clean:
+        assert entry.run_worker() is None
+        logged = capsys.readouterr().err
+        assert "BudgetExhausted" in logged or "RuntimeAdapterError" in logged
+        assert "fixture-capability" not in logged and "Connection error" not in logged
+    else:
+        with pytest.raises(Exception) as raised:
+            entry.run_worker()
+        assert raised.type in (RuntimeAdapterError, BudgetExhausted)
+
+
+_HERMES_FAILED_TURN = {"completed": False, "failed": True, "error": "Connection error.", "failure_reason": "timeout"}
+
+
+@pytest.mark.parametrize(
+    ("broker_replies", "pending_tools", "clean"),
+    [
+        (["budget"], False, True),
+        (["forbidden"], False, False),  # broker refused for another reason: no flag
+        (["unknown", "budget"], False, False),  # an unresolved effect is never a clean pause
+        (["budget"], True, False),  # an unfinished native tool batch is never a clean pause
+    ],
+)
+def test_worker_exits_cleanly_when_pinned_hermes_returns_failed_turn_after_budget_wait(
+    tmp_path: Path, context_data: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], broker_replies: list[str], pending_tools: bool, clean: bool,
+) -> None:
+    """Pinned Hermes (bd0affe5) catches transport errors in _run_api_retry_loop and returns
+    _HERMES_FAILED_TURN; the BudgetExhausted exception chain never reaches the entrypoint."""
+    capability = tmp_path / "capability"
+    capability.write_text("fixture-capability")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    replies = iter(broker_replies)
+
+    def broker_endpoint(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path == "/control/boundary":
+            return httpx.Response(200, json=_checkpoint_ack(body))
+        reply = next(replies)
+        if reply == "unknown":
+            return httpx.Response(200, json={"operation_id": body["operation_id"], "state": "unknown",
+                                             "result": None, "usage_tokens": None})
+        code = {"budget": "budget_exhausted", "forbidden": "forbidden"}[reply]
+        return httpx.Response(409 if reply == "budget" else 403, json={"detail": {"code": code}})
+
+    client = httpx.Client(transport=httpx.MockTransport(broker_endpoint), trust_env=False)
+    entry = runtime_entrypoint
+    context_data["current_turn_user_index"] = 0
+    monkeypatch.setattr(entry, "wait_until_ready", lambda *_a, **_k: None)
+    monkeypatch.setattr(entry, "_sanitize_environment",
+                        lambda: (str(tmp_path), str(workspace), "http://172.30.0.2:8000", str(capability)))
+    monkeypatch.setattr(entry, "load_bootstrap", lambda _path: (
+        RuntimeContextV1.model_validate(context_data), [], SimpleNamespace(checkpoint_revision=0)))
+    monkeypatch.setattr(entry, "_pin_import_paths", lambda: None)
+    monkeypatch.setattr(entry, "RuntimeAdapter", lambda *a, **k: RuntimeAdapter(*a, broker_client=client, **k))
+    monkeypatch.setattr(entry, "install_saved_turn_continuation", lambda *_a: None)
+
+    class PinnedHermesShape:
+        def __init__(self, adapter: RuntimeAdapter) -> None:
+            self.adapter = adapter
+
+        def run_conversation(self, **_kwargs: Any) -> dict[str, Any]:
+            for content in broker_replies:
+                try:
+                    self.adapter.dispatch_chat_completion(
+                        {"model": "fixture", "messages": [{"role": "user", "content": content}]})
+                except Exception:
+                    pass  # handle_api_error: no re-raise
+            if pending_tools:
+                self.adapter.context = self.adapter.context.model_copy(update={"pending_assistant": PendingAssistant(
+                    turn_id=self.adapter.context.turn_id, message_index=0, next_tool_index=0)})
+            return dict(_HERMES_FAILED_TURN)
+
+    monkeypatch.setattr(entry, "build_native_agent", lambda adapter, **_k: PinnedHermesShape(adapter))
+    monkeypatch.chdir(tmp_path)
+    if clean:
+        assert entry.run_worker() is None
+        logged = capsys.readouterr().err
+        assert "budget" in logged and "Connection error" not in logged and "fixture-capability" not in logged
+    else:
+        with pytest.raises(RuntimeAdapterError, match="complete, quiescent turn"):
+            entry.run_worker()
+    client.close()
+
+
+def test_committed_usage_replaces_reservation_in_advisory_allowance(
+    tmp_path: Path, context_data: dict[str, Any]
+) -> None:
+    """The broker turns a committed reservation into its actual usage; unknown keeps it all."""
+    effects: list[OperationRequest] = []
+    response_bytes = _chat_completion("ok")
+
+    def broker_endpoint(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        if request.url.path == "/control/boundary":
+            return httpx.Response(200, json=_checkpoint_ack(body))
+        if request.url.path == "/effects":
+            operation = OperationRequest.model_validate(body)
+            effects.append(operation)
+            if operation.payload["messages"][0]["content"] == "lost":
+                return httpx.Response(200, json={"operation_id": body["operation_id"], "state": "unknown",
+                                                 "result": None, "usage_tokens": None})
+            return httpx.Response(200, json={
+                "operation_id": body["operation_id"], "state": "committed", "usage_tokens": 11,
+                "result": {"project_id": context_data["project_id"], "key": "results/ok",
+                           "sha256": hashlib.sha256(response_bytes).hexdigest(), "size": len(response_bytes),
+                           "content_type": "application/json"}})
+        return httpx.Response(200, content=response_bytes)
+
+    def reserve(content: str) -> int:
+        return llm_input_reserve([{"role": "user", "content": content}])
+
+    context_data["budget_remaining_tokens"] = 2000
+    client = httpx.Client(transport=httpx.MockTransport(broker_endpoint), trust_env=False)
+    adapter = RuntimeAdapter(context_data, broker_url="http://172.30.0.2:8000", capability="fixture-capability",
+                             workspace_dir=tmp_path, broker_client=client)
+
+    def call(content: str, **limit: Any) -> int:
+        adapter.dispatch_chat_completion({"model": "fixture", "messages": [{"role": "user", "content": content}], **limit})
+        return effects[-1].payload["max_output_tokens"]
+
+    assert call("first", max_tokens=100) == 100
+    assert call("second", max_tokens=100) == 100
+    assert call("third") == 2000 - 11 - 11 - reserve("third")  # ledger: usage 22, nothing held
+    with pytest.raises(EffectUnresolved):
+        call("lost", max_tokens=100)
+    held = reserve("lost") + 100
+    assert call("fourth") == 2000 - 11 * 3 - held - reserve("fourth")
+    client.close()
 
 
 def test_readiness_marker_must_be_literal_ready(tmp_path: Path) -> None:

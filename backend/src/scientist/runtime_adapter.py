@@ -22,7 +22,7 @@ from scientist.model_payload import (
     ChatMessage,
     ModelPayloadError,
     build_chat_completion_body,
-    serialized_input_bytes,
+    llm_input_reserve,
 )
 from scientist.runtime_contracts import (
     AppliedToolId,
@@ -43,7 +43,6 @@ from scientist.runtime_contracts import (
 
 _MAX_PROVIDER_RESPONSE = 2 * 1024 * 1024
 _MAX_BROKER_RESPONSE = 3 * 1024 * 1024
-_PROTOCOL_OVERHEAD_TOKENS = 64
 _DEFAULT_MODEL_OUTPUT_TOKENS = 2048
 _COMPRESSION_MAX_OUTPUT_TOKENS = 2048
 _REVIEWED_NATIVE_TODO_TOOL_NAMES = frozenset({"todo_list", "todo"})
@@ -75,8 +74,16 @@ class EffectDenied(RuntimeAdapterError):
     """The broker rejected an effect; no provider bytes may be returned."""
 
 
+class BudgetExhausted(EffectDenied):
+    """The broker refused the reservation and recorded the owner budget decision."""
+
+
 class BoundaryNotDurable(RuntimeAdapterError):
     """A checkpoint could not be acknowledged, so dispatch must not proceed."""
+
+
+def _without_output_limit(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if key != "max_output_tokens"}
 
 
 def _model_mapping(value: Any) -> dict[str, Any]:
@@ -261,6 +268,14 @@ class RuntimeAdapter:
         self.workspace_dir = workspace_dir
         self.checkpoint_revision = checkpoint_revision
         self.operation_purpose = operation_purpose
+        # Charges of operations allocated by this generation against the bootstrap snapshot:
+        # the full reservation until committed, then the broker-reported usage.
+        self._charges: dict[str, int] = {}
+        # Set once the broker records a budget wait; no further effects this generation.
+        self.budget_exhausted = False
+        # Effects posted this generation whose outcome is not known to be committed or
+        # refused before any journal row (budget 409). A clean budget pause requires none.
+        self.unresolved_effects: set[str] = set()
         self._owns_broker_client = broker_client is None
         self._broker = broker_client or httpx.Client(
             trust_env=False,
@@ -411,13 +426,15 @@ class RuntimeAdapter:
     ) -> tuple[OperationRequest, OperationMapping]:
         sequence = self.context.operation_sequence
         # An identical request at the last uncommitted boundary is a recovery
-        # replay. Reuse its id and reservation instead of creating a second spend.
+        # replay. Reuse its id, payload and reservation instead of creating a second
+        # spend. The output limit is excluded from the comparison because it follows
+        # the per-generation budget snapshot (ADR-012); the journaled value wins.
         for mapping in reversed(self.context.operation_mappings):
             if (
                 mapping.turn_id == self.context.turn_id
                 and mapping.purpose == purpose
                 and mapping.model_sequence == sequence - 1
-                and mapping.request.payload == payload
+                and _without_output_limit(mapping.request.payload) == _without_output_limit(payload)
             ):
                 rebound = mapping.request.model_copy(update={"generation": self.context.generation})
                 if operation_fingerprint(rebound) != mapping.payload_hash:
@@ -449,6 +466,7 @@ class RuntimeAdapter:
                 "operation_sequence": sequence + 1,
             }
         )
+        self._charges[operation_id] = reserve_tokens
         self.context = RuntimeContextV1.model_validate(self.context.model_dump(mode="json"))
         return request, mapping
 
@@ -465,18 +483,28 @@ class RuntimeAdapter:
         messages = _wire_messages(request_body.get("messages"))
         max_tokens = request_body.get("max_tokens", request_body.get("max_completion_tokens"))
         if max_tokens is None:
-            max_tokens = min(_DEFAULT_MODEL_OUTPUT_TOKENS, self.context.plan.token_limit)
+            max_tokens = _DEFAULT_MODEL_OUTPUT_TOKENS
         elif type(max_tokens) is not int or max_tokens <= 0:
             raise RuntimeAdapterError("invalid native model output limit")
-        max_tokens = min(max_tokens, _DEFAULT_MODEL_OUTPUT_TOKENS)
+        if self.context.budget_remaining_tokens is None:
+            raise RuntimeAdapterError("runtime context has no trusted budget snapshot")
+        if self.budget_exhausted:
+            raise BudgetExhausted("run is waiting for an owner budget decision")
         if purpose == "compression":
-            if max_tokens is None:
-                max_tokens = _COMPRESSION_MAX_OUTPUT_TOKENS
-            elif type(max_tokens) is int:
-                max_tokens = min(max_tokens, _COMPRESSION_MAX_OUTPUT_TOKENS)
             request_body = {**request_body, "stream": False}
         controls = {key: value for key, value in request_body.items() if key in _SUPPORTED_CONTROLS}
         try:
+            input_reserve = llm_input_reserve(messages, **controls)
+            # ADR-012: output = min(2048, snapshot - this generation's reservations - the
+            # broker's input reserve), for default and explicit limits (explicit values
+            # above it are clamped, as the 2048 cap already was). Below 1 nothing can
+            # be clamped lawfully: the unclamped request goes to the broker, whose
+            # atomic reservation check records the owner budget wait (zero provider
+            # calls). Never send 0 and never force 1.
+            allowance = self.context.budget_remaining_tokens - sum(self._charges.values()) - input_reserve
+            max_tokens = min(max_tokens, _DEFAULT_MODEL_OUTPUT_TOKENS)
+            if allowance >= 1:
+                max_tokens = min(max_tokens, allowance)
             canonical_body = build_chat_completion_body(
                 self.context.model,
                 messages,
@@ -484,7 +512,6 @@ class RuntimeAdapter:
                 **controls,
             )
             normalized_body = canonical_body
-            input_bytes = serialized_input_bytes(messages, **controls)
         except (ModelPayloadError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeAdapterError("native model request is outside the approved wire profile") from exc
         payload = {
@@ -497,7 +524,7 @@ class RuntimeAdapter:
             "timeout_seconds": 20,
             **{key: value for key, value in normalized_body.items() if key not in {"model", "messages", "max_tokens"}},
         }
-        reserve = input_bytes + _PROTOCOL_OVERHEAD_TOKENS + normalized_body["max_tokens"]
+        reserve = input_reserve + normalized_body["max_tokens"]
         request, _mapping = self._next_operation(purpose=purpose, payload=payload, reserve_tokens=reserve)
         self.context = self.context.model_copy(
             update={
@@ -505,6 +532,7 @@ class RuntimeAdapter:
             }
         )
         self._checkpoint("before_model")
+        self.unresolved_effects.add(request.operation_id)
         posted = self._broker.post(
             f"{self.broker_url}/effects",
             content=canonical_bytes(request.model_dump(mode="json")),
@@ -512,6 +540,15 @@ class RuntimeAdapter:
         )
         if len(posted.content) > _MAX_BROKER_RESPONSE:
             raise RuntimeAdapterError("effect response exceeds its byte limit")
+        if posted.status_code == 409:
+            try:
+                code = posted.json()["detail"]["code"]
+            except (ValueError, KeyError, TypeError):
+                code = None
+            if code == "budget_exhausted":
+                self.unresolved_effects.discard(request.operation_id)
+                self.budget_exhausted = True
+                raise BudgetExhausted("broker refused the reservation and recorded an owner budget decision")
         try:
             result = OperationResult.model_validate_json(posted.content)
         except ValidationError as exc:
@@ -524,6 +561,10 @@ class RuntimeAdapter:
             raise EffectDenied("broker denied the provider operation")
         if result.state != "committed" or result.result is None:
             raise RuntimeAdapterError("committed operation has no typed result reference")
+        self.unresolved_effects.discard(request.operation_id)
+        if request.operation_id in self._charges and result.usage_tokens is not None:
+            # The broker released reserve - usage on commit; unknown/denied keep the full reservation.
+            self._charges[request.operation_id] = result.usage_tokens
         fetched = self._broker.get(
             f"{self.broker_url}/effects/{request.operation_id}/result",
             headers={"X-Worker-Capability": self._capability},

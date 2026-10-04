@@ -27,7 +27,7 @@ from scientist.auth import DomainError
 from scientist.contracts import ObjectRef, OperationRequest, OperationResult, PlanSpec, Principal, RunView
 from scientist.domain import _event, _run_view
 from scientist import limits
-from scientist.model_payload import ModelPayloadError, build_chat_completion_body, serialized_input_bytes
+from scientist.model_payload import ModelPayloadError, build_chat_completion_body, llm_input_reserve
 from scientist.secrets import read_secret
 
 @dataclass(frozen=True)
@@ -70,7 +70,6 @@ _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_TIMEOUT_SECONDS = 20
 _MAX_HTTP_TOTAL_SECONDS = 20.0
-_LLM_PROTOCOL_OVERHEAD = 64
 _LLM_CONTROLS = {
     "temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "seed",
     "parallel_tool_calls", "logprobs", "top_logprobs", "tools", "tool_choice",
@@ -512,8 +511,7 @@ def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: Oper
         max_output = payload.get("max_output_tokens")
         if isinstance(max_output, bool) or not isinstance(max_output, int) or max_output < 1:
             raise DomainError("budget_exhausted", 409)
-        input_bytes = _llm_input_bytes(payload)
-        if request.reserve_tokens < input_bytes + _LLM_PROTOCOL_OVERHEAD + max_output:
+        if request.reserve_tokens < _llm_input_reserve(payload) + max_output:
             raise DomainError("budget_exhausted", 409)
         _validate_timeout(payload)
         recipient = _provider_destinations.get(str(plan.provider_id))
@@ -578,7 +576,7 @@ def _validate_timeout(payload: dict) -> None:
         raise DomainError("forbidden", 400)
 
 
-def _llm_input_bytes(payload: dict) -> int:
+def _llm_input_reserve(payload: dict) -> int:
     if ("prompt" in payload) == ("messages" in payload):
         raise DomainError("forbidden", 400)
     messages = payload.get("messages")
@@ -589,7 +587,7 @@ def _llm_input_bytes(payload: dict) -> int:
         messages = [{"role": "user", "content": prompt}]
     controls = {key: payload[key] for key in _LLM_CONTROLS if key in payload}
     try:
-        return serialized_input_bytes(messages, **controls)
+        return llm_input_reserve(messages, **controls)
     except ModelPayloadError as exc:
         raise DomainError("forbidden", 400) from exc
 

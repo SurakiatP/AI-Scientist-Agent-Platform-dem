@@ -18,6 +18,7 @@ from scientist.runtime_contracts import (
     validate_workspace_path,
 )
 from scientist.runtime_adapter import (
+    BudgetExhausted,
     RuntimeAdapter,
     RuntimeAdapterError,
     build_native_agent,
@@ -214,6 +215,28 @@ def load_bootstrap(bootstrap_dir: Path) -> tuple[RuntimeContextV1, list[dict[str
     return context, workspace, metadata
 
 
+def _paused_for_budget(adapter: RuntimeAdapter) -> bool:
+    """The broker recorded the owner budget wait and nothing else is left in flight.
+
+    The flag is set only by the broker's budget_exhausted 409 (no journal row, no provider
+    call), and every later dispatch fails before I/O. Every other effect of this generation
+    must be committed, and no native tool batch may be half-applied (pending_assistant is
+    cleared only once the whole batch is checkpointed), so recovery loses nothing.
+    """
+    return (adapter.budget_exhausted and not adapter.unresolved_effects
+            and adapter.context.pending_assistant is None)
+
+
+def _caused_by_budget_wait(exc: BaseException | None) -> bool:
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, BudgetExhausted):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def run_worker() -> None:
     wait_until_ready(Path(os.environ.get("SCIENTIST_READINESS_FILE", str(_READY))))
     bootstrap_dir, workspace_name, broker_url, capability_name = _sanitize_environment()
@@ -288,6 +311,11 @@ def run_worker() -> None:
             or result.get("error")
             or adapter.context.pending_assistant is not None
         ):
+            # Pinned Hermes swallows the transport error and returns a failed turn dict,
+            # so the BudgetExhausted chain never reaches us; the adapter state is the proof.
+            if isinstance(result, dict) and result.get("completed") is not True and _paused_for_budget(adapter):
+                print("worker paused for owner budget decision (failed Hermes turn)", file=sys.stderr)
+                return
             raise RuntimeAdapterError("Hermes did not return a complete, quiescent turn")
         final_messages = result.get("messages")
         final_user_index = result.get("current_turn_user_idx")
@@ -317,6 +345,13 @@ def run_worker() -> None:
             )
         adapter.context = adapter.context.model_copy(update={"boundary": "final"})
         adapter._checkpoint("final")
+    except Exception as exc:
+        # Exit cleanly (code 0) only when the broker recorded the owner budget wait (adapter
+        # flag) and this failure is that wait, possibly wrapped by the SDK/Hermes. Recovery
+        # keeps the wait; anything else is still a worker failure.
+        if not (_paused_for_budget(adapter) and _caused_by_budget_wait(exc)):
+            raise
+        print(f"worker paused for owner budget decision ({type(exc).__name__})", file=sys.stderr)
     finally:
         adapter.close()
 
