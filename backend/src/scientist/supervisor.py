@@ -630,7 +630,7 @@ def recover(db: Session, run_id: UUID) -> RunView:
         db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
                    {"id": executor["id"]})
     pending_unknown = db.execute(text("""
-        SELECT 1 FROM operations WHERE run_id=:run AND state='unknown' LIMIT 1
+        SELECT 1 FROM operations WHERE run_id=:run AND state='unknown' AND NOT COALESCE(result ? 'retry_identity', false) LIMIT 1
     """), {"run": run_id}).scalar_one_or_none() is not None
     if uncertain:
         reason = "executor_quiescence_unproven"

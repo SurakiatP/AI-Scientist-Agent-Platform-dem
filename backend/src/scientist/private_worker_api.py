@@ -208,8 +208,7 @@ class WorkerController:
         row = self._run(db, capability, lock=False)
         if not operation_id or len(operation_id) > 200:
             raise DomainError("forbidden", 403)
-        operation = db.execute(text("SELECT * FROM operations WHERE run_id=:run AND operation_id=:op"),
-                               {"run":row.id,"op":operation_id}).one_or_none()
+        operation, _ = broker.effective_operation(db, row.id, operation_id)
         if operation is None or operation.state != "committed":
             raise DomainError("result_unavailable", 409)
         ref = broker._operation_result(operation).result

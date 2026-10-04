@@ -142,6 +142,8 @@ def execute(db: Session, worker_capability: str, request: OperationRequest) -> O
         pending = existing.result or {}
         if existing.state == "unknown" and pending.get("usage_known") and pending.get("ref"):
             return _finalize_staged_success(db, request.run_id, request.operation_id)
+        if existing.state == "unknown" and pending.get("retry_identity"):
+            return _continue_owner_retry(db, row, existing, request)
         return _operation_result(existing)
     if limits.budget_exhausted(db, row, reserve_tokens=request.reserve_tokens):
         decision_id = limits.mark_budget_wait(db, request.run_id, row.revision, _event)
@@ -197,6 +199,58 @@ def execute(db: Session, worker_capability: str, request: OperationRequest) -> O
         return result
     finally:
         _active_operations.discard(identity)
+
+
+def effective_operation(db: Session, run_id: UUID, operation_id: str):
+    """Follow owner retry links from operation_id; return (last existing row, next retry id or None).
+
+    The second element is set only when the last row carries a retry decision whose row is not yet created.
+    """
+    seen: set[str] = set()
+    row = db.execute(text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :op"),
+                     {"run": run_id, "op": operation_id}).one_or_none()
+    while row is not None:
+        seen.add(row.operation_id)
+        retry_id = (row.result or {}).get("retry_identity") if row.state == "unknown" else None
+        if not retry_id or retry_id in seen:
+            return row, None
+        nxt = db.execute(text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :op"),
+                         {"run": run_id, "op": retry_id}).one_or_none()
+        if nxt is None:
+            return row, retry_id
+        row = nxt
+    return None, None
+
+
+def _continue_owner_retry(db: Session, run, original, request: OperationRequest) -> OperationResult:
+    """Replay of an unknown operation the owner chose to retry: send the last stored retry identity once.
+
+    The caller holds the run lock (held through the nested execute, which commits the retry row and its
+    reservation before dispatch), so a concurrent or later replay finds that row and sends nothing.
+    The original stays unknown with its reservation retained; the outcome is returned under its operation_id.
+    """
+    tip, next_id = effective_operation(db, run.id, original.operation_id)
+    if next_id is not None:
+        try:
+            stored = OperationRequest.model_validate((tip.result or {})["retry_request"])
+        except (KeyError, ValueError) as exc:
+            raise DomainError("storage_unavailable", 503) from exc
+        if stored.operation_id != next_id or stored.model_copy(
+                update={"operation_id": request.operation_id, "generation": request.generation}) != request:
+            raise DomainError("storage_unavailable", 503)
+        execute(db, issue_capability(db, run.id, request.generation, 300),
+                stored.model_copy(update={"generation": request.generation}))
+        db.execute(text("""
+            UPDATE operations SET result = result || jsonb_build_object('retry_of', CAST(:original AS text))
+            WHERE run_id = :run AND operation_id = :retry
+        """), {"original": tip.operation_id, "run": run.id, "retry": next_id})
+        db.commit()
+        tip, _ = effective_operation(db, run.id, next_id)
+    staged = tip.result or {}
+    if tip.state == "unknown" and staged.get("usage_known") and staged.get("ref"):
+        return _finalize_staged_success(db, run.id, tip.operation_id).model_copy(
+            update={"operation_id": original.operation_id})
+    return _operation_result(tip).model_copy(update={"operation_id": original.operation_id})
 
 
 def _finish_reserved_operation(
@@ -349,7 +403,7 @@ def resolve_unknown(
     run = _load_run(db, run_id, lock=True)
     operation = db.execute(text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :operation FOR UPDATE"),
                            {"run": run_id, "operation": operation_id}).one_or_none()
-    if operation is None or operation.state != "unknown":
+    if operation is None or operation.state != "unknown" or (operation.result or {}).get("retry_identity"):
         raise DomainError("revision_conflict", 409)
     if not _quiescent(run, operation):
         raise DomainError("revision_conflict", 409)
