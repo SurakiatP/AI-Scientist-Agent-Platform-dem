@@ -455,13 +455,17 @@ def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
         raise DomainError("not_found", 404)
     if row["state"] in {"completed", "failed", "canceled", "rejected"}:
         return _run_view(db, run_id)
-    if row["state"] in {"planning", "awaiting_approval", "queued"}:
+    in_flight = row["state"] == "queued" and db.execute(text("""
+        SELECT EXISTS (SELECT 1 FROM operations WHERE run_id=:run AND state='reserved')
+            OR EXISTS (SELECT 1 FROM runtime_executors WHERE run_id=:run AND state<>'inactive')
+    """), {"run": run_id}).scalar_one()
+    if row["state"] in {"planning", "awaiting_approval", "queued"} and not in_flight:
         db.execute(text("UPDATE runs SET state='canceled', cancel_requested=true, lease_expires_at=NULL WHERE id=:run"),
                    {"run": run_id})
         _event(db, run_id, row["revision"], "run.state", {"state": "canceled"})
         db.commit()
         return _run_view(db, run_id)
-    if row["state"] not in {"running", "recovering", "stopping", "waiting_input"}:
+    if row["state"] not in {"running", "recovering", "stopping", "waiting_input", "queued"}:
         return _run_view(db, run_id)
     db.execute(text("UPDATE runs SET state='stopping', cancel_requested=true WHERE id=:run"), {"run": run_id})
     db.commit()

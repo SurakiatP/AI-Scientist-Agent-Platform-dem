@@ -339,16 +339,18 @@ def _record_unknown(db: Session, request: OperationRequest, revision: int, *, us
            "run": request.run_id, "operation": request.operation_id})
     if usage_tokens is not None:
         db.execute(text("""
-            UPDATE runs SET reserved_tokens = reserved_tokens - :reserve,
-                usage_tokens = usage_tokens + :usage,
-                state = 'waiting_input', waiting_reason = 'unknown_outcome'
+            UPDATE runs SET reserved_tokens = reserved_tokens - :reserve, usage_tokens = usage_tokens + :usage
             WHERE id = :run
         """), {"reserve": request.reserve_tokens, "usage": usage_tokens, "run": request.run_id})
         _emit_usage_event(db, request.run_id, revision)
-    else:
-        db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"),
-                   {"run": request.run_id})
-    _event(db, request.run_id, revision, "decision.required", {"decision_id": str(uuid4()), "reason": "unknown_outcome"})
+    # A concurrent stop/cancel/terminal transition wins; the reservation stays held either way.
+    waiting = db.execute(text("""
+        UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome'
+        WHERE id = :run AND state NOT IN ('completed', 'failed', 'canceled', 'rejected')
+          AND NOT cancel_requested
+    """), {"run": request.run_id}).rowcount
+    if waiting == 1:
+        _event(db, request.run_id, revision, "decision.required", {"decision_id": str(uuid4()), "reason": "unknown_outcome"})
     db.commit()
     return OperationResult(operation_id=request.operation_id, state="unknown", result=None, usage_tokens=usage_tokens)
 
@@ -375,14 +377,15 @@ def reconcile(db: Session, run_id: UUID, operation_id: str) -> OperationResult:
     if row.state in {"reserved", "unknown"}:
         if not _quiescent(run, row):
             raise DomainError("revision_conflict", 409)
+    stopped = run.state in limits._TERMINAL or run.cancel_requested
     if row.state == "reserved":
         db.execute(text("UPDATE operations SET state = 'unknown' WHERE id = :id AND state = 'reserved'"), {"id": row.id})
-        if run.state != "waiting_input" or run.waiting_reason != "unknown_outcome":
+        if not stopped and (run.state != "waiting_input" or run.waiting_reason != "unknown_outcome"):
             db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})
             _event(db, run_id, run.revision, "decision.required", {"decision_id": str(uuid4()), "reason": "unknown_outcome"})
         db.commit()
         row = db.execute(text("SELECT * FROM operations WHERE id = :id"), {"id": row.id}).one()
-    elif row.state == "unknown" and not pending.get("retry_identity") and (run.state != "waiting_input" or run.waiting_reason != "unknown_outcome"):
+    elif row.state == "unknown" and not stopped and not pending.get("retry_identity") and (run.state != "waiting_input" or run.waiting_reason != "unknown_outcome"):
         db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})
         _event(db, run_id, run.revision, "decision.required", {"decision_id": str(uuid4()), "reason": "unknown_outcome"})
         db.commit()
