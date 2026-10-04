@@ -1,0 +1,21 @@
+{
+  "docker_context": "colima-scientist-platform-test",
+  "colima_profile": "scientist-platform-test",
+  "engine_version": "29.8.2",
+  "expected_engine_id": "<docker --context <ctx> info --format {{.ID}}>",
+  "database_url": "postgresql+psycopg://postgres@127.0.0.1:54331/scientist_b5",
+  "s3_endpoint": "http://127.0.0.1:54332",
+  "private_dir": ".local/b5-private",
+  "runtime_commit": "bd0affe5e5f723579df8902852f5d0c47795f355",
+  "server_source_hashes": ".local/server-source-context-budget-20261004-08/source-hashes.json",
+  "worker_image": "scientist-worker@sha256:e17c71b972c3fa233b82bb181697eee94be89ea77afc90b6e4270a978ed65108",
+  "server_image": "scientist-server-budget-candidate@sha256:c5e78f6c1c97cde19d38a3963ffda28c800089ec12eb3a851f58b238f1ea29a0",
+  "fixture_images": {
+    "happy": "scientist-server-happy-budget@sha256:67a87a23cc3167acfe89bc10cbab7e4de8bf08d15aa2d024f5ddb236fd5c4b7f",
+    "counter": "scientist-server-counter-budget@sha256:99fa21c2bc1e213cb1440ffc0e34094ae6048ae27786cc6e2c9f8922a9f0d0d2",
+    "barrier": "scientist-server-barrier-budget@sha256:1ae7316dee0a12cdd298fd97c47cb9648d9835897707b1ff63d8f4e21675f358",
+    "checkpoint_fault": "scientist-server-checkpoint-fault-budget@sha256:9279fee75a1578fc7c4f9f9971c9a73eec48f73820e84df97adb30f7098f6670"
+  },
+  "postgres_image": "scientist-postgres@sha256:a86add9f159a3628a029db26cf4652d0ae189d583642e3409ff1193a43a5dac6",
+  "minio_image": "scientist-minio@sha256:95901ad4bcb2b634d565aeac213315f0246db150221e7d61dbe5df5cba82b962"
+}
