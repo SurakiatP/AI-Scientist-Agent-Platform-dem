@@ -181,6 +181,8 @@ export interface ArtifactReadyPayload {
 export interface DecisionRequiredPayload {
   decision_id: string;
   reason: "budget_exhausted" | "unknown_outcome" | "data_scope" | "plan_change";
+  required_tokens?: null | number;
+  required_elapsed_ms?: null | number;
 }
 
 export interface UsageUpdatedPayload {

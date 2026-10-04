@@ -208,6 +208,9 @@ class ArtifactReadyPayload(Contract):
 class DecisionRequiredPayload(Contract):
     decision_id: UUID
     reason: Literal["budget_exhausted", "unknown_outcome", "data_scope", "plan_change"]
+    # Smallest limit increase that admits the refused request; None when not a budget wait.
+    required_tokens: int | None = Field(default=None, ge=0)
+    required_elapsed_ms: int | None = Field(default=None, ge=0)
 
 
 class UsageUpdatedPayload(Contract):
