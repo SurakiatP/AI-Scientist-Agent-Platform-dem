@@ -145,7 +145,7 @@ def execute(db: Session, worker_capability: str, request: OperationRequest) -> O
             return _continue_owner_retry(db, row, existing, request)
         return _operation_result(existing)
     if limits.budget_exhausted(db, row, reserve_tokens=request.reserve_tokens):
-        decision_id = limits.mark_budget_wait(db, request.run_id, row.revision, _event)
+        decision_id = limits.mark_budget_wait(db, request.run_id, row.revision, _event, reserve_tokens=request.reserve_tokens)
         if decision_id is None:
             db.rollback()
             raise DomainError("forbidden", 403)
@@ -169,7 +169,7 @@ def execute(db: Session, worker_capability: str, request: OperationRequest) -> O
         if current.generation != request.generation or current.state != "running" or current.lease_expires_at is None or current.lease_expires_at <= datetime.now(timezone.utc):
             raise DomainError("forbidden", 403)
         if limits.budget_exhausted(db, current, reserve_tokens=request.reserve_tokens):
-            decision_id = limits.mark_budget_wait(db, request.run_id, current.revision, _event)
+            decision_id = limits.mark_budget_wait(db, request.run_id, current.revision, _event, reserve_tokens=request.reserve_tokens)
             if decision_id is not None:
                 db.commit()
                 raise DomainError("budget_exhausted", 409)
@@ -491,7 +491,7 @@ def resolve_unknown(
             if exc.code != "budget_exhausted":
                 raise
             db.rollback()
-            limits.mark_budget_wait(db, run_id, run.revision, _event)  # no-op if execute already marked it
+            limits.mark_budget_wait(db, run_id, run.revision, _event, reserve_tokens=retry_request.reserve_tokens)  # no-op if execute already marked it
             db.commit()
     return _run_view(db, run_id)
 
