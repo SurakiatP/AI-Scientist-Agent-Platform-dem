@@ -29,6 +29,7 @@ USER_QUESTION = "Synthesize the approved synthetic fixture evidence."
 
 os.environ["SCIENTIST_DATABASE_URL"] = CFG.database_url
 os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(PRIVATE / "master_key")
+os.environ["SCIENTIST_PROVIDER_ENDPOINT"] = "https://research.example"  # D4: the synthetic plan recipient must be a configured destination
 
 import boto3
 from sqlalchemy import text

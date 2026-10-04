@@ -55,6 +55,12 @@ def _run(db, project_session):
     return owner, submit_run(db, owner, project_id, session_id, f"k-{uuid4()}", "question", [], uuid4(), "fixture")
 
 
+@pytest.fixture(autouse=True)
+def _destinations(monkeypatch):
+    monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", "https://api.scholar.example,https://meta.example/v1")
+    monkeypatch.setenv("SCIENTIST_PROVIDER_ENDPOINT", "https://llm.example")
+
+
 def test_build_plan_has_stages_for_search_verify_synthesize(db, project_session):
     owner, run = _run(db, project_session)
     plan = build_plan(db, owner, run.run_id, ["  graphene  ", "graphene", "battery"])
@@ -112,3 +118,36 @@ def test_untitled_citation_gets_a_valid_title_and_urls_need_a_host():
     assert verify_citation({}, {})["title"] == "Untitled citation"
     for bad in ("http://", "https://[bad", "https:///path"):
         assert verify_citation({"doi": "10.1/x"}, {"doi": "10.1/x", "url": bad})["original_url"] is None
+
+
+def test_recipients_come_from_configuration_only(db, project_session):
+    owner, run = _run(db, project_session)
+    plan = build_plan(db, owner, run.run_id, ["https://evil.example", "graphene"])
+    assert plan.data_recipients == ["https://api.scholar.example", "https://meta.example", "https://llm.example"]
+    assert "evil" not in " ".join(plan.data_recipients)
+
+
+@pytest.mark.parametrize("value", ["", "http://a.example", "https://localhost", "https://127.0.0.1", "https://10.0.0.5",
+                                   "https://169.254.169.254", "https://u:p@a.example", "https://localhost.", "https://2130706433", "https://127.1", "https://a.example:8443",
+                                   "https://@a.example", "https://metadata.google.internal", "https://a.example:443", "ftp://a.example", "https://"])
+def test_unsafe_configured_endpoints_are_dropped_and_plan_not_ready(db, project_session, monkeypatch, value):
+    owner, run = _run(db, project_session)
+    monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", value)
+    with pytest.raises(DomainError) as error:
+        build_plan(db, owner, run.run_id, ["x"])
+    assert error.value.code == "data_destinations_not_configured" and error.value.status == 409
+
+
+def test_missing_provider_destination_is_not_ready(db, project_session, monkeypatch):
+    owner, run = _run(db, project_session)
+    monkeypatch.delenv("SCIENTIST_PROVIDER_ENDPOINT")
+    with pytest.raises(DomainError, match="data_destinations_not_configured"):
+        build_plan(db, owner, run.run_id, ["x"])
+
+
+def test_origin_is_canonical():
+    from scientist.settings import _origin
+    assert _origin("HTTPS://LLM.Example.:443/") is None  # explicit ports are refused outright
+    assert _origin("HTTPS://LLM.Example./x") == "https://llm.example"
+    assert _origin("https://[2606:4700::1111]/") == "https://[2606:4700::1111]"
+

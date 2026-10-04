@@ -70,3 +70,10 @@ def project_session(db):
     project_id = create_project(db, "test project")
     session_id = create_session(db, project_id, "test session")
     return project_id, session_id
+
+
+@pytest.fixture(autouse=True)
+def _configured_recipients(monkeypatch):
+    # Plans may only name configured destinations; cover the hosts the fixtures use.
+    monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", "https://alternate.example,https://packages.example")
+    monkeypatch.setenv("SCIENTIST_PROVIDER_ENDPOINT", "https://research.example")

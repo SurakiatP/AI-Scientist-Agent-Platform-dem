@@ -137,7 +137,9 @@ def test_revision_conflicts_on_project_and_plan(client):
     assert stale_plan.status_code == 409
 
 
-def test_full_workflow_snapshot_plan_events_artifacts_publish(client, db):
+def test_full_workflow_snapshot_plan_events_artifacts_publish(client, db, monkeypatch):
+    monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", "https://api.scholar.example")
+    monkeypatch.setenv("SCIENTIST_PROVIDER_ENDPOINT", "https://llm.example")
     project = new_project(client)
     pid = project["id"]
     session = new_session(client, pid)
@@ -397,3 +399,31 @@ def test_sse_closes_when_owner_session_is_revoked_mid_stream(client, db, monkeyp
     with client.stream("GET", f"/api/v1/runs/{rid}/events", params={"after": 3}) as stream:
         "".join(stream.iter_text())
     assert time.monotonic() - started < 2.5 and len(calls) < 10
+
+
+def test_list_runs_orders_by_creation_then_id_and_messages_match_view(client, db):
+    # W4 resource test: random run ids must not decide which run is "latest".
+    project, session = new_project(client), None
+    session = new_session(client, project["id"])
+    created = [submit(client, session["id"])["run_id"] for _ in range(6)]
+    listed = [r["run_id"] for r in client.get(f"/api/v1/projects/{project['id']}/runs").json()]
+    assert listed == created
+    from scientist.contracts import MessageView
+    db.execute(text("INSERT INTO messages (id, project_id, session_id, role, content) VALUES (:i, :p, :s, 'user', 'hi')"),
+               {"i": uuid4(), "p": project["id"], "s": session["id"]})
+    db.commit()
+    (message,) = client.get(f"/api/v1/sessions/{session['id']}/messages").json()
+    assert MessageView.model_validate(message).run_id is None
+
+
+def test_patch_plan_cannot_add_unconfigured_recipient(client, db, monkeypatch):
+    monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", "https://api.scholar.example")
+    monkeypatch.setenv("SCIENTIST_PROVIDER_ENDPOINT", "https://llm.example")
+    project = new_project(client)
+    session = new_session(client, project["id"])
+    run = submit(client, session["id"])
+    plan = client.get(f"/api/v1/runs/{run['run_id']}/plan").json()["plan"]
+    bad = client.patch(f"/api/v1/runs/{run['run_id']}/plan", json={"expected_revision": 1, "plan": {**plan, "data_recipients": ["https://evil.example"]}})
+    assert (bad.status_code, bad.json()["code"]) == (409, "data_destinations_not_configured")
+    ok = client.patch(f"/api/v1/runs/{run['run_id']}/plan", json={"expected_revision": 1, "plan": {**plan, "data_recipients": ["https://llm.example", "peer:x"]}})
+    assert ok.status_code == 200

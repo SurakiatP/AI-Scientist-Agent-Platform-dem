@@ -250,7 +250,16 @@ class RunEvent(Contract):
         return self
 
 
-MODELS = (Principal, APIError, ObjectRef, PackageSpec, PlanSpec, ArtifactView, PlanView, RunView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
+class MessageView(Contract):
+    id: UUID
+    sequence: int = Field(ge=1)
+    role: str = Field(min_length=1, max_length=24)
+    content: str
+    created_at: datetime
+    run_id: UUID | None = None
+
+
+MODELS = (Principal, APIError, ObjectRef, PackageSpec, PlanSpec, ArtifactView, PlanView, RunView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
 
 
 def _ts_type(schema: dict[str, Any]) -> str:

@@ -11,8 +11,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scientist.auth import DomainError, authorize
-from scientist.contracts import ArtifactView, CitationView, FileView, FindingView, PlanSpec, PlanView, Principal, ProjectView, RunEvent, RunView, SessionView
-from scientist import limits
+from scientist.contracts import ArtifactView, CitationView, FileView, FindingView, PlanSpec, PlanView, MessageView, Principal, ProjectView, RunEvent, RunView, SessionView
+from scientist import limits, settings
 
 _SNAPSHOT_MAX_BYTES = 1024 * 1024
 
@@ -77,6 +77,9 @@ def revise_plan(db: Session, owner: Principal, run_id: UUID, expected_revision: 
     snapshot_digest = db.execute(text("SELECT digest FROM input_snapshots WHERE run_id = :run"), {"run": run_id}).scalar_one()
     if plan.input_snapshot_digest != snapshot_digest:
         raise DomainError("revision_conflict", 409)
+    allowed = settings.allowed_recipients()  # data_recipients come from configuration only; peers are checked by the broker
+    if any(r not in allowed and not r.startswith("peer:") for r in plan.data_recipients):
+        raise DomainError("data_destinations_not_configured", 409)
     digest = _plan_digest(plan)
     revision = row.revision + 1
     db.execute(text("UPDATE runs SET revision = :revision, plan_digest = :digest WHERE id = :run"), {
@@ -539,14 +542,14 @@ def list_messages(db: Session, principal: Principal, session_id: UUID, after_seq
     if after_sequence < 0 or not 1 <= limit <= 500:
         raise DomainError("cursor_expired", 400)
     session_project(db, principal, session_id)
-    return [{"id": str(r.id), "sequence": r.sequence, "role": r.role, "content": r.content, "created_at": r.created_at.astimezone(timezone.utc).isoformat()}
+    return [MessageView(id=r.id, sequence=r.sequence, role=r.role, content=r.content, created_at=r.created_at.astimezone(timezone.utc)).model_dump(mode="json")
             for r in db.execute(text("SELECT id, sequence, role, content, created_at FROM messages WHERE session_id = :s AND sequence > :a ORDER BY sequence LIMIT :l"),
                                 {"s": session_id, "a": after_sequence, "l": limit})]
 
 
 def list_runs(db: Session, principal: Principal, project_id: UUID) -> list[RunView]:
     _project_access(db, principal, "result:read", project_id)
-    ids = db.execute(text("SELECT id FROM runs WHERE project_id = :p ORDER BY id"), {"p": project_id}).scalars().all()
+    ids = db.execute(text("SELECT id FROM runs WHERE project_id = :p ORDER BY (SELECT min(occurred_at) FROM events WHERE run_id = runs.id), id"), {"p": project_id}).scalars().all()
     return [_run_view(db, i) for i in ids]
 
 

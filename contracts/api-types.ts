@@ -157,6 +157,15 @@ export interface ConnectionView {
   has_secret: boolean;
 }
 
+export interface MessageView {
+  id: string;
+  sequence: number;
+  role: string;
+  content: string;
+  created_at: string;
+  run_id?: null | string;
+}
+
 export interface PlanReadyPayload {
   plan_digest: string;
 }
