@@ -175,7 +175,8 @@ def execute(db: Session, worker_capability: str, request: OperationRequest) -> O
                 raise DomainError("budget_exhausted", 409)
             db.rollback()
             raise DomainError("forbidden", 403)
-        raise DomainError("budget_exhausted", 409)
+        # No decision can be recorded here, so a 409 would leave the adapter waiting forever.
+        raise DomainError("forbidden", 403)
     db.execute(text("""
         INSERT INTO operations (id, run_id, operation_id, generation, kind, payload_hash, state, reserve_tokens, result)
         VALUES (:id, :run, :operation, :generation, :kind, :hash, 'reserved', :reserve, CAST(:result AS jsonb))

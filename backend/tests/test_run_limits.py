@@ -593,3 +593,17 @@ def test_unknown_outcome_decision_has_no_required_amounts(run_limits_context, mo
     payload = _decision_payload(context)
     assert payload["reason"] == "unknown_outcome"
     assert payload.get("required_tokens") is None and payload.get("required_elapsed_ms") is None
+
+
+def test_unrecordable_budget_refusal_is_forbidden_not_a_silent_409(run_limits_context, monkeypatch):
+    context = run_limits_context
+    monkeypatch.setattr(limits, "budget_exhausted", lambda *a, **k: False)
+    context.db.execute(text("UPDATE runs SET usage_tokens=token_limit WHERE id=:r"), {"r": context.run_id})
+    context.db.commit()
+    with pytest.raises(DomainError) as refused:
+        broker.execute(context.db, context.capability, _request(context, reserve_tokens=200))
+    assert (refused.value.code, refused.value.status) == ("forbidden", 403)
+    assert context.transport.calls == 0
+    with context.sql_engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM events WHERE run_id=:r AND kind='decision.required'"),
+                                  {"r": context.run_id}).scalar_one() == 0
