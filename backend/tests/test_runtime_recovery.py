@@ -570,7 +570,9 @@ def test_recover_failed_dispatch_stop_keeps_reservation_and_generation_paused(
     assert (operation.state, operation.reserve_tokens) == ("reserved", 7)
     assert db.execute(text("SELECT state FROM runtime_executors WHERE id=:id"),
                       {"id": dispatch_ref.executor_id}).scalar_one() == "unknown"
-    assert supervisor.claim(db, max_active=3) is None
+    db.rollback()
+    assert db.execute(text("SELECT state, generation FROM runs WHERE id=:run"),
+                      {"run": run.run_id}).one() == ("waiting_input", 1)
 
 
 def test_recover_retries_unknown_unbound_identity_after_engine_discovery_recovers(
@@ -655,3 +657,166 @@ def test_recover_retries_unknown_unbound_identity_after_engine_discovery_recover
     assert engine.stopped == [worker_ref]
     assert db.execute(text("SELECT count(*) FROM runtime_executors WHERE run_id=:run AND generation=1 AND state='active'"),
                       {"run": run.run_id}).scalar_one() == 0
+
+
+def _recover_with_budget_decision(db, project_session, object_fixture, tmp_path, monkeypatch, decision):
+    run = _prepare_recovery_run(db, project_session, object_fixture, tmp_path, boundary="before_model")
+    db.execute(text("""
+        UPDATE runs SET state='waiting_input', waiting_reason='budget_exhausted',
+            budget_decision_id=:decision, usage_tokens=10, elapsed_used_ms=0,
+            elapsed_active_since=NULL, lease_expires_at=NULL
+        WHERE id=:run
+    """), {"run": run.run_id, "decision": decision})
+    db.commit()
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=object(), dispatch=object()))
+    before = _snapshot(db, run.run_id)
+    return run, supervisor.recover(db, run.run_id), before
+
+
+def _snapshot(db, run_id):
+    events = db.execute(text("""
+        SELECT count(*) FILTER (WHERE kind='decision.required'),
+               count(*) FILTER (WHERE kind='run.state')
+        FROM events WHERE run_id=:run"""), {"run": run_id}).one()
+    usage = db.execute(text("""
+        SELECT usage_tokens, reserved_tokens, elapsed_used_ms FROM runs WHERE id=:run"""),
+        {"run": run_id}).one()
+    return tuple(events), tuple(usage)
+
+
+def _queued_events(db, run_id):
+    return db.execute(text("""
+        SELECT count(*) FROM events WHERE run_id=:run AND kind='run.state'
+          AND payload->>'state'='queued'"""), {"run": run_id}).scalar_one()
+
+
+def test_recover_keeps_pending_owner_budget_decision_with_tokens_remaining(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    decision = uuid4()
+    run, recovered, before = _recover_with_budget_decision(
+        db, project_session, object_fixture, tmp_path, monkeypatch, decision)
+
+    assert recovered.state == "waiting_input"
+    assert recovered.waiting_reason == "budget_exhausted"
+    assert db.execute(text("SELECT budget_decision_id FROM runs WHERE id=:run"),
+                      {"run": run.run_id}).scalar_one() == decision
+    assert _snapshot(db, run.run_id) == before
+
+
+def test_recover_requeues_budget_wait_after_owner_decision_consumed(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    _, recovered, _ = _recover_with_budget_decision(
+        db, project_session, object_fixture, tmp_path, monkeypatch, None)
+
+    assert recovered.state == "queued"
+
+
+def _decision_run(db, project_session, object_fixture, tmp_path, usage, *, worker_state="active"):
+    run = _prepare_recovery_run(db, project_session, object_fixture, tmp_path)
+    decision = uuid4()
+    db.execute(text("""UPDATE runs SET state='waiting_input', waiting_reason='budget_exhausted',
+        budget_decision_id=:d, usage_tokens=CASE WHEN :u < 0 THEN token_limit ELSE :u END,
+        elapsed_used_ms=0, elapsed_active_since=NULL, lease_expires_at=NULL WHERE id=:run"""),
+        {"run": run.run_id, "d": decision, "u": usage})
+    worker = ExecutorRef(uuid4(), run.run_id, 1, "worker", None, uuid4(), "engine-test", "c" * 64)
+    _insert_executor(db, run.run_id, worker, worker_state, bound=True)
+    db.commit()
+    return run, decision
+
+
+def _flaky_stop_engine(monkeypatch):
+    calls = []
+
+    class Engine:
+        def stop_worker(self, ref, grace):
+            calls.append(ref)
+            return len(calls) > 1
+
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=Engine(), dispatch=object()))
+
+
+def _run_row(db, run_id):
+    db.rollback()
+    return db.execute(text("SELECT state, waiting_reason, budget_decision_id, generation FROM runs WHERE id=:r"),
+                      {"r": run_id}).one()
+
+
+def test_two_step_recover_through_quiescence_keeps_owner_decision(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    run, decision = _decision_run(db, project_session, object_fixture, tmp_path, 10)
+    _flaky_stop_engine(monkeypatch)
+
+    first = supervisor.recover(db, run.run_id)
+    assert first.waiting_reason == "executor_quiescence_unproven"
+    second = supervisor.recover(db, run.run_id)
+
+    row = _run_row(db, run.run_id)
+    assert (row.state, row.waiting_reason, row.budget_decision_id) == (
+        "waiting_input", "budget_exhausted", decision)
+    assert second.state == "waiting_input"
+    assert _run_row(db, run.run_id).generation == 1
+
+
+def test_recover_of_resolved_queued_run_keeps_pending_owner_decision(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    # Shape left by broker.resolve after unknown_outcome: queued, decision still set.
+    run, decision = _decision_run(db, project_session, object_fixture, tmp_path, 10)
+    db.execute(text("DELETE FROM runtime_executors WHERE run_id=:r"), {"r": run.run_id})
+    db.execute(text("UPDATE runs SET state='queued', waiting_reason=NULL WHERE id=:r"), {"r": run.run_id})
+    db.commit()
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=object(), dispatch=object()))
+
+    supervisor.recover(db, run.run_id)
+
+    row = _run_row(db, run.run_id)
+    assert (row.state, row.waiting_reason, row.budget_decision_id) == (
+        "waiting_input", "budget_exhausted", decision)
+
+
+def test_exhausted_run_with_overwritten_reason_accepts_owner_extension(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    from scientist.domain import extend_run_budget
+
+    run, decision = _decision_run(db, project_session, object_fixture, tmp_path, -1)
+    _flaky_stop_engine(monkeypatch)
+    supervisor.recover(db, run.run_id)
+    supervisor.recover(db, run.run_id)
+
+    row = _run_row(db, run.run_id)
+    assert (row.state, row.waiting_reason, row.budget_decision_id) == (
+        "waiting_input", "budget_exhausted", decision)
+    revision = db.execute(text("SELECT revision FROM runs WHERE id=:r"), {"r": run.run_id}).scalar_one()
+    owner = Principal(identity=uuid4(), kind="owner")
+    limit = db.execute(text("SELECT token_limit FROM runs WHERE id=:r"), {"r": run.run_id}).scalar_one()
+    extend_run_budget(db, owner, run.run_id, revision, decision, "ext-1", limit + 500, 120000)
+
+
+def test_claim_refuses_queued_run_with_pending_budget_decision():
+    schema = f"claim_{uuid4().hex}"
+    with engine().begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    isolated = create_engine(engine().url, connect_args={"options": f"-csearch_path={schema}"}, poolclass=NullPool)
+    claim_db = Session(isolated, expire_on_commit=False)
+    try:
+        migrate(isolated)
+        project_id = create_project(claim_db, "claim decision")
+        session_id = create_session(claim_db, project_id, "claim decision")
+        run, _ = _approved_run(claim_db, (project_id, session_id))
+        decision = uuid4()
+        claim_db.execute(text("UPDATE runs SET state='queued', budget_decision_id=:d WHERE id=:r"),
+                         {"r": run.run_id, "d": decision})
+        claim_db.commit()
+
+        assert supervisor.claim(claim_db, max_active=3) is None
+        row = _run_row(claim_db, run.run_id)
+        assert row.state == "waiting_input" and row.budget_decision_id == decision and row.generation == 0
+    finally:
+        claim_db.close()
+        isolated.dispose()
+        with engine().begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))

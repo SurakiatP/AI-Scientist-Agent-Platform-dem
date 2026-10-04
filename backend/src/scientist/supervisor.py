@@ -280,7 +280,7 @@ def claim(db: Session, max_active: int) -> tuple[UUID, int] | None:
     if row is None:
         db.rollback()
         return None
-    if limits.budget_exhausted(db, row):
+    if row["budget_decision_id"] is not None or limits.budget_exhausted(db, row):
         limits.mark_budget_wait(db, row["id"], row["revision"], _event)
         db.commit()
         return None
@@ -736,7 +736,11 @@ def _queue_recovered_run(db: Session, run_id: UUID, generation: int, revision: i
     ).mappings().one_or_none()
     if current is None:
         return
-    if limits.budget_exhausted(db, current):
+    # A set budget_decision_id means an owner decision is pending (extension clears it).
+    if current["budget_decision_id"] is not None or limits.budget_exhausted(db, current):
+        if current["state"] == "waiting_input" and current["waiting_reason"] != "budget_exhausted":
+            # Quiescence and checkpoint are proven here; earlier recover steps only masked the wait.
+            db.execute(text("UPDATE runs SET waiting_reason='budget_exhausted' WHERE id=:run"), {"run": run_id})
         limits.mark_budget_wait(db, run_id, revision, _event)
         return
     changed = db.execute(text("""

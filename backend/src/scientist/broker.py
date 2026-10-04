@@ -488,8 +488,8 @@ def resolve_unknown(
         except DomainError as exc:
             if exc.code != "budget_exhausted":
                 raise
-            db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'budget_exhausted' WHERE id = :run"),
-                       {"run": run_id})
+            db.rollback()
+            limits.mark_budget_wait(db, run_id, run.revision, _event)  # no-op if execute already marked it
             db.commit()
     return _run_view(db, run_id)
 

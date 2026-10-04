@@ -185,3 +185,43 @@ def test_second_replay_waits_on_run_lock_before_retry_row_exists(broker_fixture,
         release.set()
         assert {first.result(10).state, second.result(10).state} <= {"committed", "unknown"}  # in-flight duplicate reports unknown
     assert transport.calls == 2
+
+
+def test_retry_hitting_budget_wait_records_owner_decision(broker_fixture, monkeypatch):
+    from uuid import uuid4
+
+    from scientist import supervisor
+    from scientist.auth import DomainError
+    from scientist.domain import extend_run_budget
+
+    db, owner, run_id, transport, _ = broker_fixture
+    transport.lose_response = True
+    broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id))
+    transport.lose_response = False
+    db.execute(text("UPDATE runs SET lease_expires_at = now() - interval '1 second' WHERE id = :run"), {"run": run_id})
+    db.commit()
+    broker.reconcile(db, run_id, "operation-1")
+    db.execute(text("UPDATE runs SET lease_expires_at = now() + interval '1 hour' WHERE id = :run"), {"run": run_id})
+    db.commit()
+
+    def exhausted(*args, **kwargs):
+        raise DomainError("budget_exhausted", 409)
+
+    monkeypatch.setattr(broker, "execute", exhausted)
+    broker.resolve_unknown(db, owner, run_id, "operation-1", "retry", None)
+    monkeypatch.undo()
+
+    row = db.execute(text("""SELECT state, waiting_reason, budget_decision_id, lease_expires_at, revision,
+                             token_limit, elapsed_limit_ms FROM runs WHERE id=:r"""), {"r": run_id}).one()
+    assert (row.state, row.waiting_reason) == ("waiting_input", "budget_exhausted")
+    assert row.budget_decision_id is not None and row.lease_expires_at is None
+    assert db.execute(text("""SELECT count(*) FROM events WHERE run_id=:r AND kind='decision.required'
+                              AND payload->>'reason'='budget_exhausted'"""), {"r": run_id}).scalar_one() == 1
+
+    supervisor._queue_recovered_run(db, run_id, 1, row.revision)  # the step recover takes once quiescence is proven
+    db.commit()
+    held = db.execute(text("SELECT state, waiting_reason FROM runs WHERE id=:r"), {"r": run_id}).one()
+    assert tuple(held) == ("waiting_input", "budget_exhausted")
+    extended = extend_run_budget(db, owner, run_id, row.revision, row.budget_decision_id, "retry-ext",
+                                 row.token_limit + 10, row.elapsed_limit_ms)
+    assert extended.token_limit == row.token_limit + 10
