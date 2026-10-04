@@ -4,6 +4,7 @@ import Projects from './Projects';
 import ProjectDetails from './ProjectDetails';
 import Library from './Library';
 import RunHistory from './RunHistory';
+import Chat from './Chat';
 import Landing from './Landing';
 import { AppearanceSettings, usePreferences } from './preferences';
 import { t } from './locales';
@@ -37,6 +38,7 @@ export default function App() {
     <Route path="projects" element={<Projects />} />
     <Route path="projects/:projectId" element={<ProjectDetails />} />
     <Route path="projects/:projectId/library" element={<Library />} />
+    <Route path="projects/:projectId/sessions/:sessionId" element={<Chat />} />
     <Route path="projects/:projectId/runs" element={<RunHistory />} />
     <Route path="sources" element={<Library />} />
     <Route path="history" element={<RunHistory />} />
