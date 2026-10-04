@@ -8,12 +8,12 @@ from uuid import UUID
 from sqlalchemy import text
 from scientist.db import session
 
-from b5_live_config import CFG
+from b5_live_config import CFG, digest
 
 report_path = CFG.evidence / 'b5-native-unknown-acceptance.json'
 report = json.loads(report_path.read_text())
 assert report['status'] == 'PASS' and report['paid_calls'] == 0
-assert report['service_image_digest'] == CFG.digest(CFG.fixture_images['counter'])
+assert report['service_image_digest'] == digest(CFG.fixture_images['counter'])
 assert report['worker_image_digest'] == CFG.worker_image_id
 run_id = UUID(report['run_id'])
 operation_id = report['unknown_snapshot']['operation_id']

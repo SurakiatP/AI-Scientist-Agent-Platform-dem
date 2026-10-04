@@ -66,3 +66,10 @@ def test_live_tree_hygiene():
             assert not CRED.search(line), where
             if SHA.search(line) and path.name not in SHA_OK_FILES:
                 assert any(tok in line for tok in SHA_OK_LINES), where
+
+
+def test_cfg_attributes_used_by_live_scripts_exist():
+    defined = set(json.loads((LIVE / "b5_live.example.json").read_text())) | {
+        "root", "evidence", "private_dir", "worker_image_id", "server_image_id"}
+    used = {m for p in LIVE.glob("*.py") for m in re.findall(r"\bCFG\.([a-z_0-9]+)", p.read_text())}
+    assert used <= defined, used - defined
