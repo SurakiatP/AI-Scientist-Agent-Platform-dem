@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Protocol, Sequence
+from typing import TYPE_CHECKING, Callable, Protocol, Sequence
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -37,6 +37,10 @@ from scientist.runtime_contracts import (
     RuntimeContextV1,
     WorkspaceFile as BoundaryWorkspaceFile,
 )
+
+
+if TYPE_CHECKING:
+    from scientist.private_worker_api import WorkerController
 
 
 _DOCKER_CONTEXT = "colima-scientist-platform-test"
@@ -72,6 +76,34 @@ class WorkerBootstrap:
     context: bytes
     workspace: Sequence[BoundaryWorkspaceFile]
     metadata: BootstrapMetadata
+
+
+def continuation_bootstrap(db: Session, run_id: UUID, generation: int, controller: WorkerController) -> WorkerBootstrap:
+    """Fail-closed bootstrap for a claimed generation > first: latest verified checkpoint, rebound.
+
+    Never falls back to a fresh context. Raises on no checkpoint, integrity failure
+    or a generation/revision the controller does not accept. Never touches usage or operations.
+    A fresh context is lawful only when the run has no checkpoint AND no operation rows;
+    callers must choose this function in every other case.
+    """
+    row = db.execute(text("SELECT manifest FROM checkpoints WHERE run_id=:run ORDER BY revision DESC LIMIT 1"),
+                     {"run": run_id}).mappings().one_or_none()
+    if row is None:
+        raise RuntimeError("no checkpoint to continue from")
+    manifest = CheckpointManifest.model_validate(row["manifest"])
+    with tempfile.TemporaryDirectory(prefix="scientist-continuation-") as directory:
+        raw = checkpoints.restore(db, manifest, Path(directory))
+        saved = RuntimeContextV1.model_validate_json(raw)
+        files = []
+        for entry in saved.workspace_manifest:
+            data = (Path(directory) / entry.path).read_bytes()
+            files.append(BoundaryWorkspaceFile(
+                path=entry.path, sha256=entry.sha256, size=entry.size,
+                data_base64=base64.b64encode(data).decode("ascii")))
+    context = controller.bootstrap_context(db, raw, run_id, generation)
+    return WorkerBootstrap(
+        context=context.model_dump_json().encode(), workspace=files,
+        metadata=BootstrapMetadata(schema_version=1, checkpoint_revision=manifest.revision))
 
 
 class DispatchRuntime(Protocol):
@@ -340,6 +372,7 @@ def start(db: Session, run_id: UUID, generation: int) -> str:
                    {"id": dispatch_id})
         db.commit()
         bootstrap = cfg.bootstrap_factory(db, run_id, generation)
+        db.commit()  # bootstrap writes nothing; release the run-row lock it may hold
         context = RuntimeContextV1.model_validate_json(bootstrap.context)
         if (context.run_id != run_id or context.generation != generation
                 or context.revision != run["revision"]
