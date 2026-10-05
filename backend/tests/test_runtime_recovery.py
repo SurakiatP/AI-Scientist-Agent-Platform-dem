@@ -974,3 +974,75 @@ def test_restore_missing_object_is_integrity_not_outage(db, project_session, obj
     del object_fixture.data[(objects.BUCKET, manifest.workspace[0].key)]
     with pytest.raises(checkpoints.CheckpointIntegrityError):
         checkpoints.restore(db, manifest, tmp_path / "r")
+
+
+def _slow_fence_fakes(monkeypatch, *, dispatch_ok=True, worker_raises=False):
+    import threading
+    # Both stops must be in flight at once to pass the barrier; a serial fence would time out (no wall-clock bound).
+    barrier = threading.Barrier(2, timeout=5)
+    seen = SimpleNamespace(threads=set(), dbs=[], overlapped=[])
+
+    def meet():
+        try:
+            barrier.wait()
+            seen.overlapped.append(True)
+        except threading.BrokenBarrierError:
+            seen.overlapped.append(False)
+
+    class Engine:
+        def stop_worker(self, ref, grace_seconds):
+            seen.threads.add(threading.get_ident())
+            meet()
+            if worker_raises:
+                raise RuntimeError("docker unavailable")
+            return True
+
+    class Dispatch:
+        def stop(self, db, ref, grace_seconds):
+            seen.threads.add(threading.get_ident())
+            seen.dbs.append(db)
+            meet()
+            return dispatch_ok
+
+        def inactive(self, db, ref, operation_id):
+            return True
+
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=Engine(), dispatch=Dispatch()))
+    return seen
+
+
+def test_fence_generation_stops_executors_concurrently_without_session(db, project_session, monkeypatch):
+    import threading
+    run, _ = _reserved_stop_run(db, project_session, monkeypatch)
+    seen = _slow_fence_fakes(monkeypatch)
+    assert supervisor._fence_generation(db, run.run_id, 1, 0) is True
+    assert seen.overlapped == [True, True]
+    assert len(seen.threads) == 2 and threading.get_ident() not in seen.threads
+    assert not any(isinstance(arg, Session) for arg in seen.dbs)
+    states = db.execute(text("SELECT kind, state, proof->>'source' FROM runtime_executors "
+                             "WHERE run_id=:run ORDER BY kind"), {"run": run.run_id}).all()
+    assert states == [("dispatch", "inactive", "owned-engine-generation-fence"),
+                      ("worker", "inactive", "owned-engine-generation-fence")]
+
+
+def test_fence_generation_one_failed_concurrent_stop_is_incomplete(db, project_session, monkeypatch):
+    run, _ = _reserved_stop_run(db, project_session, monkeypatch)
+    _slow_fence_fakes(monkeypatch, dispatch_ok=False)
+    before = _ops_and_budget(db, run.run_id)
+    assert supervisor._fence_generation(db, run.run_id, 1, 0) is False
+    assert dict(db.execute(text("SELECT kind, state FROM runtime_executors WHERE run_id=:run"),
+                           {"run": run.run_id}).all()) == {"worker": "inactive", "dispatch": "unknown"}
+    assert _ops_and_budget(db, run.run_id) == before
+    stopped = supervisor.stop(db, run.run_id, 0)
+    assert (stopped.state, stopped.waiting_reason) == ("waiting_input", "executor_quiescence_unproven")
+    assert _ops_and_budget(db, run.run_id) == before
+
+
+def test_fence_generation_stop_exception_is_never_proof(db, project_session, monkeypatch):
+    run, _ = _reserved_stop_run(db, project_session, monkeypatch)
+    _slow_fence_fakes(monkeypatch, worker_raises=True)
+    before = _ops_and_budget(db, run.run_id)
+    assert supervisor._fence_generation(db, run.run_id, 1, 0) is False
+    assert dict(db.execute(text("SELECT kind, state FROM runtime_executors WHERE run_id=:run"),
+                           {"run": run.run_id}).all()) == {"worker": "unknown", "dispatch": "inactive"}
+    assert _ops_and_budget(db, run.run_id) == before

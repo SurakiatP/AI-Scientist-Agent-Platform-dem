@@ -15,6 +15,7 @@ import subprocess
 import tarfile
 import base64
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, replace
@@ -817,6 +818,7 @@ def _fence_generation(db: Session, run_id: UUID, generation: int | None, grace_s
         ORDER BY CASE kind WHEN 'worker' THEN 0 ELSE 1 END, id FOR UPDATE
     """), {"run": run_id, "generation": generation}).mappings().all()
     complete = True
+    pending_rows = []
     for row in rows:
         if row["state"] == "inactive":
             if not _inactive_executor_proven(row):
@@ -829,9 +831,28 @@ def _fence_generation(db: Session, run_id: UUID, generation: int | None, grace_s
             db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
                        {"id": row["id"]})
             continue
-        if row["kind"] == "worker":
-            ref = _executor_ref(row)
-            ok = cfg.engine.stop_worker(ref, grace_seconds)
+        pending_rows.append((row, _executor_ref(row)))
+
+    # Safety: the caller already committed the stopping/cancel_requested broker reservation, which
+    # requires state='running', so no new effect can start; stopping concurrently adds no risk and
+    # worker-first ordering adds no safety. Threads never touch the SQLAlchemy session
+    # (DockerDispatchRuntime.stop ignores db), so only Docker calls run in parallel.
+    def stop_one(ref: ExecutorRef) -> bool:
+        try:
+            if ref.kind == "worker":
+                return bool(cfg.engine.stop_worker(ref, grace_seconds))
+            return bool(cfg.dispatch.stop(None, ref, grace_seconds))  # type: ignore[arg-type]
+        except Exception:
+            return False
+
+    outcomes: list[bool] = []
+    if pending_rows:
+        with ThreadPoolExecutor(max_workers=min(len(pending_rows), 8)) as pool:
+            outcomes = list(pool.map(stop_one, [ref for _, ref in pending_rows]))
+
+    for (row, ref), stopped in zip(pending_rows, outcomes):
+        if ref.kind == "worker":
+            ok = stopped
             if ok:
                 proof = {
                     "source": "owned-engine-generation-fence",
@@ -855,8 +876,6 @@ def _fence_generation(db: Session, run_id: UUID, generation: int | None, grace_s
                     "incarnation": ref.process_incarnation,
                 }).rowcount == 1
         else:
-            ref = _executor_ref(row)
-            stopped = cfg.dispatch.stop(db, ref, grace_seconds)
             pending = db.execute(text("""SELECT operation_id FROM operations WHERE run_id=:run AND generation=:generation
                 AND state IN ('reserved','unknown')"""),
                 {"run": run_id, "generation": row["generation"]}).scalars().all()
