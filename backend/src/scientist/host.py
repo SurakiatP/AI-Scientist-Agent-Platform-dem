@@ -103,6 +103,7 @@ class HostConfig(BaseModel):
     max_active: int = Field(strict=True, ge=1, le=3)
     poll_seconds: float = Field(default=2.0, ge=0.2, le=30)
     provider_destinations: dict[str, str]
+    peer_destinations: dict[str, str] = Field(default_factory=dict, validate_default=True)
 
     @field_validator("database_url")
     @classmethod
@@ -164,6 +165,16 @@ class HostConfig(BaseModel):
         if value != dict(settings.provider_destinations()):
             raise ValueError("provider destinations differ from SCIENTIST_PROVIDER_DESTINATIONS")
         return value
+
+    @field_validator("peer_destinations", mode="before")
+    @classmethod
+    def _peers(cls, value: object) -> dict[str, str]:
+        parsed = settings.parse_peer_destinations(value)
+        if parsed != value:
+            raise ValueError("peer destinations must be canonical UUID origins")
+        if parsed != settings.peer_destinations():
+            raise ValueError("peer destinations differ SCIENTIST_PEER_DESTINATIONS")
+        return parsed
 
     @model_validator(mode="after")
     def _secrets(self) -> "HostConfig":
@@ -228,7 +239,8 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
     template = json.dumps({
         "schema_version": 1, "runtime_commit": RUNTIME_COMMIT, "image_digest": pin,
         "skills_digest": cfg.skills_digest, "environment_digest": cfg.environment_digest,
-        "provider_destinations": cfg.provider_destinations, "secret_files": {n: n for n in sorted(_SECRET_NAMES)},
+            "provider_destinations": cfg.provider_destinations, "peer_destinations": cfg.peer_destinations,
+            "secret_files": {n: n for n in sorted(_SECRET_NAMES)},
     }, sort_keys=True).encode()
     _parse_template(template)
     template_path = cfg.state_dir / "dispatch-template.json"
@@ -251,7 +263,11 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
         host_secrets_dir=str(cfg.secrets_dir), launcher_dir=str(launcher)), engine=engine)
 
     objects.configure(s3, bucket=cfg.bucket)
-    broker.configure(capability_key=capability_key, provider_destinations=dict(cfg.provider_destinations))
+    broker.configure(
+        capability_key=capability_key,
+        provider_destinations=dict(cfg.provider_destinations),
+        peer_destinations=dict(cfg.peer_destinations),
+    )
     os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(cfg.secrets_dir / "master_key")
     global _destinations
     _destinations = dict(cfg.provider_destinations)

@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 from typing import Literal
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -21,7 +18,6 @@ from scientist.db import session
 
 
 router = APIRouter(prefix="/api/v1")
-_PEER_MAP_LIMIT = 16 * 1024
 
 
 class _Body(BaseModel):
@@ -45,42 +41,8 @@ def _principal(request: Request) -> Principal:
 
 
 def configured_peers() -> dict[str, str]:
-    """Read endpoint authority only from bounded, operator-owned configuration."""
-    raw = os.environ.get("SCIENTIST_PEER_DESTINATIONS", "")
-    try:
-        encoded = raw.encode("utf-8")
-    except UnicodeError:
-        return {}
-    if not raw or len(encoded) > _PEER_MAP_LIMIT:
-        return {}
-    try:
-        def pairs(items):
-            result = {}
-            for key, value in items:
-                if key in result:
-                    raise ValueError("duplicate peer configuration key")
-                result[key] = value
-            return result
-
-        parsed = json.loads(raw, object_pairs_hook=pairs)
-        if not isinstance(parsed, dict) or len(parsed) > 100:
-            return {}
-        result: dict[str, str] = {}
-        for peer_id, endpoint in parsed.items():
-            normalized_id = str(UUID(peer_id))
-            if normalized_id != peer_id:
-                return {}
-            normalized_endpoint = settings._origin(endpoint) if isinstance(endpoint, str) else None
-            if normalized_endpoint is None or normalized_endpoint != endpoint:
-                return {}
-            parts = urlsplit(endpoint)
-            if parts.path not in {"", "/"} or parts.query or parts.fragment:
-                return {}
-            result[normalized_id] = endpoint.rstrip("/")
-        return result
-    except (ValueError, TypeError, UnicodeError):
-        return {}
-
+    """Read endpoint authority through the shared fail-closed parser."""
+    return settings.peer_destinations()
 
 def _no_store_error(request: Request, error: DomainError) -> JSONResponse:
     return JSONResponse(

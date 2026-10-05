@@ -20,6 +20,7 @@ import subprocess
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from scientist import settings
 from scientist.dispatch_authority import dispatch_is_inactive
 from scientist.runtime_contracts import RUNTIME_COMMIT
 from scientist.supervisor import DockerWorkerEngine, ExecutorRef
@@ -31,6 +32,21 @@ _EXEC_LABEL = "scientist.platform/executor"
 _KIND_LABEL = "scientist.platform/kind"
 _INC_LABEL = "scientist.platform/incarnation"
 _SECRET_NAMES = {"database_url", "broker_capability_key", "master_key", "s3_access_key", "s3_secret_key"}
+
+
+def _validated_peer_destinations(values: Any) -> Mapping[UUID, str]:
+    if not isinstance(values, Mapping):
+        raise ValueError("peer destinations must be a mapping")
+    raw: dict[str, str] = {}
+    for key, endpoint in values.items():
+        peer_id = str(key) if isinstance(key, UUID) else key
+        if not isinstance(peer_id, str) or peer_id in raw or not isinstance(endpoint, str):
+            raise ValueError("peer destinations must use canonical UUID keys and origins")
+        raw[peer_id] = endpoint
+    parsed = settings.parse_peer_destinations(raw)
+    if parsed != raw:
+        raise ValueError("peer destinations must use canonical UUID keys and origins")
+    return MappingProxyType({UUID(key): endpoint for key, endpoint in parsed.items()})
 
 # Fixed, trusted code sent only to the verified dispatch image via `docker exec`.
 # It uses raw numeric IPv4 sockets so macOS never tries to route a Colima bridge IP,
@@ -157,6 +173,7 @@ class DispatchIdentity(BaseModel):
     skills_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     environment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider_destinations: Mapping[UUID, str] = Field(max_length=32)
+    peer_destinations: Mapping[UUID, str] = Field(default_factory=dict, max_length=100, validate_default=True)
     secret_files: dict[str, str]
     # Launch-only (not in the static template): services subnet the entrypoint must pin its clients inside.
     service_subnet: str | None = None
@@ -194,6 +211,20 @@ class DispatchIdentity(BaseModel):
     def serialize_provider_destinations(self, values: Mapping[UUID, str]) -> dict[str, str]:
         return {str(key): value for key, value in values.items()}
 
+    @field_validator("peer_destinations", mode="before")
+    @classmethod
+    def validate_peer_destinations(cls, values: Any) -> Mapping[UUID, str]:
+        return _validated_peer_destinations(values)
+
+    @field_validator("peer_destinations", mode="after")
+    @classmethod
+    def freeze_peer_destinations(cls, values: Mapping[UUID, str]) -> Mapping[UUID, str]:
+        return MappingProxyType(dict(values))
+
+    @field_serializer("peer_destinations")
+    def serialize_peer_destinations(self, values: Mapping[UUID, str]) -> dict[str, str]:
+        return {str(key): value for key, value in values.items()}
+
     @field_validator("runtime_commit")
     @classmethod
     def pinned_runtime(cls, value: str) -> str:
@@ -212,6 +243,7 @@ class DispatchTemplate(BaseModel):
     skills_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     environment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider_destinations: Mapping[UUID, str] = Field(max_length=32)
+    peer_destinations: Mapping[UUID, str] = Field(default_factory=dict, max_length=100, validate_default=True)
     secret_files: dict[str, str]
 
     @field_validator("runtime_commit")
@@ -233,6 +265,20 @@ class DispatchTemplate(BaseModel):
 
     @field_serializer("provider_destinations")
     def serialize_provider_destinations(self, values: Mapping[UUID, str]) -> dict[str, str]:
+        return {str(key): value for key, value in values.items()}
+
+    @field_validator("peer_destinations", mode="before")
+    @classmethod
+    def validate_peer_destinations(cls, values: Any) -> Mapping[UUID, str]:
+        return _validated_peer_destinations(values)
+
+    @field_validator("peer_destinations", mode="after")
+    @classmethod
+    def freeze_peer_destinations(cls, values: Mapping[UUID, str]) -> Mapping[UUID, str]:
+        return MappingProxyType(dict(values))
+
+    @field_serializer("peer_destinations")
+    def serialize_peer_destinations(self, values: Mapping[UUID, str]) -> dict[str, str]:
         return {str(key): value for key, value in values.items()}
 
 

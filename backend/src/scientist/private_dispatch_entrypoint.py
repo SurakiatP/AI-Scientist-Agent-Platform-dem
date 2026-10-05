@@ -130,6 +130,7 @@ def create_dispatch_app(identity: DispatchIdentity):
         persist_result=persist_result,
         capability_key=_read_secret("broker_capability_key"),
         provider_destinations={str(key): value for key, value in identity.provider_destinations.items()},
+        peer_destinations={str(key): value for key, value in identity.peer_destinations.items()},
     )
     controller = WorkerController(
         pins=pins,
