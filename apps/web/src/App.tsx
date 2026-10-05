@@ -1,3 +1,4 @@
+import Settings from './Settings';
 import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, NavLink, Outlet, Route, Routes, useLocation, useNavigationType } from 'react-router-dom';
 import Projects from './Projects';
@@ -42,7 +43,7 @@ export default function App() {
     <Route path="projects/:projectId/runs" element={<RunHistory />} />
     <Route path="sources" element={<Library />} />
     <Route path="history" element={<RunHistory />} />
-    <Route path="settings" element={<WorkspacePage titleKey="settingsTitle" textKey="settingsUnavailable" />} />
+    <Route path="settings" element={<Settings />} />
     <Route path="settings/appearance" element={<AppearanceRoute />} />
     <Route path="*" element={<WorkspacePage titleKey="workspaceTitle" textKey="workspaceUnavailable" />} />
   </Route></Routes>;
@@ -62,7 +63,7 @@ export function AppShell() {
   useEffect(() => { setDrawerOpen(false); }, [location.pathname]);
 
   const links = [
-    ['/', 'home'], ['/projects', 'projects'], ['/sources', 'sources'], ['/history', 'history'], ['/settings/appearance', 'settings'],
+    ['/', 'home'], ['/projects', 'projects'], ['/sources', 'sources'], ['/history', 'history'], ['/settings', 'settings'],
   ] as const;
   const navigation = (onNavigate?: () => void) => <nav aria-label={t('navLabel', language)}>
     {links.map(([to, key]) => <NavLink key={to} to={to} end={to === '/'} onClick={onNavigate} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
