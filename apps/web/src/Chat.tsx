@@ -1,16 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunEvent, RunView } from '../../../contracts/api-types';
+import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunView } from '../../../contracts/api-types';
 import { ApiError, apiErrorMessage, request } from './api';
 import { useAppPreferences } from './App';
 import { ArtifactCard, ArtifactViewer, INITIAL_VISUAL_STATE, type VisualState } from './ArtifactViewer';
 import type { DecisionRequiredPayload } from '../../../contracts/api-types';
 import { RunProgress, type DecisionChoice } from './RunProgress';
+import { useRunEvents } from './useRunEvents';
 import './research.css';
 
 const text = (language: 'th' | 'en', en: string, th: string) => language === 'th' ? th : en;
 type MessageView = { id: string; sequence: number; role: string; content: string; created_at?: string };
-type EventPage = { events: RunEvent[]; latest_cursor: number };
 const fileStateLabels: Record<FileView['state'], [string, string]> = { uploading: ['Uploading', 'กำลังอัปโหลด'], preparing: ['Preparing', 'กำลังเตรียมไฟล์'], ready: ['Ready', 'พร้อมใช้งาน'], failed: ['Failed', 'ไม่สำเร็จ'] };
 const fileStateLabel = (state: FileView['state'], language: 'th' | 'en') => fileStateLabels[state][language === 'th' ? 1 : 0];
 function newKey(): string { // randomUUID needs a secure context; getRandomValues does not
@@ -31,56 +31,6 @@ const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Cont
 type DecisionBody = { decision_id: string; expected_revision: number; idempotency_key: string; choice: DecisionChoice; add_tokens?: number; add_elapsed_ms?: number; usage_tokens?: number };
 const submitDecision = (runId: string, body: DecisionBody) => request<RunView>(`/api/v1/runs/${runId}/decisions`, json(body));
 
-type EventPageResult = { expired: false; events: RunEvent[]; latest_cursor: number } | { expired: true; snapshot: RunView };
-// Raw fetch: request() drops the 410 body that carries the resync snapshot. /events is SSE and is never fetched here.
-async function fetchEventPage(runId: string, after: number, signal: AbortSignal): Promise<EventPageResult> {
-  const response = await fetch(`/api/v1/runs/${runId}/event-page?after=${after}&limit=100`, { credentials: 'same-origin', redirect: 'error', headers: { Accept: 'application/json' }, signal });
-  const body: unknown = await response.json().catch(() => null);
-  if (response.status === 410 && body && typeof body === 'object' && 'snapshot' in body) return { expired: true, snapshot: (body as { snapshot: RunView }).snapshot };
-  if (!response.ok) throw new ApiError('request_failed', response.status, '');
-  return { expired: false, ...(body as EventPage) };
-}
-
-// TODO(F4): replace with useRunEvents (snapshot + SSE). Polling keeps F3 testable against fixtures.
-function usePolledRun(initial: RunView | null, pollMs: number) {
-  const [run, setRun] = useState<RunView | null>(initial);
-  const [events, setEvents] = useState<RunEvent[]>([]);
-  const [connected, setConnected] = useState(true);
-  const runId = initial?.run_id ?? null;
-  const cursor = useRef(0);
-  useEffect(() => { setRun(initial); setEvents([]); cursor.current = 0; setConnected(true); }, [runId]);
-  useEffect(() => {
-    if (!runId) return;
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout>;
-    const tick = async () => {
-      let drained = false;
-      try {
-        const snapshot = await request<RunView>(`/api/v1/runs/${runId}`, { signal: controller.signal });
-        if (controller.signal.aborted) return;
-        setRun((old) => old && old.run_id === snapshot.run_id && snapshot.latest_cursor < old.latest_cursor ? old : snapshot); // ignore stale snapshots (the cursor only grows; revision can stay equal)
-        let latest = snapshot.latest_cursor;
-        do { // keep paging until caught up, even once the run is terminal
-          const page = await fetchEventPage(runId, cursor.current, controller.signal);
-          if (controller.signal.aborted) return;
-          if (page.expired) { setRun(page.snapshot); setEvents([]); cursor.current = 0; break; } // events are never deleted: re-page from the start
-          latest = Math.max(latest, page.latest_cursor);
-          if (page.events.length) {
-            cursor.current = Math.max(cursor.current, ...page.events.map((e) => e.sequence));
-            setEvents((old) => [...old, ...page.events.filter((e) => !old.some((o) => o.sequence === e.sequence))].sort((x, y) => x.sequence - y.sequence));
-          } else break;
-        } while (cursor.current < latest);
-        setConnected(true);
-        drained = TERMINAL.includes(snapshot.state) && cursor.current >= latest;
-      } catch { if (controller.signal.aborted) return; setConnected(false); }
-      if (!drained) timer = setTimeout(() => void tick(), pollMs);
-    };
-    void tick();
-    return () => { controller.abort(); clearTimeout(timer); };
-  }, [runId, pollMs]);
-  return { run, setRun, events, connected };
-}
-
 function ChatSession({ pollMs }: { pollMs: number }) {
   const { projectId = '', sessionId = '' } = useParams();
   const { language } = useAppPreferences();
@@ -92,7 +42,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const [question, setQuestion] = useState(() => readDraft(draftKey).question);
   const [selected, setSelected] = useState<string[]>(() => readDraft(draftKey).selected);
   const [activeRun, setActiveRun] = useState<RunView | null>(null);
-  const { run, setRun, events, connected } = usePolledRun(activeRun, pollMs);
+  const { run, setRun, events, connected } = useRunEvents(activeRun?.run_id ?? null, { retryBaseDelayMs: pollMs });
   const [pendingDecisions, setPendingDecisions] = useState<PendingDecisionView[]>([]);
   const [archived, setArchived] = useState<RunView[]>([]);
   const [plan, setPlan] = useState<PlanView | null>(null);
@@ -121,7 +71,12 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   }, [base, sessionId]);
   useEffect(() => { // resume the latest run of this session
     const controller = new AbortController();
-    request<RunView[]>(`${base}/runs`, { signal: controller.signal }).then((all) => { if (!controller.signal.aborted) setActiveRun(all.filter((r) => r.session_id === sessionId).at(-1) ?? null); }).catch(() => undefined);
+    request<RunView[]>(`${base}/runs`, { signal: controller.signal }).then((all) => {
+      if (!controller.signal.aborted) {
+        const latest = all.filter((r) => r.session_id === sessionId).at(-1) ?? null;
+        setActiveRun((current) => current ?? latest);
+      }
+    }).catch(() => undefined);
     return () => controller.abort();
   }, [base, sessionId]);
   useEffect(() => { // refresh file readiness while any file is still being prepared

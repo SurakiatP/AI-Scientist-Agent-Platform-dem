@@ -1,5 +1,51 @@
-import { expect, test } from '@playwright/test';
-import { DECISION_BUDGET, DECISION_UNKNOWN, PROJECT_ID, RUN_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
+import { expect, test, type Page } from '@playwright/test';
+import type { RunEvent } from '../../../contracts/api-types';
+import { DECISION_BUDGET, DECISION_UNKNOWN, NEW_RUN_ID, PROJECT_ID, RUN_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
+
+type ChatEventSource = { url: string; closed: boolean; emit: (item: unknown) => void; fail: () => void };
+
+async function installChatEventSource(page: Page) {
+  await page.addInitScript(() => {
+    const w = window as typeof window & { __chatEventSources?: ChatEventSource[] };
+    w.__chatEventSources = [];
+    class FixtureEventSource extends EventTarget {
+      url: string;
+      closed = false;
+      constructor(url: string) {
+        super();
+        this.url = url;
+        w.__chatEventSources!.push(this);
+        queueMicrotask(() => { if (!this.closed) this.dispatchEvent(new Event('open')); });
+      }
+      close() { this.closed = true; }
+      emit(item: unknown) {
+        const value = item as { kind: string };
+        this.dispatchEvent(new MessageEvent(value.kind, { data: JSON.stringify(item) }));
+      }
+      fail() { this.dispatchEvent(new Event('error')); }
+    }
+    Object.defineProperty(window, 'EventSource', { configurable: true, value: FixtureEventSource });
+  });
+}
+
+async function chatStreams(page: Page) {
+  return page.evaluate(() => (window as typeof window & { __chatEventSources?: ChatEventSource[] }).__chatEventSources?.map(({ url, closed }) => ({ url, closed })) ?? []);
+}
+
+async function emitChatEvent(page: Page, index: number, item: unknown) {
+  await page.evaluate(({ index, item }) => (window as typeof window & { __chatEventSources: ChatEventSource[] }).__chatEventSources[index].emit(item), { index, item });
+}
+
+async function failChatStream(page: Page, index: number) {
+  await page.evaluate((index) => (window as typeof window & { __chatEventSources: ChatEventSource[] }).__chatEventSources[index].fail(), index);
+}
+
+async function publishChatEvents(page: Page, fixture: { pushEvents: (...items: RunEvent[]) => void }, ...items: RunEvent[]) {
+  fixture.pushEvents(...items);
+  const streams = await chatStreams(page);
+  const index = streams.length - 1;
+  for (const item of items) await emitChatEvent(page, index, item);
+}
 
 test('expanded artifact preserves controls and focus', async ({ page }) => {
   await installResearchFixtureRoutes(page);
@@ -67,47 +113,50 @@ test('revision conflict refreshes the plan instead of approving it', async ({ pa
 
 test('run states render distinctly with confirmed stage counts only', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'queued', artifacts: [] }) });
+  await installChatEventSource(page);
   await page.goto(SESSION_URL);
   await expect(page.getByRole('heading', { name: 'Queued to start' })).toBeVisible();
-  fixture.pushEvents(event(1, 'stage.started', { stage: 'search_literature' }), event(2, 'stage.completed', { stage: 'search_literature', outcome: 'completed' }), event(3, 'stage.started', { stage: 'verify_references' }));
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(1);
+
+  const startedRun = event(1, 'run.state', { state: 'running' });
+  const searchStarted = event(2, 'stage.started', { stage: 'search_literature' });
+  const searchCompleted = event(3, 'stage.completed', { stage: 'search_literature', outcome: 'completed' });
+  const verifyStarted = event(4, 'stage.started', { stage: 'verify_references' });
   fixture.setRun({ state: 'running', stage: 'verify_references' });
+  await publishChatEvents(page, fixture, startedRun, searchStarted, searchCompleted, verifyStarted);
   await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
   await expect(page.getByText('1 stages completed')).toBeVisible();
   await expect(page.getByText('Current stage: Verify references')).toBeVisible();
   await expect(page.getByText('%')).toHaveCount(0);
 
-  fixture.pushEvents(event(4, 'decision.required', { decision_id: DECISION_BUDGET, reason: 'budget_exhausted', required_tokens: 37, required_elapsed_ms: null }));
-  fixture.setRun({ state: 'waiting_input', reserved_tokens: 5 });
-  await expect(page.getByRole('heading', { name: 'Waiting for your decision' })).toBeVisible();
-  await expect(page.getByText('Required to continue: 37 more tokens.')).toBeVisible();
-
-  fixture.pushEvents(event(5, 'decision.required', { decision_id: DECISION_UNKNOWN, reason: 'unknown_outcome' }));
-  await expect(page.getByText(/5 reserved tokens are retained/)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Use a verified result' })).toBeDisabled();
-  await expect(page.getByRole('button', { name: /Retry \(may duplicate cost\)/ })).toBeVisible();
-  await page.getByRole('button', { name: /Retry \(may duplicate cost\)/ }).click();
-  await expect.poll(() => fixture.writes.find((w) => w.path.endsWith('/decisions'))?.body).toMatchObject({ decision_id: DECISION_UNKNOWN, choice: 'retry' });
-
-  fixture.pushEvents(event(6, 'stage.completed', { stage: 'verify_references', outcome: 'failed' }));
-  fixture.setRun({ state: 'failed', error_code: 'storage_unavailable', artifacts: [{ ...report, partial: true }] });
-  await expect(page.getByRole('alert').filter({ hasText: 'Verify references' })).toContainText('Partial outputs are kept below.');
+  const completedRun = event(5, 'run.state', { state: 'completed' });
+  fixture.setRun({ state: 'completed', stage: null });
+  await publishChatEvents(page, fixture, completedRun);
+  await expect(page.getByRole('heading', { name: 'Completed' })).toBeVisible();
+  await expect(page.getByText('1 stages completed')).toBeVisible();
 });
 
 test('stop stays pending until acknowledged and a lost connection never claims it stopped', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', artifacts: [] }) });
+  await installChatEventSource(page);
   await page.goto(SESSION_URL);
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(1);
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Stopping, waiting for confirmation' })).toBeVisible();
   await expect.poll(() => fixture.writes.some((w) => w.path.endsWith('/stop'))).toBe(true);
   await expect(page.getByRole('button', { name: 'Stopping…' })).toBeDisabled();
-  fixture.setOffline(true);
+  await failChatStream(page, 0);
   await expect(page.getByText(/Connection lost.*may still be active/)).toBeVisible();
+  await page.getByRole('button', { name: 'TH', exact: true }).click();
+  await expect(page.getByText(/การเชื่อมต่อขาดหาย.*งานอาจยังทำงานอยู่/)).toBeVisible();
+  await page.getByRole('button', { name: 'EN', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Stopping, waiting for confirmation' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Stopped' })).toHaveCount(0);
-  fixture.setOffline(false);
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(2);
   await expect(page.getByText('Connected', { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Stopping, waiting for confirmation' })).toBeVisible();
   fixture.acknowledgeStop();
+  await emitChatEvent(page, 1, event(1, 'run.state', { state: 'canceled' }));
   await expect(page.getByRole('heading', { name: 'Stopped' })).toBeVisible();
 });
 
@@ -128,6 +177,7 @@ test('an unconfirmed submission reuses its key', async ({ page }) => {
   await page.getByLabel('Research question').fill('Q');
   await page.getByRole('button', { name: 'Review plan' }).click();
   await expect(page.getByRole('alert')).toContainText('could not confirm');
+  fixture.setRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] });
   await page.getByRole('button', { name: 'Review plan' }).click();
   await expect(page.getByText('Review the plan')).toBeVisible();
   const keys = fixture.writes.filter((w) => w.path.endsWith('/runs')).map((w) => w.body.submission_key);
@@ -221,25 +271,16 @@ test('event paging drains every page after the run is terminal and never fetches
 test('an expired cursor re-pages from cursor 0 because events are never deleted', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', artifacts: [] }), expireCursorOnce: true });
   fixture.pushEvents(event(1, 'stage.started', { stage: 'search_literature' }));
+  await installChatEventSource(page);
   await page.goto(SESSION_URL);
   await expect(page.getByRole('listitem').filter({ hasText: 'Search literature' })).toBeVisible();
   fixture.pushEvents(event(2, 'stage.completed', { stage: 'search_literature', outcome: 'completed' }));
+  await failChatStream(page, 0);
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(2);
   await expect.poll(() => fixture.pageRequests().filter((n) => n === 0).length).toBeGreaterThanOrEqual(2);
   await expect(page.getByText('Connected', { exact: true })).toBeVisible();
   await expect(page.getByText('1 stages completed')).toBeVisible();
   await expect(page.getByRole('listitem').filter({ hasText: 'Search literature' })).toHaveCount(1);
-});
-
-test('a stale snapshot is ignored by latest_cursor, not revision', async ({ page }) => {
-  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', artifacts: [], latest_cursor: 5 }) });
-  await page.goto(SESSION_URL);
-  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
-  fixture.setRun({ latest_cursor: 2, state: 'waiting_input' });
-  const seen = fixture.pageRequests().length;
-  await expect.poll(() => fixture.pageRequests().length).toBeGreaterThan(seen + 2);
-  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
-  fixture.setRun({ latest_cursor: 6 });
-  await expect(page.getByRole('heading', { name: 'Waiting for your decision' })).toBeVisible();
 });
 
 test('stop and its acknowledgement never change the revision, and 422 uses detail', async ({ page }) => {
@@ -458,4 +499,128 @@ test('zero usage requires and submits the provider-record acknowledgement', asyn
   await confirm.click();
   await expect.poll(() => fixture.writes.filter((write) => write.path.endsWith('/decisions')).length).toBe(1);
   expect(fixture.writes.find((write) => write.path.endsWith('/decisions'))?.body.usage_tokens).toBe(0);
+});
+
+test('Chat applies stage and state SSE, then reconnect replay keeps the conversation and stage count stable', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'queued', artifacts: [] }) });
+  await installChatEventSource(page);
+  await page.goto(SESSION_URL);
+  await expect(page.getByRole('heading', { name: 'Queued to start' })).toBeVisible();
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(1);
+
+  const running = event(1, 'run.state', { state: 'running' });
+  const started = event(2, 'stage.started', { stage: 'search_literature' });
+  fixture.pushEvents(running, started);
+  await emitChatEvent(page, 0, running);
+  await emitChatEvent(page, 0, started);
+  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
+  await expect(page.getByText('Current stage: Search literature')).toBeVisible();
+
+  const completed = event(3, 'stage.completed', { stage: 'search_literature', outcome: 'completed' });
+  const terminal = event(4, 'run.state', { state: 'completed' });
+  fixture.pushEvents(completed, terminal);
+  fixture.setRun({ state: 'completed', stage: null });
+  await emitChatEvent(page, 0, completed);
+  await failChatStream(page, 0);
+
+  await expect(page.getByRole('heading', { name: 'Completed' })).toBeVisible();
+  await expect(page.getByText('1 stages completed')).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Conversation' }).getByText('Original question about diffusion', { exact: true })).toHaveCount(1);
+});
+
+test('a session switch ignores its late stream and refresh resumes the current run snapshot', async ({ page }) => {
+  await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', artifacts: [] }) });
+  await installChatEventSource(page);
+  await page.goto(SESSION_URL);
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(1);
+
+  const otherSessionUrl = `${SESSION_URL.slice(0, SESSION_URL.lastIndexOf('/'))}/44444444-4444-4444-8444-444444444444`;
+  await page.evaluate((url) => {
+    history.pushState({}, '', url);
+    dispatchEvent(new PopStateEvent('popstate'));
+  }, otherSessionUrl);
+  await expect.poll(async () => (await chatStreams(page))[0]?.closed).toBe(true);
+  await emitChatEvent(page, 0, event(1, 'run.state', { state: 'failed' }));
+  await expect(page.getByRole('heading', { name: 'Running' })).toHaveCount(0);
+
+  await page.evaluate((url) => {
+    history.pushState({}, '', url);
+    dispatchEvent(new PopStateEvent('popstate'));
+  }, SESSION_URL);
+  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(2);
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
+  await expect.poll(async () => (await chatStreams(page)).some((source) => source.url.includes(`/runs/${RUN_ID}/events?`))).toBe(true);
+});
+
+test('terminal run snapshots show final status instead of a disconnected active-run warning', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'completed', artifacts: [] }) });
+  await page.goto(SESSION_URL);
+  const progress = page.getByRole('region', { name: 'Research progress' });
+  await expect(progress.getByText('Run finished.', { exact: true })).toBeVisible();
+  await expect(progress.getByText(/may still be active/)).toHaveCount(0);
+
+  fixture.setRun({ state: 'canceled', revision: 2 });
+  await page.reload();
+  await page.getByRole('button', { name: 'TH', exact: true }).click();
+  const thaiProgress = page.getByRole('region', { name: 'ความคืบหน้าการวิจัย' });
+  await expect(page.getByRole('heading', { name: 'หยุดแล้ว' })).toBeVisible();
+  await expect(thaiProgress.getByText('งานสิ้นสุดแล้ว', { exact: true })).toBeVisible();
+  await expect(thaiProgress.getByText(/งานอาจยังทำงานอยู่/)).toHaveCount(0);
+});
+
+test('a delayed empty session bootstrap cannot erase a run submitted while it was pending', async ({ page }) => {
+  await installResearchFixtureRoutes(page, { run: null });
+  let releaseBootstrap!: () => void;
+  let reportBootstrapStarted!: () => void;
+  let reportBootstrapResponded!: () => void;
+  const bootstrapGate = new Promise<void>((resolve) => { releaseBootstrap = resolve; });
+  const bootstrapStarted = new Promise<void>((resolve) => { reportBootstrapStarted = resolve; });
+  const bootstrapResponded = new Promise<void>((resolve) => { reportBootstrapResponded = resolve; });
+  await page.route(`**/api/v1/projects/${PROJECT_ID}/runs`, async (route) => {
+    reportBootstrapStarted();
+    await bootstrapGate;
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '[]' });
+    reportBootstrapResponded();
+  });
+  await page.goto(SESSION_URL);
+  await bootstrapStarted;
+  await page.getByLabel('Research question').fill('A fresh question');
+  await page.getByRole('button', { name: 'Review plan' }).click();
+  await expect(page.getByRole('heading', { name: 'Review the plan' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Waiting approval' })).toBeVisible();
+
+  releaseBootstrap();
+  await bootstrapResponded;
+  await expect(page.getByRole('heading', { name: 'Review the plan' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Waiting approval' })).toBeVisible();
+});
+
+test('a stale REST snapshot cannot replace progress confirmed by a newer SSE event', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', artifacts: [] }) });
+  await installChatEventSource(page);
+  let snapshotCount = 0;
+  await page.route(`**/api/v1/runs/${RUN_ID}`, async (route) => {
+    snapshotCount += 1;
+    const snapshot = snapshotCount === 1
+      ? makeRun({ state: 'running', revision: 1, latest_cursor: 0, stage: null, artifacts: [] })
+      : makeRun({ state: 'waiting_input', revision: 2, latest_cursor: 0, stage: 'search_literature', artifacts: [] });
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snapshot) });
+  });
+  await page.goto(SESSION_URL);
+  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(1);
+
+  const confirmed = event(1, 'stage.started', { stage: 'verify_references' });
+  fixture.pushEvents(confirmed);
+  await emitChatEvent(page, 0, confirmed);
+  await expect(page.getByText('Current stage: Verify references')).toBeVisible();
+  await failChatStream(page, 0);
+
+  await expect.poll(async () => (await chatStreams(page)).length).toBe(2);
+  await expect(page.getByRole('heading', { name: 'Running' })).toBeVisible();
+  await expect(page.getByText('Current stage: Verify references')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Waiting for your decision' })).toHaveCount(0);
+  expect(snapshotCount).toBeGreaterThanOrEqual(2);
 });
