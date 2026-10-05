@@ -126,3 +126,33 @@ def mark_budget_wait(
             "required_elapsed_ms": max(0, effective_elapsed_ms(db, run_id) - row["elapsed_limit_ms"] + 1),
         })
     return decision_id
+
+
+def confirm_unknown_usage(
+    db: Session, run_id: UUID, operation: Any, usage_tokens: int, emit_event: EventWriter
+) -> None:
+    """Owner-confirmed settlement of one unknown operation: release exactly its reservation, add confirmed usage.
+
+    Caller holds the run and operation row locks and has proven quiescence. Usage may not exceed the
+    operation's reserve (hard cap), so the run never overshoots its limit by confirmation.
+    """
+    reserve = int(operation.reserve_tokens)
+    if not 0 <= usage_tokens <= reserve:
+        raise ValueError("confirmed usage exceeds the operation reserve")
+    done = db.execute(text("""
+        UPDATE operations SET state='committed', usage_tokens=:usage,
+            result = result || jsonb_build_object('owner_confirmed_usage', true, 'usage_known', true, 'usage_tokens', CAST(:usage AS integer))
+        WHERE id=:id AND state='unknown'
+    """), {"usage": usage_tokens, "id": operation.id}).rowcount
+    if done != 1:
+        raise ValueError("operation is no longer unknown")
+    held = db.execute(text("""
+        UPDATE runs SET reserved_tokens = reserved_tokens - :reserve, usage_tokens = usage_tokens + :usage
+        WHERE id=:run AND reserved_tokens >= :reserve
+    """), {"reserve": reserve, "usage": usage_tokens, "run": run_id}).rowcount
+    if held != 1:
+        raise ValueError("run does not hold the operation reservation")
+    row = db.execute(text("SELECT revision, usage_tokens, reserved_tokens, token_limit FROM runs WHERE id=:run"),
+                     {"run": run_id}).one()
+    emit_event(db, run_id, row.revision, "usage.updated", {
+        "usage_tokens": row.usage_tokens, "reserved_tokens": row.reserved_tokens, "token_limit": row.token_limit})

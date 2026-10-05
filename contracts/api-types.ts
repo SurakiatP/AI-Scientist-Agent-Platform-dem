@@ -171,10 +171,11 @@ export interface DecisionSubmit {
   decision_id: string;
   expected_revision: number;
   idempotency_key: string;
-  choice: "verified_result" | "retry" | "stop" | "extend";
+  choice: "verified_result" | "retry" | "stop" | "extend" | "confirm_usage";
   result?: ObjectRef | null;
   add_tokens?: null | number;
   add_elapsed_ms?: null | number;
+  usage_tokens?: null | number;
 }
 
 export interface PlanReadyPayload {

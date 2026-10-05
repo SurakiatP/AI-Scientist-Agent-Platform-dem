@@ -272,6 +272,8 @@ def submit_decision(db: Session, principal: Principal, run_id: UUID, body: Decis
     if not budget:
         if body.choice == "extend":
             raise DomainError("forbidden", 400)
+        if body.choice == "confirm_usage" or run.state == "canceled":
+            return _confirm_canceled_usage(db, run, mapped, body, payload_hash, broker)
         candidates = db.execute(text("""
             SELECT count(*) FROM operations WHERE run_id = :run AND state = 'unknown'
               AND NOT COALESCE(result ? 'retry_identity', false)
@@ -301,6 +303,33 @@ def submit_decision(db: Session, principal: Principal, run_id: UUID, body: Decis
     except Exception:
         db.rollback()
         raise
+
+
+def _confirm_canceled_usage(db: Session, run, mapped, body: DecisionSubmit, payload_hash: str, broker) -> RunView:
+    """Owner-confirmed usage for the one operation a canceled run left unknown (never an automatic release)."""
+    if body.choice != "confirm_usage":
+        raise DomainError("revision_conflict", 409)  # canceled: only confirm_usage is meaningful
+    if run.state != "canceled":
+        raise DomainError("forbidden", 400)
+    operation = db.execute(text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :op FOR UPDATE"),
+                           {"run": run.id, "op": mapped.operation_id}).one_or_none()
+    pending = (operation.result or {}) if operation is not None else {}
+    if (operation is None or operation.state != "unknown" or pending.get("retry_identity")
+            or pending.get("usage_known") or not broker._quiescent(run, operation)):
+        raise DomainError("revision_conflict", 409)
+    try:
+        limits.confirm_unknown_usage(db, run.id, operation, body.usage_tokens, _event)
+    except ValueError as exc:
+        db.rollback()
+        raise DomainError("forbidden" if "exceeds" in str(exc) else "revision_conflict", 400 if "exceeds" in str(exc) else 409) from exc
+    db.execute(text("""
+        UPDATE owner_decisions SET state = 'resolved', resolved_at = now(), resolution = CAST(:resolution AS jsonb),
+            idempotency_key = :key, payload_hash = :hash
+        WHERE decision_id = :id AND state = 'pending'
+    """), {"resolution": json.dumps({"choice": "confirm_usage", "usage_tokens": body.usage_tokens}),
+           "key": body.idempotency_key, "hash": payload_hash, "id": body.decision_id})
+    db.commit()
+    return _run_view(db, run.id)
 
 
 def get_run(db: Session, principal: Principal, run_id: UUID) -> RunView:

@@ -264,14 +264,17 @@ class DecisionSubmit(Contract):
     decision_id: UUID
     expected_revision: int = Field(ge=1)
     idempotency_key: str = Field(min_length=1, max_length=200)
-    choice: Literal["verified_result", "retry", "stop", "extend"]
+    choice: Literal["verified_result", "retry", "stop", "extend", "confirm_usage"]
     result: ObjectRef | None = None
     add_tokens: int | None = Field(default=None, ge=0)
     add_elapsed_ms: int | None = Field(default=None, ge=0)
+    usage_tokens: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_choice_fields(self):
         extend = (self.add_tokens, self.add_elapsed_ms)
+        if (self.choice == "confirm_usage") != (self.usage_tokens is not None):
+            raise ValueError("usage_tokens is required for, and only valid with, confirm_usage")
         if (self.choice == "verified_result") != (self.result is not None):
             raise ValueError("result is required for, and only valid with, verified_result")
         if self.choice == "extend" and None in extend:
