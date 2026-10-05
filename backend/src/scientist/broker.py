@@ -408,8 +408,13 @@ def reconcile(db: Session, run_id: UUID, operation_id: str) -> OperationResult:
                 if run.state != "waiting_input":
                     _event(db, run_id, run.revision, "run.state", {"state": "waiting_input"})
             _issue_unknown_decision(db, run_id, run.revision, operation_id)
+        if run.state == "canceled":
+            _issue_unknown_decision(db, run_id, run.revision, operation_id)
         db.commit()
         row = db.execute(text("SELECT * FROM operations WHERE id = :id"), {"id": row.id}).one()
+    elif row.state == "unknown" and run.state == "canceled" and not pending.get("retry_identity") and not pending.get("usage_known"):
+        _issue_unknown_decision(db, run_id, run.revision, operation_id)
+        db.commit()
     elif row.state == "unknown" and not stopped and not pending.get("retry_identity"):
         if run.state != "waiting_input" or run.waiting_reason != "unknown_outcome":
             db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})

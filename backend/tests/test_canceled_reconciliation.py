@@ -206,3 +206,85 @@ def test_reserve_column_is_authoritative_and_drift_is_not_a_500(broker_fixture, 
         domain.submit_decision(db, owner, run_id, confirm(db, run_id, did, 6))
     assert err.value.status == 409
     assert numbers(db, run_id)[:3] == (0, 5, "unknown")
+
+
+def _decisions(db, run_id):
+    return db.execute(text("SELECT count(*) FROM owner_decisions WHERE run_id=:r AND state='pending' AND reason='unknown_outcome'"),
+                      {"r": run_id}).scalar_one(), db.execute(
+        text("SELECT count(*) FROM events WHERE run_id=:r AND kind='decision.required'"), {"r": run_id}).scalar_one()
+
+
+def _undecided_canceled_unknown(db, transport, run_id):
+    canceled_unknown(db, transport, run_id)
+    db.execute(text("DELETE FROM owner_decisions WHERE run_id=:r"), {"r": run_id})
+    db.commit()
+    assert _decisions(db, run_id)[0] == 0
+    return _decisions(db, run_id)[1]  # decision.required events already emitted (immutable)
+
+
+def test_stop_on_canceled_run_issues_exactly_one_decision(broker_fixture, dispatch):
+    db, _, run_id, transport, _ = broker_fixture
+    base = _undecided_canceled_unknown(db, transport, run_id)
+    assert supervisor.stop(db, run_id, 10).state == "canceled"
+    assert _decisions(db, run_id) == (1, base + 1)
+    assert supervisor.stop(db, run_id, 10).state == "canceled"
+    assert _decisions(db, run_id) == (1, base + 1)
+
+
+@pytest.mark.parametrize("patch", ['{"retry_identity": "retry-x"}', '{"usage_known": true}'])
+def test_canceled_run_skips_unresolvable_operation(broker_fixture, dispatch, patch):
+    from scientist import broker
+    db, _, run_id, transport, _ = broker_fixture
+    base = _undecided_canceled_unknown(db, transport, run_id)
+    db.execute(text("UPDATE operations SET result = result || CAST(:p AS jsonb) WHERE run_id=:r"), {"r": run_id, "p": patch})
+    db.commit()
+    supervisor.stop(db, run_id, 10)
+    assert _decisions(db, run_id) == (0, base)
+    broker.reconcile(db, run_id, "operation-1")
+    assert _decisions(db, run_id) == (0, base)
+
+
+def test_e2e_fenced_in_flight_op_confirm_usage_over_rest(broker_fixture, dispatch, control_client):
+    from scientist import broker
+    from test_owner_decisions import request
+    db, _, run_id, transport, _ = broker_fixture
+    transport.lose_response = True
+    broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id, "operation-1"))
+    transport.lose_response = False
+    bind_executor(db, run_id, "operation-1")
+    db.execute(text("DELETE FROM owner_decisions WHERE run_id=:r"), {"r": run_id})
+    db.commit()
+    domain.request_stop(db, Principal(identity=uuid4(), kind="owner"), run_id)
+    assert supervisor.stop(db, run_id, 10).state == "canceled"
+    did = db.execute(text("SELECT decision_id FROM owner_decisions WHERE run_id=:r AND state='pending'"), {"r": run_id}).scalar_one()
+    before = numbers(db, run_id)[1]
+    rev = db.execute(text("SELECT revision FROM runs WHERE id=:r"), {"r": run_id}).scalar_one()
+    r = _decide(control_client, run_id, did, rev, choice="confirm_usage", usage_tokens=2)
+    assert r.status_code == 200, r.text
+    assert (r.json()["usage_tokens"], r.json()["reserved_tokens"]) == (2, before - 5)
+
+
+def test_reconcile_on_canceled_run_issues_decision(broker_fixture, dispatch):
+    from scientist import broker
+    db, _, run_id, transport, _ = broker_fixture
+    base = _undecided_canceled_unknown(db, transport, run_id)
+    broker.reconcile(db, run_id, "operation-1")
+    assert _decisions(db, run_id) == (1, base + 1)
+    assert db.execute(text("SELECT state FROM runs WHERE id=:r"), {"r": run_id}).scalar_one() == "canceled"
+    broker.reconcile(db, run_id, "operation-1")
+    assert _decisions(db, run_id) == (1, base + 1)
+
+
+def test_stop_fencing_a_running_run_issues_decision_for_reserved_operation(broker_fixture, dispatch):
+    db, _, run_id, transport, _ = broker_fixture
+    transport.lose_response = True
+    from scientist import broker
+    from test_owner_decisions import request
+    broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id, "operation-1"))
+    transport.lose_response = False
+    bind_executor(db, run_id, "operation-1")
+    db.execute(text("DELETE FROM owner_decisions WHERE run_id=:r"), {"r": run_id})
+    db.commit()
+    domain.request_stop(db, Principal(identity=uuid4(), kind="owner"), run_id)
+    assert supervisor.stop(db, run_id, 10).state == "canceled"
+    assert _decisions(db, run_id)[0] == 1

@@ -473,6 +473,9 @@ def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
     if row is None:
         raise DomainError("not_found", 404)
     if row["state"] in {"completed", "failed", "canceled", "rejected"}:
+        if row["state"] == "canceled":
+            _issue_unknown_decisions(db, run_id, row["revision"], canceled=True)
+            db.commit()
         return _run_view(db, run_id)
     in_flight = row["state"] == "queued" and db.execute(text("""
         SELECT EXISTS (SELECT 1 FROM operations WHERE run_id=:run AND state='reserved')
@@ -518,6 +521,7 @@ def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
     """), {"run": run_id, "generation": row["generation"]}).rowcount
     if canceled == 1:
         _event(db, run_id, row["revision"], "run.state", {"state": "canceled"})
+        _issue_unknown_decisions(db, run_id, row["revision"], canceled=True)
     db.commit()
     return _run_view(db, run_id)
 
@@ -689,6 +693,7 @@ def recover(db: Session, run_id: UUID, *, budget_resume: bool = False) -> RunVie
                 lease_expires_at=NULL WHERE id=:run
         """), {"run": run_id})
         _event(db, run_id, row["revision"], "run.state", {"state": "canceled"})
+        _issue_unknown_decisions(db, run_id, row["revision"], canceled=True)
     elif pending_unknown:
         limits.settle_active_interval(db, run_id)
         reason = "unknown_outcome" if pending_unknown else "executor_quiescence_unproven"
@@ -777,13 +782,13 @@ def recover(db: Session, run_id: UUID, *, budget_resume: bool = False) -> RunVie
     return _run_view(db, run_id)
 
 
-def _issue_unknown_decisions(db: Session, run_id: UUID, revision: int) -> None:
+def _issue_unknown_decisions(db: Session, run_id: UUID, revision: int, *, canceled: bool = False) -> None:
     """Bind a decision to every undecided, unstaged unknown operation (idempotent)."""
     for (operation_id,) in db.execute(text("""
         SELECT operation_id FROM operations WHERE run_id=:run AND state='unknown'
           AND NOT COALESCE(result ? 'retry_identity', false)
-          AND NOT (COALESCE(result ->> 'usage_known', 'false') = 'true' AND result ? 'ref')
-    """), {"run": run_id}).all():
+          AND NOT (COALESCE(result ->> 'usage_known', 'false') = 'true' AND (result ? 'ref' OR :canceled))
+    """), {"run": run_id, "canceled": canceled}).all():  # canceled: usage already booked, confirm_usage refuses it
         broker._issue_unknown_decision(db, run_id, revision, operation_id)
 
 

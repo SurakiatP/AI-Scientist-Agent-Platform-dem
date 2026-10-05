@@ -908,6 +908,8 @@ def test_recover_cancel_requested_moves_reserved_operation_to_unknown(db, projec
     assert supervisor.recover(db, run.run_id).state == "canceled"
     after = _ops_and_budget(db, run.run_id)
     assert after[0][0] == "unknown" and after[0][1:] == before[0][1:] and after[1] == before[1] == 7
+    assert db.execute(text("SELECT count(*) FROM owner_decisions WHERE run_id=:r AND state='pending' AND reason='unknown_outcome'"),
+                      {"r": run.run_id}).scalar_one() == 1
 
 
 def test_restore_reraises_storage_outage_but_corruption_stays_integrity(
