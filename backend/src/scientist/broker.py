@@ -24,7 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scientist.auth import DomainError
-from scientist.contracts import ObjectRef, OperationRequest, OperationResult, PlanSpec, Principal, RunView
+from scientist.contracts import ObjectRef, OperationRequest, OperationResult, PeerReleaseSpec, PlanSpec, Principal, RunView, canonical_peer_parameters_bytes
 from scientist.domain import _event, _run_view
 from scientist import limits
 from scientist.model_payload import ModelPayloadError, build_chat_completion_body, llm_input_reserve
@@ -38,6 +38,7 @@ class DispatchTarget:
     credential_id: UUID | None = None
     expected_sha256: str | None = None
     model: str | None = None
+    peer_release: PeerReleaseSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ class UnknownOperationContext:
     request: OperationRequest
 
 
-Transport = Callable[[OperationRequest, DispatchTarget], tuple[bytes, int]]
+Transport = Callable[[OperationRequest, DispatchTarget], tuple[bytes, int | None]]
 PersistResult = Callable[[Session, UUID, bytes, str], ObjectRef]
 Resolver = Callable[[str, int], list[str]]
 ResultVerifier = Callable[[UnknownOperationContext, ObjectRef], bool]
@@ -270,7 +271,7 @@ def _finish_reserved_operation(
         return _record_unknown(db, request, revision, usage_tokens=None, result_ref=None)
     finally:
         _active_session.reset(db_token)
-    if len(data) > _MAX_RESPONSE_BYTES or usage_tokens < 0:
+    if len(data) > _MAX_RESPONSE_BYTES or (usage_tokens is not None and (isinstance(usage_tokens, bool) or not isinstance(usage_tokens, int) or usage_tokens < 0)):
         return _record_unknown(db, request, revision, usage_tokens=None, result_ref=None)
     if target.expected_sha256 is not None and hashlib.sha256(data).hexdigest() != target.expected_sha256:
         return _record_unknown(db, request, revision, usage_tokens=usage_tokens, result_ref=None)
@@ -279,6 +280,13 @@ def _finish_reserved_operation(
     except Exception:
         db.rollback()
         return _record_unknown(db, request, revision, usage_tokens=usage_tokens, result_ref=None)
+
+    if usage_tokens is None:
+        terminal = None
+        if target.kind == "peer":
+            task_state = json.loads(data).get("status", {}).get("state")
+            terminal = task_state in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"}
+        return _record_unknown(db, request, revision, usage_tokens=None, result_ref=result_ref, peer_task_terminal=terminal)
 
     # Commit actual provider usage and a recoverable result reference before the final
     # committed transition. A failed final commit therefore leaves a truthful unknown.
@@ -334,11 +342,13 @@ def _finalize_staged_success(db: Session, run_id: UUID, operation_id: str) -> Op
 
 
 def _record_unknown(db: Session, request: OperationRequest, revision: int, *, usage_tokens: int | None,
-                    result_ref: ObjectRef | None) -> OperationResult:
+                    result_ref: ObjectRef | None, peer_task_terminal: bool | None = None) -> OperationResult:
     prior = _load_run(db, request.run_id, lock=True)
     result = {"request": request.model_dump(mode="json"), "usage_known": usage_tokens is not None}
     if result_ref is not None:
         result["ref"] = result_ref.model_dump(mode="json")
+        if peer_task_terminal is not None:
+            result["peer_task_terminal"] = peer_task_terminal
     db.execute(text("""
         UPDATE operations SET state = 'unknown', usage_tokens = COALESCE(:usage, usage_tokens),
             result = CAST(:result AS jsonb)
@@ -598,24 +608,39 @@ def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: Oper
         _validate_url(package.source, plan.data_recipients)
         return DispatchTarget("package", package.source, tuple(plan.data_recipients), expected_sha256=package.sha256)
     else:
-        _reject_fields(payload, {"peer_id", "message", "request", "timeout_seconds"})
-        if "peer_id" not in payload or not ({"message", "request"} & set(payload)):
-            raise DomainError("forbidden", 400)
-        _validate_timeout(payload)
-        peer_id = str(payload.get("peer_id", ""))
-        destination = _peer_destinations.get(peer_id)
-        if not destination or f"peer:{peer_id}" not in plan.data_recipients:
+        _reject_fields(payload, {"release_id", "parameters"})
+        if set(payload) != {"release_id", "parameters"}:
+            raise DomainError("forbidden", 403)
+        release = next((item for item in plan.peer_releases if str(item.release_id) == payload["release_id"]), None)
+        if release is None or request.reserve_tokens != release.reserved_tokens:
             raise DomainError("forbidden", 403)
         try:
-            parsed_peer_id = UUID(peer_id)
+            parameters = canonical_peer_parameters_bytes(payload["parameters"])
         except ValueError as exc:
             raise DomainError("forbidden", 403) from exc
+        if (hashlib.sha256(parameters).hexdigest() != release.parameters_sha256.lower() or
+                parameters != canonical_peer_parameters_bytes(release.approved_parameters)):
+            raise DomainError("forbidden", 403)
+        from scientist.domain import _validate_peer_releases
+        from scientist.settings import _origin
+        _validate_peer_releases(db, request.run_id, project_id, plan)
+        peer_id = str(release.peer_id)
+        destination = _peer_destinations.get(peer_id)
+        if (not destination or _origin(destination) != destination or
+                hashlib.sha256(destination.encode()).hexdigest() != release.endpoint_fingerprint.lower()):
+            raise DomainError("forbidden", 403)
         delegated = db.execute(text("SELECT 1 FROM delegations WHERE project_id = :project AND peer_id = :peer AND revoked_at IS NULL AND :action = ANY(actions)"),
-                               {"project": project_id, "peer": parsed_peer_id, "action": "peer"}).scalar_one_or_none()
+                               {"project": project_id, "peer": release.peer_id, "action": "peer"}).scalar_one_or_none()
         if delegated is None:
             raise DomainError("forbidden", 403)
-        _validate_url(destination, [destination], allow_lan=True)
-    return DispatchTarget("peer", destination, (destination,))
+        credential = db.execute(text("SELECT id FROM credentials WHERE project_id=:project AND provider=:provider AND model IS NULL ORDER BY created_at DESC,id LIMIT 1"),
+                                {"project": project_id, "provider": f"peer:{peer_id}"}).scalar_one_or_none()
+        if credential is None:
+            raise DomainError("forbidden", 403)
+        if len(destination + "/a2a") > 2048:
+            raise DomainError("forbidden", 403)
+        return DispatchTarget("peer", destination + "/a2a", (destination,), credential_id=credential, peer_release=release)
+
 
 
 def _reject_fields(payload: dict, allowed: set[str]) -> None:
@@ -651,7 +676,7 @@ def _approved_recipient(plan: PlanSpec, recipient: object) -> None:
     _validate_url(recipient, plan.data_recipients)
 
 
-def _validate_url(url: object, recipients: list[str], *, allow_lan: bool = False) -> tuple[str, int, str, str]:
+def _validate_url(url: object, recipients: list[str], *, allow_lan: bool = False, resolver: Resolver | None = None) -> tuple[str, int, str, str]:
     if not isinstance(url, str) or len(url) > 2048:
         raise DomainError("forbidden", 403)
     # urlsplit strips \t\r\n and accepts spaces/NUL/non-ASCII; http.client would then fail after reservation.
@@ -682,7 +707,7 @@ def _validate_url(url: object, recipients: list[str], *, allow_lan: bool = False
             literal = ipaddress.ip_address(host)
             addresses = [str(literal)]
         except ValueError:
-            addresses = _resolver(host, port)
+            addresses = (resolver or _resolver)(host, port)
         if not addresses:
             raise ValueError("empty DNS result")
         parsed_addresses = [ipaddress.ip_address(address.split("%", 1)[0]) for address in addresses]
@@ -693,6 +718,8 @@ def _validate_url(url: object, recipients: list[str], *, allow_lan: bool = False
     if any(address in _METADATA_ADDRESSES for address in parsed_addresses):
         raise DomainError("forbidden", 403)
     if allow_lan:
+        if len({address.is_global for address in parsed_addresses}) != 1:
+            raise DomainError("forbidden", 403)
         for address in parsed_addresses:
             checked = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped else address
             if checked.is_loopback or checked.is_multicast or checked.is_unspecified or checked.is_link_local or checked.is_reserved:
@@ -703,15 +730,17 @@ def _validate_url(url: object, recipients: list[str], *, allow_lan: bool = False
     return host, port, path, str(parsed_addresses[0])
 
 
-def _dispatch(request: OperationRequest, target: DispatchTarget) -> tuple[bytes, int]:
+def _dispatch(request: OperationRequest, target: DispatchTarget) -> tuple[bytes, int | None]:
     if _transport is not None:
         return _transport(request, target)
     return http_transport(request, target)
 
 
-def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[bytes, int]:
+def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[bytes, int | None]:
     """Native bounded HTTP transport, usable beneath durable dispatch bindings."""
-    host, port, path, ip = _validate_url(target.url, list(target.approved_recipients), allow_lan=target.kind == "peer")
+    if target.kind == "peer":
+        return _peer_http_transport(request, target)
+    host, port, path, ip = _validate_url(target.url, list(target.approved_recipients))
     if target.kind == "llm":
         messages = request.payload.get("messages")
         if "prompt" in request.payload:
@@ -768,6 +797,40 @@ def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[b
     finally:
         watchdog.cancel()
         connection.close()
+
+
+
+def _peer_http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[bytes, int | None]:
+    import asyncio
+    from google.protobuf.json_format import MessageToDict
+    from scientist.a2a_outbound import PeerOutboundCallbacks, submit_peer_release
+    from scientist import peer_http_exchange, peer_receipt_runtime
+
+    release = target.peer_release
+    if release is None or target.credential_id is None:
+        raise DomainError("forbidden", 403)
+    credential = read_secret(_active_session.get(), target.credential_id)
+    origin = target.approved_recipients[0]
+    captured: list[bytes] = []
+    def capture(_run, _operation, task, accounting):
+        captured.append(json.dumps(MessageToDict(task), ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":"), allow_nan=False).encode())
+    callbacks = PeerOutboundCallbacks(
+        prepare=peer_receipt_runtime.prepare_submission,
+        record_remote_identity=peer_receipt_runtime.record_remote_identity,
+        mark_unknown=peer_receipt_runtime.mark_unknown,
+        persist_result=capture,
+    )
+    result = asyncio.run(submit_peer_release(
+        release, request.run_id, request.operation_id, endpoint_url=target.url,
+        expected_authority=urlsplit(origin).netloc, callbacks=callbacks,
+        exchange=peer_http_exchange.pinned_exchange(origin, credential, request_bytes_limit=release.request_bytes_limit),
+    ))
+    if len(captured) != 1:
+        raise DomainError("provider_unavailable", 502)
+    # The common broker PUT happens after the SDK callback committed the remote identity.
+    # Standard A2A has no authoritative usage contract; None preserves the reservation.
+    return captured[0], result.accounting.usage_tokens
 
 
 def _abort_connection(connection: http.client.HTTPConnection) -> None:

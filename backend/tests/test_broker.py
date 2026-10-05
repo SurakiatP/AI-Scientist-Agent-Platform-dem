@@ -266,14 +266,15 @@ def test_peer_request_cannot_override_configured_endpoint_or_body_route(broker_f
     assert transport.calls == 0
 
 
-def test_valid_peer_effect_uses_only_configured_destination(broker_fixture):
+def test_legacy_peer_message_without_approved_release_is_denied(broker_fixture):
     db, _, run_id, transport, _ = broker_fixture
     capability = broker.issue_capability(db, run_id, 1, 300)
     peer_request = OperationRequest(run_id=run_id, generation=1, operation_id="peer-valid", kind="peer",
                                     payload={"peer_id": str(PEER_ID), "message": "fixture"}, reserve_tokens=5)
-    broker.execute(db, capability, peer_request)
-    assert transport.targets[-1].url == "https://peer.example/a2a"
-    assert transport.targets[-1].credential_id is None
+    with pytest.raises(DomainError, match="forbidden"):
+        broker.execute(db, capability, peer_request)
+    assert transport.calls == 0
+    assert db.execute(text("SELECT reserved_tokens FROM runs WHERE id=:run"), {"run": run_id}).scalar_one() == 0
 
 
 def test_reserved_effect_reconciles_to_owner_resolvable_unknown(broker_fixture):
@@ -1478,3 +1479,25 @@ def test_search_truncated_body_is_not_committed(broker_fixture, monkeypatch):
     result = broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id, "truncated"))
     assert result.state != "committed"
     assert not stored
+
+
+def test_unsupported_transport_usage_preserves_result_and_reservation(broker_fixture):
+    db, _, run_id, transport, stored = broker_fixture
+    transport.usage_tokens = None
+    request = OperationRequest(run_id=run_id, generation=1, operation_id="unsupported-usage",
+                               kind="search", payload={"url": "https://research.example/query"}, reserve_tokens=5)
+    capability = broker.issue_capability(db, run_id, 1, 300)
+    result = broker.execute(db, capability, request)
+    assert result.state == "unknown" and result.usage_tokens is None
+    operation = db.execute(text("SELECT state, result FROM operations WHERE run_id=:run AND operation_id=:op"),
+                           {"run": run_id, "op": request.operation_id}).one()
+    assert operation.state == "unknown"
+    assert operation.result["usage_known"] is False
+    assert operation.result["ref"]["key"] in stored
+    run = db.execute(text("SELECT reserved_tokens, usage_tokens, waiting_reason FROM runs WHERE id=:run"),
+                     {"run": run_id}).one()
+    assert (run.reserved_tokens, run.usage_tokens, run.waiting_reason) == (5, 0, "unknown_outcome")
+    db.execute(text("UPDATE runs SET state='running', waiting_reason=NULL WHERE id=:run"), {"run": run_id})
+    db.commit()
+    broker.execute(db, capability, request)
+    assert transport.calls == 1
