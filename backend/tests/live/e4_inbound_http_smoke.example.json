@@ -1,0 +1,10 @@
+{
+  "database_url_file": "/operator/private/e4/database_url",
+  "s3_access_key_file": "/operator/private/e4/s3_access_key",
+  "s3_secret_key_file": "/operator/private/e4/s3_secret_key",
+  "s3_endpoint": "http://127.0.0.1:54332",
+  "bucket": "scientist-b5",
+  "postgres_container_id": "0000000000000000000000000000000000000000000000000000000000000000",
+  "minio_container_id": "0000000000000000000000000000000000000000000000000000000000000000",
+  "image_verification": "/operator/evidence/image-verification.json"
+}

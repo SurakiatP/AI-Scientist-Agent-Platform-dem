@@ -108,3 +108,38 @@ Fixture Dockerfiles are re-pinned to the server image they were last built from 
 | `b5-fault-fixture-context/` | `fixtures/counter/` | Dockerfile sha256 `95e577283c72b6f8b98e295523bc769db8a0913fa80472d1a073bbbb7a7c6d74`; sitecustomize.py sha256 `edfbcfe6a3050c4f9d5d667007417098492e7d5b20880017787cca9d7e3ae3e8` |
 | `b5-after-result-fixture-context/` | `fixtures/barrier/` | Dockerfile sha256 `6642650a722ed193a8fbd8e35dc6db60f5db6972434a3278d8ea3ceff4f50f7c`; sitecustomize.py sha256 `f142d1973a6257ca5b665a7e4c73e9bf322cc5ed1e7d5c6bccc1f0bbe3c0ca0a` |
 | `b5-checkpoint-fault-fixture-context/` | `fixtures/checkpoint_fault/` | Dockerfile sha256 `95e577283c72b6f8b98e295523bc769db8a0913fa80472d1a073bbbb7a7c6d74`; sitecustomize.py sha256 `1269fd7f9e586ba34a25bb1e15d358f4fe468218f8ac5600e21b5a15fa734d43` |
+# Composed inbound protocol smoke (E4 narrow gate)
+
+`e4_inbound_http_smoke.py` exercises the production composed listener over real
+loopback HTTP using the official MCP and A2A clients, a fresh isolated PostgreSQL
+database on the owned b5 service, and the actual b5 MinIO bucket. It covers all
+seven MCP tools, submission replay, A2A message/get/list/SSE disconnect, owner
+route isolation, scoped callers, token revocation, and a verified five-byte S3
+upload/readback. Requests stay behind owner approval; no provider operation runs.
+
+Copy `e4_inbound_http_smoke.example.json` to a local operator file, replace the
+paths/identities, and set mode 0600. Credential files must also be mode 0600 in a
+private directory. Use a newly created database whose name matches
+`scientist_test_e4[a-z0-9]+`, on 127.0.0.1:54331, with SCRAM credentials. Do not
+reuse a previous smoke database. The database URL and S3 keys are read directly
+from private files; never put their values in command arguments or evidence.
+The image verification record and its adjacent server source-hash manifest must
+prove that current application source matches the scanned candidate images.
+
+Run from the repository with a new evidence directory:
+
+```sh
+rtk proxy uv run python backend/tests/live/e4_inbound_http_smoke.py \
+  --config /operator/private/e4/config.json \
+  --evidence /operator/evidence/new-e4-smoke-round
+```
+
+Exit 0 certifies this narrow smoke only. Missing prerequisites return 77 / NOT
+RUN; failed checks return 1 / FAIL. Failed evidence is retained, never overwritten.
+The listener shuts down before a successful proof is written. Synthetic database
+rows and project-scoped S3 objects remain available for independent readback.
+The stop tool here requests `stopping`; actual host cancellation is a separate
+gate. Prepared uploads do not prove scientific parsing. This suite does not
+certify outbound peer TLS, physical container recovery/GetTask after storage
+failure, full E4 acceptance, F4 browser integration, deployment/restore or native
+scientific execution. Aggregate E4 remains explicitly NOT RUN in its proof.
