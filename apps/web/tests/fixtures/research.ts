@@ -1,5 +1,5 @@
 import type { Page } from '@playwright/test';
-import type { ArtifactView, ConnectionView, FileView, PlanView, RunEvent, RunView } from '../../../../contracts/api-types';
+import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunEvent, RunView } from '../../../../contracts/api-types';
 import { PROJECT_ID, SESSION_ID, installProjectFixtureRoutes } from './project';
 
 const SUBMIT_FIELDS = ['submission_key', 'question', 'input_ids', 'provider_id', 'model'];
@@ -29,7 +29,8 @@ export function event<K extends RunEvent['kind']>(sequence: number, kind: K, pay
 }
 
 type Options = {
-  run?: RunView | null; messages?: Array<{ id: string; sequence: number; role: string; content: string; created_at: string }>;
+  run?: RunView | null; pendingDecisions?: PendingDecisionView[]; conflictOnDecision?: boolean;
+  messages?: Array<{ id: string; sequence: number; role: string; content: string; created_at: string }>;
   connection?: ConnectionView['state'] | 'missing'; expireCursorOnce?: boolean; pageSize?: number; conflictOnApprove?: boolean; failFirstSubmit?: boolean; holdSubmit?: boolean; reportMarkdown?: string; failFirstDecision?: boolean;
 };
 
@@ -37,6 +38,7 @@ type Options = {
 export async function installResearchFixtureRoutes(page: Page, options: Options = {}) {
   await installProjectFixtureRoutes(page);
   let run: RunView | null = options.run === undefined ? makeRun() : options.run;
+  let pendingDecisions: PendingDecisionView[] = [...(options.pendingDecisions ?? [])];
   let events: RunEvent[] = [];
   let plan = makePlan(1);
   let offline = false;
@@ -51,7 +53,7 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
   let release: (() => void) | null = null;
   const gate = options.holdSubmit ? new Promise<void>((resolve) => { release = resolve; }) : null;
   const submitted = new Map<string, RunView>();
-  const writes: Array<{ method: string; path: string; body?: any }> = [];
+  const writes: Array<{ method: string; path: string; body?: any; headers: Record<string, string> }> = [];
   const deletes: string[] = [];
   const messages = options.messages ?? [{ id: 'm1', sequence: 1, role: 'user', content: 'Original question about diffusion', created_at: '2026-10-05T00:00:00Z' }];
   const connection: ConnectionView = { id: CONNECTION_ID, label: 'Fixture', provider: 'fixture-provider', model: 'fixture-model', state: options.connection === 'missing' ? 'unconfigured' : options.connection ?? 'ready', has_secret: true };
@@ -66,7 +68,7 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
     const method = request.method();
     const json = (body: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
     const err = (code: string, status: number) => json({ code, message: code, request_id: 'fixture' }, status);
-    let body: any; if (method !== 'GET') { try { body = request.postDataJSON(); } catch { body = undefined; } writes.push({ method, path, body }); }
+    let body: any; if (method !== 'GET') { try { body = request.postDataJSON(); } catch { body = undefined; } writes.push({ method, path, body, headers: request.headers() }); }
 
     if (method === 'GET' && path === '/connections') return options.connection === 'missing' ? err('not_found', 404) : json([connection]);
     if (method === 'GET' && path === `/sessions/${SESSION_ID}/messages`) return json(messages);
@@ -94,6 +96,7 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
       const sub = runMatch[2] ?? '';
       if (offline) return err('request_failed', 503);
       if (method === 'GET' && sub === '') return run ? json(run) : err('not_found', 404);
+      if (method === 'GET' && sub === '/pending-decisions') return json(pendingDecisions);
       if (method === 'GET' && sub === '/events') return err('not_found', 404); // SSE only: a fetch client must use event-page
       if (method === 'GET' && sub === '/event-page') {
         const params = new URL(request.url()).searchParams; const after = Number(params.get('after') ?? 0); pageRequests.push(after);
@@ -109,7 +112,7 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
       }
       if (method === 'POST' && sub === '/stop') { run = { ...run!, state: 'stopping' }; return json(run); }
       if (method === 'POST' && sub === '/decisions') { // mirrors DecisionSubmit: exact fields, per-key idempotency
-        const allowed = ['decision_id', 'expected_revision', 'idempotency_key', 'choice', 'result', 'add_tokens', 'add_elapsed_ms'];
+        const allowed = ['decision_id', 'expected_revision', 'idempotency_key', 'choice', 'result', 'add_tokens', 'add_elapsed_ms', 'usage_tokens'];
         const bad = !body || Object.keys(body).some((k) => !allowed.includes(k)) || !['decision_id', 'expected_revision', 'idempotency_key', 'choice'].every((k) => k in body) || !/^[0-9a-f-]{36}$/.test(body.decision_id);
         if (bad) return json({ detail: [{ type: 'value_error', loc: ['body'], msg: 'invalid decision' }] }, 422);
         decisionCalls += 1;
@@ -117,8 +120,21 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
         const payload = JSON.stringify({ ...body, idempotency_key: undefined });
         const prior = receipts.get(body.idempotency_key);
         if (prior) return prior.payload === payload ? json(prior.run) : err('idempotency_conflict', 409);
-        if (body.expected_revision !== run!.revision) return err('revision_conflict', 409);
-        run = { ...run!, state: body.choice === 'stop' ? 'stopping' : 'queued', revision: run!.revision + 1 };
+      if (options.conflictOnDecision) {
+        run = { ...run!, revision: run!.revision + 1 };
+        pendingDecisions = [];
+        return err('revision_conflict', 409);
+      }
+      if (body.expected_revision !== run!.revision) return err('revision_conflict', 409);
+        if (body.choice === 'confirm_usage') { // canceled runs accept only confirm_usage with 0 <= usage <= reserve
+        const operationCap = pendingDecisions.find((item) => item.decision_id === body.decision_id)?.operation_reserved_tokens ?? 0;
+        if (run!.state !== 'canceled' || !Number.isInteger(body.usage_tokens) || body.usage_tokens < 0 || body.usage_tokens > operationCap) return err('invalid_decision', 400);
+        run = { ...run!, reserved_tokens: run!.reserved_tokens - operationCap, usage_tokens: run!.usage_tokens + body.usage_tokens, revision: run!.revision + 1 };
+        pendingDecisions = pendingDecisions.filter((item) => item.decision_id !== body.decision_id);
+        receipts.set(body.idempotency_key, { payload, run: run! }); return json(run);
+        }
+      run = { ...run!, state: body.choice === 'stop' ? 'stopping' : 'queued', revision: run!.revision + 1 };
+      pendingDecisions = pendingDecisions.filter((item) => item.decision_id !== body.decision_id);
         receipts.set(body.idempotency_key, { payload, run: run! }); return json(run);
       }
     }
@@ -127,8 +143,31 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
 
   return {
     writes, deletes,
-    setRun: (patch: Partial<RunView>) => { run = { ...(run ?? makeRun()), ...patch }; },
-    pushEvents: (...next: RunEvent[]) => { events = [...events, ...next]; },
+    setRun: (patch: Partial<RunView>) => {
+      run = { ...(run ?? makeRun()), ...patch };
+      if (!options.pendingDecisions && patch.reserved_tokens !== undefined) {
+        pendingDecisions = pendingDecisions.map((decision) => ({ ...decision, operation_reserved_tokens: patch.reserved_tokens }));
+      }
+    },
+    pushEvents: (...next: RunEvent[]) => {
+      events = [...events, ...next];
+      for (const item of next) {
+        if (run) {
+          run = {
+            ...run,
+            latest_cursor: Math.max(run.latest_cursor, item.sequence),
+            ...(item.kind === 'decision.required' && run.state !== 'canceled'
+              ? { state: 'waiting_input' as const, waiting_reason: item.payload.reason }
+              : {}),
+          };
+        }
+        if (item.kind === 'decision.required' && !pendingDecisions.some((pending) => pending.decision_id === item.payload.decision_id)) {
+          if (item.payload.reason === 'budget_exhausted') pendingDecisions = pendingDecisions.filter((pending) => pending.reason === 'budget_exhausted');
+          if (item.payload.reason === 'unknown_outcome') pendingDecisions = pendingDecisions.filter((pending) => pending.reason === 'unknown_outcome');
+          pendingDecisions.push({ ...item.payload, operation_reserved_tokens: run?.reserved_tokens ?? 0 });
+        }
+      }
+    },
     setOffline: (value: boolean) => { offline = value; },
     acknowledgeStop: () => { stopAcknowledged = true; run = { ...run!, state: 'canceled' }; },
     stopAcknowledged: () => stopAcknowledged,

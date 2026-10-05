@@ -215,6 +215,15 @@ class DecisionRequiredPayload(Contract):
     required_elapsed_ms: int | None = Field(default=None, ge=0)
 
 
+class PendingDecisionView(Contract):
+    """An owner-actionable decision reconstructed from current durable state."""
+    decision_id: UUID
+    reason: Literal["budget_exhausted", "unknown_outcome", "data_scope", "plan_change"]
+    required_tokens: int | None = Field(default=None, ge=0)
+    required_elapsed_ms: int | None = Field(default=None, ge=0)
+    operation_reserved_tokens: int | None = Field(default=None, ge=0)
+
+
 class UsageUpdatedPayload(Contract):
     usage_tokens: int = Field(ge=0)
     reserved_tokens: int = Field(ge=0)
@@ -284,7 +293,7 @@ class DecisionSubmit(Contract):
         return self
 
 
-MODELS = (Principal, APIError, ObjectRef, PackageSpec, PlanSpec, ArtifactView, PlanView, RunView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
+MODELS = (Principal, APIError, ObjectRef, PackageSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
 
 
 def _ts_type(schema: dict[str, Any]) -> str:

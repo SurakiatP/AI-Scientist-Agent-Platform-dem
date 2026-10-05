@@ -76,6 +76,14 @@ export interface RunView {
   retry_of?: null | string;
 }
 
+export interface PendingDecisionView {
+  decision_id: string;
+  reason: "budget_exhausted" | "unknown_outcome" | "data_scope" | "plan_change";
+  required_tokens?: null | number;
+  required_elapsed_ms?: null | number;
+  operation_reserved_tokens?: null | number;
+}
+
 export interface OperationRequest {
   run_id: string;
   generation: number;

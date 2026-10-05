@@ -291,6 +291,16 @@ def get_run(request: Request, run_id: UUID):
         return domain.get_run(db, _principal(request), run_id)
 
 
+@router.get("/runs/{run_id}/pending-decisions")
+def get_pending_decisions(request: Request, run_id: UUID):
+    with database_session() as db:
+        decisions = domain.get_pending_decisions(db, _principal(request), run_id)
+        return JSONResponse(
+            [decision.model_dump(mode="json") for decision in decisions],
+            headers={"Cache-Control": "no-store"},
+        )
+
+
 @router.get("/runs/{run_id}/plan")
 def get_plan(request: Request, run_id: UUID):
     with database_session() as db:

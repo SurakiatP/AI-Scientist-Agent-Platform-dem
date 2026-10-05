@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scientist.auth import DomainError, authorize
-from scientist.contracts import ArtifactView, CitationView, DecisionSubmit, FileView, FindingView, PlanSpec, PlanView, MessageView, Principal, ProjectView, RunEvent, RunView, SessionView
+from scientist.contracts import ArtifactView, CitationView, DecisionSubmit, FileView, FindingView, PendingDecisionView, PlanSpec, PlanView, MessageView, Principal, ProjectView, RunEvent, RunView, SessionView
 from scientist import limits, settings
 
 _SNAPSHOT_MAX_BYTES = 1024 * 1024
@@ -336,6 +336,53 @@ def get_run(db: Session, principal: Principal, run_id: UUID) -> RunView:
     row = _load_run(db, run_id)
     _authorize_run(db, principal, "result:read", row.project_id)
     return _run_view(db, run_id)
+
+
+def get_pending_decisions(db: Session, owner: Principal, run_id: UUID) -> list[PendingDecisionView]:
+    """Return only owner decisions that are actionable for the run's current state."""
+    if owner.kind != "owner":
+        raise DomainError("forbidden", 403)
+    run = _load_run(db, run_id)
+    _authorize_run(db, owner, "result:read", run.project_id)
+    if run.state not in {"waiting_input", "canceled"}:
+        return []
+
+    pending: list[tuple[int, PendingDecisionView]] = []
+    if run.state == "waiting_input" and run.waiting_reason == "budget_exhausted" and run.budget_decision_id:
+        row = db.execute(text("""
+            SELECT sequence, payload FROM events
+            WHERE run_id=:run AND kind='decision.required' AND payload->>'decision_id'=:decision
+            ORDER BY sequence DESC LIMIT 1
+        """), {"run": run_id, "decision": str(run.budget_decision_id)}).mappings().one_or_none()
+        if row is not None:
+            payload = PendingDecisionView.model_validate(row["payload"])
+            if payload.reason == "budget_exhausted":
+                pending.append((row["sequence"], payload))
+
+    if run.state == "canceled" or (run.state == "waiting_input" and run.waiting_reason == "unknown_outcome"):
+        from scientist import broker  # deferred: broker imports this module
+
+        rows = db.execute(text("""
+            SELECT d.decision_id, d.reason, o.operation_id, o.generation, o.reserve_tokens, o.result,
+                   COALESCE((SELECT min(e.sequence) FROM events e
+                     WHERE e.run_id=d.run_id AND e.kind='decision.required'
+                       AND e.payload->>'decision_id'=d.decision_id::text), 2147483647) AS sequence
+            FROM owner_decisions d
+            JOIN operations o ON o.run_id=d.run_id AND o.operation_id=d.operation_id
+            WHERE d.run_id=:run AND d.state='pending' AND d.reason='unknown_outcome'
+              AND o.state='unknown'
+              AND NOT COALESCE(o.result ? 'retry_identity', false)
+              AND NOT (COALESCE(o.result->>'usage_known', 'false')='true' AND o.result ? 'ref')
+            ORDER BY sequence, d.decision_id
+        """), {"run": run_id}).mappings().all()
+        for row in rows:
+            if not broker._quiescent(run, row):
+                continue
+            pending.append((row["sequence"], PendingDecisionView(
+                decision_id=row["decision_id"], reason="unknown_outcome",
+                operation_reserved_tokens=row["reserve_tokens"],
+            )))
+    return [decision for _, decision in sorted(pending, key=lambda item: (item[0], str(item[1].decision_id)))]
 
 
 def get_plan(db: Session, owner: Principal, run_id: UUID) -> PlanView:

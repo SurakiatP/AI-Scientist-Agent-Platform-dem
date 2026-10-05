@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { DECISION_BUDGET, DECISION_UNKNOWN, PROJECT_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
+import { DECISION_BUDGET, DECISION_UNKNOWN, PROJECT_ID, RUN_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
 
 test('expanded artifact preserves controls and focus', async ({ page }) => {
   await installResearchFixtureRoutes(page);
@@ -316,4 +316,146 @@ test('progress copy never names implementation identities', async ({ page }) => 
   const region = page.getByRole('region', { name: 'Research progress' });
   await expect(region).toContainText('Verify references');
   expect((await region.innerText()).toLowerCase()).not.toMatch(/hermes|a2a|mcp|agent|skill|container|docker|broker/);
+});
+
+const canceledRun = () => makeRun({ state: 'canceled', reserved_tokens: 12, artifacts: [], revision: 3 });
+const unknown = () => event(1, 'decision.required', { decision_id: DECISION_UNKNOWN, reason: 'unknown_outcome' });
+
+test('canceled run with reserved tokens confirms usage with csrf and one reused key', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: canceledRun(), failFirstDecision: true });
+  fixture.pushEvents(unknown());
+  await page.goto(SESSION_URL);
+  await page.getByLabel('Tokens actually used').fill('7');
+  await page.getByRole('checkbox', { name: 'I checked the provider records for this operation and confirm the amount above is actual usage.' }).check();
+  const confirm = page.getByRole('button', { name: 'Confirm usage' });
+  await confirm.click();
+  await expect.poll(() => fixture.writes.filter((w) => w.path.endsWith('/decisions')).length).toBe(1);
+  await expect(page.getByRole('alert')).toHaveCount(2); // terminal notice + request error
+  await confirm.click();
+  await expect(page.getByRole('button', { name: 'Confirm usage' })).toHaveCount(0);
+  const calls = fixture.writes.filter((w) => w.path.endsWith('/decisions'));
+  expect(calls).toHaveLength(2);
+  expect(calls[0].body).toEqual({ decision_id: DECISION_UNKNOWN, expected_revision: 3, idempotency_key: expect.stringMatching(/^[0-9a-f-]{36}$/), choice: 'confirm_usage', usage_tokens: 7 });
+  expect(calls[1].body.idempotency_key).toBe(calls[0].body.idempotency_key);
+  expect(calls[0].headers['x-csrf-token']).toBeTruthy();
+});
+
+test('confirm usage panel is hidden unless canceled with reservations; Thai labels; conflict shows error', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'running', reserved_tokens: 12, artifacts: [] }) });
+  fixture.pushEvents(unknown());
+  await page.goto(SESSION_URL);
+  await expect(page.getByRole('button', { name: 'Confirm usage' })).toHaveCount(0);
+  fixture.setRun({ state: 'canceled', reserved_tokens: 0 });
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Confirm usage' })).toBeDisabled();
+  fixture.setRun({ reserved_tokens: 12 });
+  await page.addInitScript(() => localStorage.setItem('scientist-platform.language', 'th'));
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'ยืนยันการใช้งานจริง' })).toBeVisible();
+  fixture.setRun({ revision: 9 });
+  await page.getByLabel('โทเคนที่ใช้จริง').fill('1');
+  await page.getByRole('checkbox', { name: 'ฉันตรวจสอบบันทึกของผู้ให้บริการสำหรับขั้นตอนนี้แล้ว และยืนยันว่าจำนวนข้างต้นคือการใช้งานจริง' }).check();
+  await page.getByRole('button', { name: 'ยืนยันการใช้งานจริง' }).click();
+  await expect(page.getByRole('alert')).toHaveCount(2);
+  await expect(page.getByRole('button', { name: 'ยืนยันการใช้งานจริง' })).toBeVisible();
+});
+
+test('confirm usage needs an explicit records check and is capped by this operation reservation', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, {
+    run: makeRun({ state: 'canceled', reserved_tokens: 12, artifacts: [], revision: 3 }),
+  });
+  fixture.pushEvents(unknown());
+  await page.route(`**/api/v1/runs/${RUN_ID}/pending-decisions`, (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify([{
+      decision_id: DECISION_UNKNOWN,
+      reason: 'unknown_outcome',
+      required_tokens: null,
+      required_elapsed_ms: null,
+      operation_reserved_tokens: 6,
+    }]),
+  }));
+  await page.goto(SESSION_URL);
+
+  const usage = page.getByLabel('Tokens actually used');
+  const confirm = page.getByRole('button', { name: 'Confirm usage' });
+  await expect(usage).toHaveValue('');
+  await usage.fill('8');
+  const acknowledgement = page.getByRole('checkbox', { name: 'I checked the provider records for this operation and confirm the amount above is actual usage.' });
+  await acknowledgement.check();
+  await expect(confirm).toBeDisabled();
+  await usage.fill('6');
+  await expect(confirm).toBeDisabled();
+  await acknowledgement.check();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect.poll(() => fixture.writes.filter((w) => w.path.endsWith('/decisions')).length).toBe(1);
+  expect(fixture.writes.find((w) => w.path.endsWith('/decisions'))?.body.usage_tokens).toBe(6);
+});
+
+test('resolving one canceled operation advances to the next durable pending decision', async ({ page }) => {
+  const secondDecision = 'aaaaaaaa-0000-4000-8000-000000000003';
+  const fixture = await installResearchFixtureRoutes(page, {
+    run: makeRun({ state: 'canceled', reserved_tokens: 12, artifacts: [], revision: 3 }),
+    pendingDecisions: [
+      { decision_id: DECISION_UNKNOWN, reason: 'unknown_outcome', operation_reserved_tokens: 6 },
+      { decision_id: secondDecision, reason: 'unknown_outcome', operation_reserved_tokens: 4 },
+    ],
+  });
+  await page.goto(SESSION_URL);
+  const usage = page.getByLabel('Tokens actually used');
+  const acknowledgement = page.getByRole('checkbox', { name: 'I checked the provider records for this operation and confirm the amount above is actual usage.' });
+  const confirm = page.getByRole('button', { name: 'Confirm usage' });
+
+  await expect(usage).toHaveValue('');
+  await usage.fill('2');
+  await acknowledgement.check();
+  await confirm.click();
+  await expect.poll(() => fixture.writes.filter((write) => write.path.endsWith('/decisions')).length).toBe(1);
+  await expect(usage).toHaveValue('');
+
+  await usage.fill('1');
+  await acknowledgement.check();
+  await confirm.click();
+  await expect.poll(() => fixture.writes.filter((write) => write.path.endsWith('/decisions')).length).toBe(2);
+  await expect(page.getByRole('group', { name: 'Confirm usage' })).toHaveCount(0);
+  expect(fixture.writes.filter((write) => write.path.endsWith('/decisions')).map((write) => write.body.decision_id))
+    .toEqual([DECISION_UNKNOWN, secondDecision]);
+});
+
+test('decision conflict refreshes run and pending state without resubmitting', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, {
+    run: makeRun({ state: 'canceled', reserved_tokens: 12, artifacts: [], revision: 3 }),
+    pendingDecisions: [{ decision_id: DECISION_UNKNOWN, reason: 'unknown_outcome', operation_reserved_tokens: 6 }],
+    conflictOnDecision: true,
+  });
+  await page.goto(SESSION_URL);
+  await page.getByLabel('Tokens actually used').fill('1');
+  await page.getByRole('checkbox', { name: 'I checked the provider records for this operation and confirm the amount above is actual usage.' }).check();
+  await page.getByRole('button', { name: 'Confirm usage' }).click();
+
+  await expect(page.getByRole('group', { name: 'Confirm usage' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Stopped' })).toBeVisible();
+  expect(fixture.writes.filter((write) => write.path.endsWith('/decisions'))).toHaveLength(1);
+});
+
+
+test('zero usage requires and submits the provider-record acknowledgement', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, {
+    run: makeRun({ state: 'canceled', reserved_tokens: 12, artifacts: [], revision: 3 }),
+    pendingDecisions: [{ decision_id: DECISION_UNKNOWN, reason: 'unknown_outcome', operation_reserved_tokens: 6 }],
+  });
+  await page.goto(SESSION_URL);
+  const usage = page.getByLabel('Tokens actually used');
+  const acknowledgement = page.getByRole('checkbox', { name: 'I checked the provider records for this operation and confirm the amount above is actual usage.' });
+  const confirm = page.getByRole('button', { name: 'Confirm usage' });
+
+  await usage.fill('0');
+  await expect(confirm).toBeDisabled();
+  await acknowledgement.check();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect.poll(() => fixture.writes.filter((write) => write.path.endsWith('/decisions')).length).toBe(1);
+  expect(fixture.writes.find((write) => write.path.endsWith('/decisions'))?.body.usage_tokens).toBe(0);
 });
