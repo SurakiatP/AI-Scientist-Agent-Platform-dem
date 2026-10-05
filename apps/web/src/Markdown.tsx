@@ -1,6 +1,7 @@
-import { Children, isValidElement, useState, type ReactNode } from 'react';
+import { Children, isValidElement, useId, useState, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import rehypeKatex from 'rehype-katex';
+import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import 'katex/dist/katex.min.css';
 
@@ -22,20 +23,14 @@ const urlTransform = (url: string) => SAFE_URL.test(url.trim()) && !/^\s*\/\//.t
 const textOf = (node: ReactNode): string => Children.toArray(node).map((c) => typeof c === 'string' ? c : isValidElement<{ children?: ReactNode }>(c) ? textOf(c.props.children) : '').join('');
 
 export function Markdown({ source, language }: { source: string; language: Language }) {
+  const footnotePrefix = `${useId().replace(/:/g, '')}-`; // several reports can share one page
   const components: Components = {
-    a: ({ node: _node, href, children }) => href ? <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> : <>{children}</>,
+    // In-page links (GFM footnotes) keep their ids/aria and stay in this tab; everything else opens safely in a new one.
+    a: ({ node: _node, href, children, ...rest }) => href ? <a {...rest} href={href} {...(href.startsWith('#') ? {} : { target: '_blank', rel: 'noopener noreferrer' })}>{children}</a> : <>{children}</>,
     img: ({ alt }) => <span>{alt}</span>, // remote images are never fetched
     pre: ({ children }) => <CopyCode code={textOf(children).replace(/\n$/, '')} language={language} />,
-    // ponytail: no remark-gfm is pinned, so pipe tables arrive as a paragraph; keep them readable and scrollable. Add remark-gfm to get real <table>.
-    p: ({ node, children }) => {
-      const start = node?.position?.start.offset, end = node?.position?.end.offset;
-      const t = start != null && end != null ? source.slice(start, end) : textOf(children);
-      return /^\s*\|/.test(t) && t.includes('\n')
-        ? <div className="table-scroll" tabIndex={0} role="region" aria-label={text(language, 'Table (plain text)', 'ตาราง (ข้อความ)')}><pre>{t}</pre></div>
-        : <p>{children}</p>;
-    },
-    table: ({ node: _node, children }) => <div className="table-scroll" tabIndex={0}><table>{children}</table></div>,
+    table: ({ node: _node, children }) => <div className="table-scroll" tabIndex={0} role="region" aria-label={text(language, 'Table', 'ตาราง')}><table>{children}</table></div>,
   };
   // No rehype-raw: raw HTML in the source is escaped to text. KaTeX trust=false disables \href/\url/\includegraphics.
-  return <div className="report-text"><ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[[rehypeKatex, { trust: false, strict: 'warn', throwOnError: false }]]} urlTransform={urlTransform} components={components}>{source}</ReactMarkdown></div>;
+  return <div className="report-text"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[[rehypeKatex, { trust: false, strict: 'warn', throwOnError: false }]]} remarkRehypeOptions={{ clobberPrefix: footnotePrefix, footnoteLabel: text(language, 'Footnotes', 'เชิงอรรถ'), footnoteLabelProperties: { className: ['visually-hidden'] }, footnoteBackLabel: (i) => text(language, `Back to reference ${i + 1}`, `กลับไปที่อ้างอิง ${i + 1}`) }} urlTransform={urlTransform} components={components}>{source}</ReactMarkdown></div>;
 }

@@ -1,4 +1,4 @@
-.research-chat { display: grid; gap: 20px; max-width: 900px; margin: 0 auto; padding: 24px 18px 60px; }
+.research-chat { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; max-width: 900px; margin: 0 auto; padding: 24px 18px 60px; }
 .research-chat section, .artifact-card { padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface); }
 .research-chat textarea { width: 100%; min-height: 96px; font: inherit; }
 .connection-badge { display: inline-block; padding: 4px 10px; border-radius: 999px; background: var(--soft); color: var(--ink); }
@@ -9,5 +9,7 @@
 .report-text { max-width: 72ch; line-height: 1.7; }
 .report-text pre, .table-scroll { overflow-x: auto; }
 .table-scroll { max-width: 100%; }
+.table-scroll table { border-collapse: collapse; }
+.table-scroll th, .table-scroll td { padding: 6px 10px; border: 1px solid var(--line); text-align: left; }
 .math-block pre { font-family: var(--mono); }
 .file-chip { display: inline-flex; gap: 6px; align-items: center; margin: 0 6px 6px 0; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; }
