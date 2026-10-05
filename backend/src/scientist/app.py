@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 from scientist.auth import DomainError, _consume_bootstrap, _rotate_owner_csrf, authenticate_bearer, authenticate_owner_session, create_owner_session, verify_csrf
@@ -28,6 +29,14 @@ def create_app(*, bootstrap_token: str, bootstrap_expires_at: datetime | None = 
     async def domain_error(request: Request, exc: DomainError):
         return JSONResponse(status_code=exc.status, content={
             "code": exc.code, "message": _message(exc.code),
+            "request_id": getattr(request.state, "request_id", ""),
+        })
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        # Never echo pydantic input/ctx: request bodies can carry secrets.
+        return JSONResponse(status_code=422, headers={"Cache-Control": "no-store"}, content={
+            "code": "invalid_request", "message": _message("invalid_request"),
             "request_id": getattr(request.state, "request_id", ""),
         })
 
@@ -141,4 +150,6 @@ def _message(code: str) -> str:
             "budget_exhausted": "The approved usage limit has been reached.", "storage_unavailable": "Secure storage is unavailable.",
             "request_too_large": "The captured research context is too large.", "runtime_unavailable": "The run service is not available.",
             "decision_ambiguous": "More than one step needs a decision. Reload and try again.",
-            "data_destinations_not_configured": "Research data destinations are not configured."}.get(code, "The request could not be completed.")
+            "data_destinations_not_configured": "Research data destinations are not configured.",
+            "invalid_request": "The request is not valid.", "provider_not_configured": "This provider is not configured on the server.",
+            "connection_exists": "A connection for this provider already exists. Revoke it first."}.get(code, "The request could not be completed.")

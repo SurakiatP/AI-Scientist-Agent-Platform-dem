@@ -13,9 +13,12 @@ from fastapi import APIRouter, Header, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import text
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from scientist import domain, files, objects, research, supervisor
+from scientist import secrets as secret_store
 from scientist.auth import DomainError, authenticate_owner_session
 from scientist.contracts import DecisionSubmit, ObjectRef, PlanSpec, Principal
 from scientist.db import session as database_session
@@ -83,6 +86,13 @@ class Publish(Body):
     publication_key: str
 
 
+class ConnectionCreate(Body):
+    provider_id: UUID
+    label: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    model: str = Field(min_length=1, max_length=200)
+    secret: str = Field(min_length=1, max_length=16384)
+
+
 def _principal(request: Request) -> Principal:
     return request.state.principal
 
@@ -96,6 +106,29 @@ def _error(request: Request, status: int, code: str, **extra) -> JSONResponse:
 def capabilities():
     return {"file_types": sorted(files._TYPES), "max_upload_bytes": MAX_UPLOAD_BYTES,
             "protocols": {"mcp": "not_configured", "a2a": "not_configured"}}
+
+
+@router.get("/connections")
+def list_connections(request: Request):
+    with database_session() as db:
+        views = secret_store.list_connections(db, _principal(request))
+    return JSONResponse([v.model_dump(mode="json") for v in views], headers={"Cache-Control": "no-store"})
+
+
+@router.post("/connections", status_code=201)
+def create_connection(request: Request, body: ConnectionCreate):
+    with database_session() as db:
+        view = secret_store.create_connection(db, _principal(request), body.provider_id, body.label, body.model, body.secret)
+        db.commit()
+    return JSONResponse(view.model_dump(mode="json"), status_code=201, headers={"Cache-Control": "no-store"})
+
+
+@router.delete("/connections/{connection_id}", status_code=204)
+def revoke_connection(request: Request, connection_id: UUID):
+    with database_session() as db:
+        secret_store.revoke_connection(db, _principal(request), connection_id)
+        db.commit()
+    return Response(status_code=204)
 
 
 @router.get("/projects")
