@@ -486,6 +486,8 @@ def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
     if row["state"] not in {"running", "recovering", "stopping", "waiting_input", "queued"}:
         return _run_view(db, run_id)
     db.execute(text("UPDATE runs SET state='stopping', cancel_requested=true WHERE id=:run"), {"run": run_id})
+    if row["state"] != "stopping":
+        _event(db, run_id, row["revision"], "run.state", {"state": "stopping"})
     db.commit()
     try:
         fenced = _fence_generation(db, run_id, None, grace_seconds)

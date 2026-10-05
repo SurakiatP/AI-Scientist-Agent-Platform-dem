@@ -335,7 +335,7 @@ def _finalize_staged_success(db: Session, run_id: UUID, operation_id: str) -> Op
 
 def _record_unknown(db: Session, request: OperationRequest, revision: int, *, usage_tokens: int | None,
                     result_ref: ObjectRef | None) -> OperationResult:
-    _load_run(db, request.run_id, lock=True)
+    prior = _load_run(db, request.run_id, lock=True)
     result = {"request": request.model_dump(mode="json"), "usage_known": usage_tokens is not None}
     if result_ref is not None:
         result["ref"] = result_ref.model_dump(mode="json")
@@ -358,6 +358,8 @@ def _record_unknown(db: Session, request: OperationRequest, revision: int, *, us
           AND NOT cancel_requested
     """), {"run": request.run_id}).rowcount
     if waiting == 1:
+        if prior.state != "waiting_input":
+            _event(db, request.run_id, revision, "run.state", {"state": "waiting_input"})
         _issue_unknown_decision(db, request.run_id, revision, request.operation_id)
     db.commit()
     return OperationResult(operation_id=request.operation_id, state="unknown", result=None, usage_tokens=usage_tokens)
@@ -403,12 +405,16 @@ def reconcile(db: Session, run_id: UUID, operation_id: str) -> OperationResult:
         if not stopped:
             if run.state != "waiting_input" or run.waiting_reason != "unknown_outcome":
                 db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})
+                if run.state != "waiting_input":
+                    _event(db, run_id, run.revision, "run.state", {"state": "waiting_input"})
             _issue_unknown_decision(db, run_id, run.revision, operation_id)
         db.commit()
         row = db.execute(text("SELECT * FROM operations WHERE id = :id"), {"id": row.id}).one()
     elif row.state == "unknown" and not stopped and not pending.get("retry_identity"):
         if run.state != "waiting_input" or run.waiting_reason != "unknown_outcome":
             db.execute(text("UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome' WHERE id = :run"), {"run": run_id})
+            if run.state != "waiting_input":
+                _event(db, run_id, run.revision, "run.state", {"state": "waiting_input"})
         _issue_unknown_decision(db, run_id, run.revision, operation_id)
         db.commit()
     return _operation_result(row)
@@ -462,6 +468,7 @@ def resolve_unknown(
                    {"result": json.dumps(pending, separators=(",", ":")), "id": operation.id})
         db.execute(text("UPDATE runs SET state = :state, waiting_reason = NULL WHERE id = :run"),
                    {"state": "running" if retry_now else "queued", "run": run_id})
+        _event(db, run_id, run.revision, "run.state", {"state": "running" if retry_now else "queued"})
     elif decision == "verified_result":
         if result is None or result.project_id != run.project_id or _verify_result is None:
             raise DomainError("forbidden", 400)
@@ -505,8 +512,10 @@ def resolve_unknown(
         next_state = "running" if run.lease_expires_at is not None and run.lease_expires_at > datetime.now(timezone.utc) else "queued"
         db.execute(text("UPDATE runs SET state = :state, waiting_reason = NULL WHERE id = :run"),
                    {"state": next_state, "run": run_id})
+        _event(db, run_id, run.revision, "run.state", {"state": next_state})
     else:
         db.execute(text("UPDATE runs SET state = 'stopping', cancel_requested = true, waiting_reason = NULL WHERE id = :run"), {"run": run_id})
+        _event(db, run_id, run.revision, "run.state", {"state": "stopping"})
     db.execute(text("""
         UPDATE owner_decisions SET state = 'resolved', resolved_at = now(), resolution = CAST(:resolution AS jsonb),
             idempotency_key = :key, payload_hash = :hash
