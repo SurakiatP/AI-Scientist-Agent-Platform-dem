@@ -397,6 +397,11 @@ def test_fresh_bootstrap_only_without_prior_state(iso, monkeypatch):
     assert context.provider_endpoint == ORIGIN and str(context.provider_id) == PROVIDER
     assert (context.image_digest, context.skills_digest, context.environment_digest) == (WORKER_DIGEST, "b" * 64, "d" * 64)
     assert context.system_prompt == host.SYSTEM_PROMPT and boot.metadata.checkpoint_revision == 0 and not list(boot.workspace)
+    assert context.system_prompt.startswith(
+        "You are a careful research assistant. Answer the owner's approved question using only evidence "
+        "you can verify through the approved plan. State uncertainty plainly and never invent sources.")
+    for phrase in ("Thai", "abstracts", "full texts", "tool result", "limitations"):
+        assert phrase in context.system_prompt
 
     _sql("""INSERT INTO operations (id, run_id, operation_id, generation, kind, payload_hash, state, reserve_tokens)
             VALUES (:i, :r, 'op-1', 1, 'llm', :h, 'committed', 1)""", i=uuid4(), r=run_id, h="0" * 64)

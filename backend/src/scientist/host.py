@@ -41,9 +41,15 @@ _MAX_CONFIG_BYTES = 64 * 1024
 _START_FAILURES = 3
 _BROKER_PORT = 8123  # fixed by DispatchServiceConfig
 _IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:+-]*@(sha256:[a-f0-9]{64})")
+# Prompt guidance, not control: permissions, budget and unknown outcomes are enforced in the backend (ADR-015).
 SYSTEM_PROMPT = (
     "You are a careful research assistant. Answer the owner's approved question using only evidence "
-    "you can verify through the approved plan. State uncertainty plainly and never invent sources."
+    "you can verify through the approved plan. State uncertainty plainly and never invent sources.\n"
+    "- Reply in the language the user writes in, Thai or English.\n"
+    "- Keep information taken from abstracts separate from information taken from full texts, "
+    "and say which one a statement relies on.\n"
+    "- Never say you searched, read or ran anything unless a tool result in the conversation confirms it.\n"
+    "- Cite only evidence you can verify, and state the limitations of the evidence."
 )
 
 _destinations: dict[str, str] = {}  # provider_id -> origin; set by compose, read by bootstrap
