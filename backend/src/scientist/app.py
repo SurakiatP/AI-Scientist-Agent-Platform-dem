@@ -107,9 +107,11 @@ def create_app(*, bootstrap_token: str, bootstrap_expires_at: datetime | None = 
             return _error(401, "forbidden", request.state.request_id)
         return {"identity": str(principal.identity), "kind": "external"}
 
-    from scientist import api  # deferred: api imports domain modules that need the database settings
+    from scientist import api, owner_settings, peers  # deferred: api imports domain modules that need the database settings
     app.include_router(api.router)
     app.include_router(api.control_router)
+    app.include_router(owner_settings.router)
+    app.include_router(peers.router)
     return app
 
 
@@ -140,7 +142,7 @@ def _valid_host_origin(request: Request, *, require_origin: bool) -> bool:
 
 
 def _error(status: int, code: str, request_id: str) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"code": code, "message": _message(code), "request_id": request_id})
+    return JSONResponse(status_code=status, content={"code": code, "message": _message(code), "request_id": request_id}, headers={"Cache-Control": "no-store"})
 
 
 def _message(code: str) -> str:
