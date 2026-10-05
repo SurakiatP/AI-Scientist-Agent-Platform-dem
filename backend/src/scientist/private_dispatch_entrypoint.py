@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import socket
 import stat
 import time
@@ -78,22 +79,36 @@ def _pin_service_hosts(service_subnet: str, database_url: str, s3_host: str, s3_
 
 def _wait_for_active_executor(identity: DispatchIdentity, container_id: str, timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
+    target = identity.peer_reconciliation
+    expected_operation_id = target.operation_id if target is not None else None
+    expected_attempt = target.attempt if target is not None else None
     while True:
         try:
             with session() as db:
-                row = db.execute(text("""
-                    SELECT state, container_id, engine_id, kind, process_incarnation, run_id, generation
-                    FROM runtime_executors WHERE id=:executor
-                """), {"executor": identity.executor_id}).one_or_none()
+                row = db.execute(
+                    text("""
+                        SELECT state, container_id, engine_id, kind, process_incarnation,
+                               run_id, generation, operation_id,
+                               peer_reconciliation_attempt, peer_reconciliation_started
+                        FROM runtime_executors WHERE id=:executor
+                    """),
+                    {"executor": identity.executor_id},
+                ).one_or_none()
                 if row is not None:
                     expected = ("active", identity.run_id, identity.generation, "dispatch", identity.process_incarnation)
                     observed = (row.state, row.run_id, row.generation, row.kind, row.process_incarnation)
-                    if row.container_id and container_id and not row.container_id.startswith(container_id):
-                        raise RuntimeError("dispatch database identity differs from container")
+                    scope = (row.operation_id, row.peer_reconciliation_attempt)
+                    if scope != (expected_operation_id, expected_attempt):
+                        raise RuntimeError("dispatch database reconciliation scope differs trusted config")
+                    started = row.peer_reconciliation_started
+                    if type(started) is not bool or (target is None and started is not False):
+                        raise RuntimeError("dispatch database reconciliation state differs trusted config")
+                    if row.container_id and not row.container_id.startswith(container_id):
+                        raise RuntimeError("dispatch database identity differs container")
                     if observed == expected and row.container_id and row.engine_id == identity.engine_id:
                         return
                     if observed[1:] != expected[1:] or (row.engine_id and row.engine_id != identity.engine_id):
-                        raise RuntimeError("dispatch database identity differs from trusted config")
+                        raise RuntimeError("dispatch database identity differs trusted config")
         except RuntimeError:
             raise
         except Exception:
@@ -102,9 +117,7 @@ def _wait_for_active_executor(identity: DispatchIdentity, container_id: str, tim
             raise RuntimeError("dispatch executor activation timed out")
         time.sleep(0.2)
 
-
-def create_dispatch_app(identity: DispatchIdentity):
-    """Build only the worker effects and checkpoint/result API surface."""
+def _configure_dispatch_runtime(identity: DispatchIdentity) -> RuntimePins:
     pins = RuntimePins(
         runtime_commit=identity.runtime_commit,
         image_digest=identity.image_digest,
@@ -112,8 +125,10 @@ def create_dispatch_app(identity: DispatchIdentity):
         environment_digest=identity.environment_digest,
     )
     checkpoints.configure_trusted_pins(
-        runtime_commit=pins.runtime_commit, image_digest=pins.image_digest,
-        skills_digest=pins.skills_digest, environment_digest=pins.environment_digest,
+        runtime_commit=pins.runtime_commit,
+        image_digest=pins.image_digest,
+        skills_digest=pins.skills_digest,
+        environment_digest=pins.environment_digest,
     )
 
     def persist_result(db, project_id, content: bytes, content_type: str):
@@ -123,15 +138,25 @@ def create_dispatch_app(identity: DispatchIdentity):
         with objects.open_verified(ref) as source:
             return source.read()
 
-    executor_id = identity.executor_id
-    incarnation = identity.process_incarnation
     broker.configure(
-        transport=BoundDispatchTransport(executor_id, incarnation, broker.http_transport),
+        transport=BoundDispatchTransport(
+            identity.executor_id,
+            identity.process_incarnation,
+            broker.http_transport,
+        ),
         persist_result=persist_result,
         capability_key=_read_secret("broker_capability_key"),
         provider_destinations={str(key): value for key, value in identity.provider_destinations.items()},
         peer_destinations={str(key): value for key, value in identity.peer_destinations.items()},
     )
+    return pins
+
+
+def _build_effects_app(identity: DispatchIdentity, pins: RuntimePins):
+    def read_result(ref):
+        with objects.open_verified(ref) as source:
+            return source.read()
+
     controller = WorkerController(
         pins=pins,
         provider_destinations=identity.provider_destinations,
@@ -147,13 +172,28 @@ def create_dispatch_app(identity: DispatchIdentity):
     return app
 
 
+def create_dispatch_app(identity: DispatchIdentity):
+    """Build only the normal worker effects and checkpoint/result API surface."""
+    if identity.mode != "effects":
+        raise ValueError("peer reconciliation dispatch has no effects API")
+    return _build_effects_app(identity, _configure_dispatch_runtime(identity))
+
+
 def main() -> None:
     config = parse_dispatch_config(_CONFIG.read_bytes())
     secret_values = {name: _read_secret(name).decode("utf-8") for name in config.secret_files}
     database_url, s3_endpoint = secret_values["database_url"], "http://scientist-minio:9000"
-    if config.service_subnet is not None:  # egress is attached: bind to IPs resolved once inside the services subnet
-        database_url, s3_endpoint = _pin_service_hosts(config.service_subnet, database_url, "scientist-minio", 9000, config.db_require_auth)
-    # Runtime modules use these only inside this trusted private process.
+    if config.service_subnet is not None:
+        # When egress is attached, bind IPs resolved once inside the services subnet.
+        database_url, s3_endpoint = _pin_service_hosts(
+            config.service_subnet,
+            database_url,
+            "scientist-minio",
+            9000,
+            config.db_require_auth,
+        )
+
+    # Runtime modules use only inside this trusted private process.
     os.environ["SCIENTIST_DATABASE_URL"] = database_url
     database.DATABASE_URL = database_url
     os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(_SECRETS / "master_key")
@@ -162,18 +202,29 @@ def main() -> None:
     os.environ["SCIENTIST_BROKER_CAPABILITY_KEY"] = secret_values["broker_capability_key"]
     os.environ["SCIENTIST_S3_ENDPOINT"] = s3_endpoint
     os.environ["SCIENTIST_OBJECT_BUCKET"] = "scientist-b5"
-    objects.configure(boto3.client(
-        "s3", endpoint_url=s3_endpoint, config=Config(s3={"addressing_style": "path"}),
-        aws_access_key_id=secret_values["s3_access_key"],
-        aws_secret_access_key=secret_values["s3_secret_key"], region_name="us-east-1",
-    ), bucket="scientist-b5")
+    import boto3
+
+    objects.configure(
+        boto3.client(
+            "s3",
+            endpoint_url=s3_endpoint,
+            config=Config(s3={"addressing_style": "path"}),
+            aws_access_key_id=secret_values["s3_access_key"],
+            aws_secret_access_key=secret_values["s3_secret_key"],
+            region_name="us-east-1",
+        ),
+        bucket="scientist-b5",
+    )
     container_id = Path("/etc/hostname").read_text(encoding="ascii").strip().lower()
-    if len(container_id) < 12:
+    if not re.fullmatch(r"[a-f0-9]{12}", container_id):
         raise RuntimeError("dispatch container identity unavailable")
     _wait_for_active_executor(config, container_id)
-    app = create_dispatch_app(config)
+    pins = _configure_dispatch_runtime(config)
+    if config.mode == "peer_get_task":
+        broker.reconcile_peer_from_dispatch(config)
+        return
+    app = _build_effects_app(config, pins)
     uvicorn.run(app, host="0.0.0.0", port=_SERVICE_PORT, access_log=False, log_level="warning")
-
 
 if __name__ == "__main__":
     main()

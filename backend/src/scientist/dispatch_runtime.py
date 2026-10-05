@@ -12,16 +12,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_serializer, field_validator, model_validator
 import subprocess
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scientist import settings
 from scientist.dispatch_authority import dispatch_is_inactive
+from scientist.peer_reconciliation_config import PeerReconciliationTarget
 from scientist.runtime_contracts import RUNTIME_COMMIT
 from scientist.supervisor import DockerWorkerEngine, ExecutorRef
 
@@ -31,6 +32,9 @@ _GEN_LABEL = "scientist.platform/generation"
 _EXEC_LABEL = "scientist.platform/executor"
 _KIND_LABEL = "scientist.platform/kind"
 _INC_LABEL = "scientist.platform/incarnation"
+_MODE_LABEL = "scientist.platform/dispatch-mode"
+_OPERATION_LABEL = "scientist.platform/operation"
+_RECONCILIATION_ATTEMPT_LABEL = "scientist.platform/peer-reconciliation-attempt"
 _SECRET_NAMES = {"database_url", "broker_capability_key", "master_key", "s3_access_key", "s3_secret_key"}
 
 
@@ -174,6 +178,8 @@ class DispatchIdentity(BaseModel):
     environment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider_destinations: Mapping[UUID, str] = Field(max_length=32)
     peer_destinations: Mapping[UUID, str] = Field(default_factory=dict, max_length=100, validate_default=True)
+    mode: Literal["effects", "peer_get_task"] = "effects"
+    peer_reconciliation: PeerReconciliationTarget | None = None
     secret_files: dict[str, str]
     # Launch-only (not in the static template): services subnet the entrypoint must pin its clients inside.
     service_subnet: str | None = None
@@ -187,6 +193,12 @@ class DispatchIdentity(BaseModel):
             if net.version != 4 or not net.is_private or net.prefixlen < 16:
                 raise ValueError("service subnet must be a private IPv4 network")
         return value
+
+    @model_validator(mode="after")
+    def reconciliation_mode_matches_target(self) -> "DispatchIdentity":
+        if (self.mode == "peer_get_task") != (self.peer_reconciliation is not None):
+            raise ValueError("peer GetTask mode requires exactly one reconciliation target")
+        return self
 
     @field_validator("provider_destinations")
     @classmethod
@@ -358,6 +370,7 @@ class DockerDispatchRuntime:
     def __init__(self, config: DispatchServiceConfig, engine: DockerWorkerEngine | None = None):
         self.config = config
         self.engine = engine or DockerWorkerEngine()
+        self._peer_reconciliation_by_container: dict[str, PeerReconciliationTarget] = {}
 
     def _docker(self, *args: str) -> str:
         return self.engine._docker(*args)
@@ -365,8 +378,38 @@ class DockerDispatchRuntime:
     def engine_id(self) -> str:
         return self.engine.engine_id()
 
-    def _ref(self, run_id: UUID, generation: int, executor_id: UUID, incarnation: UUID, container_id: str, engine_id: str) -> ExecutorRef:
-        return ExecutorRef(executor_id, run_id, generation, "dispatch", None, incarnation, engine_id, container_id)
+    def _ref(self, run_id: UUID, generation: int, executor_id: UUID, incarnation: UUID, container_id: str, engine_id: str, operation_id: str | None = None, peer_reconciliation: PeerReconciliationTarget | None = None) -> ExecutorRef:
+        if (peer_reconciliation is None) != (operation_id is None) or (peer_reconciliation is not None and peer_reconciliation.operation_id != operation_id):
+            raise RuntimeError("dispatch reconciliation reference differs durable identity")
+        if peer_reconciliation is not None:
+            self._peer_reconciliation_by_container[container_id] = peer_reconciliation
+        else:
+            self._peer_reconciliation_by_container.pop(container_id, None)
+        return ExecutorRef(executor_id, run_id, generation, "dispatch", operation_id, incarnation, engine_id, container_id)
+
+    def _scope_for_executor(self, executor: ExecutorRef) -> PeerReconciliationTarget | None:
+        target = self._peer_reconciliation_by_container.get(executor.container_id)
+        if executor.operation_id is None:
+            if target is not None:
+                raise RuntimeError("dispatch effects reference has a reconciliation target")
+            return None
+        if target is None or target.operation_id != executor.operation_id:
+            raise RuntimeError("dispatch reconciliation reference differs durable identity")
+        return target
+
+    @staticmethod
+    def _reconciliation_label_format() -> tuple[str, str, str]:
+        return (
+            '{{index .Config.Labels "scientist.platform/dispatch-mode"}}',
+            '{{index .Config.Labels "scientist.platform/operation"}}',
+            '{{index .Config.Labels "scientist.platform/peer-reconciliation-attempt"}}',
+        )
+
+    def _scope_labels(self, executor: ExecutorRef) -> tuple[PeerReconciliationTarget | None, list[str], list[str]]:
+        target = self._scope_for_executor(executor)
+        if target is None:
+            return None, [], []
+        return target, list(self._reconciliation_label_format()), ["peer_get_task", target.operation_id, str(target.attempt)]
 
     def _run_docker_before(self, deadline: float, *args: str) -> str:
         remaining = deadline - time.monotonic()
@@ -421,7 +464,7 @@ class DockerDispatchRuntime:
             raise RuntimeError("owned Docker engine version changed")
         return engine_id
 
-    def _materialize_launch_config(self, run_id: UUID, generation: int, executor_id: UUID, incarnation: UUID, engine_id: str, *, service_subnet: str | None = None) -> Path:
+    def _materialize_launch_config(self, run_id: UUID, generation: int, executor_id: UUID, incarnation: UUID, engine_id: str, *, service_subnet: str | None = None, peer_reconciliation: PeerReconciliationTarget | None = None) -> Path:
         template_path = Path(self.config.host_config_file)
         try:
             template_stat = template_path.lstat()
@@ -449,6 +492,8 @@ class DockerDispatchRuntime:
             "executor_id": executor_id,
             "process_incarnation": incarnation,
             "engine_id": engine_id,
+            "mode": "peer_get_task" if peer_reconciliation is not None else "effects",
+            "peer_reconciliation": peer_reconciliation,
             **({"service_subnet": service_subnet} if service_subnet is not None else {}),
         })
         path = launcher / f"dispatch-{run_id.hex}-g{generation}-{executor_id.hex}-{incarnation.hex}.json"
@@ -493,7 +538,9 @@ class DockerDispatchRuntime:
             mounts.extend(("--mount", f"type=bind,src={source},dst={self.config.secrets_dir}/{name},readonly"))
         return mounts
 
-    def find(self, db: Session, run_id: UUID, generation: int, executor_id: UUID, operation_id: str | None, process_incarnation: UUID) -> ExecutorRef | None:
+    def find(self, db: Session, run_id: UUID, generation: int, executor_id: UUID, operation_id: str | None, process_incarnation: UUID, *, peer_reconciliation: PeerReconciliationTarget | None = None) -> ExecutorRef | None:
+        if (peer_reconciliation is None) != (operation_id is None) or (peer_reconciliation is not None and peer_reconciliation.operation_id != operation_id):
+            raise RuntimeError("dispatch reconciliation operation differs durable identity")
         current_engine = self.engine_id()
         image_id = self._verified_image_id()
         ids = self._docker("ps", "-aq", "--no-trunc", "--filter", f"label={_EXEC_LABEL}={executor_id}", "--filter", f"label={_RUN_LABEL}={run_id}", "--filter", f"label={_GEN_LABEL}={generation}")
@@ -502,12 +549,35 @@ class DockerDispatchRuntime:
             return None
         if len(matches) != 1 or not re.fullmatch(r"[a-f0-9]{64}", matches[0]):
             raise RuntimeError("dispatch physical identity is ambiguous")
-        fields = self._docker("inspect", "--format", "{{index .Config.Labels \"scientist.platform/run\"}}|{{index .Config.Labels \"scientist.platform/generation\"}}|{{index .Config.Labels \"scientist.platform/executor\"}}|{{index .Config.Labels \"scientist.platform/incarnation\"}}|{{index .Config.Labels \"scientist.platform/kind\"}}|{{.Id}}|{{.Image}}|{{.Config.Image}}", matches[0]).split("|")
-        if fields != [str(run_id), str(generation), str(executor_id), str(process_incarnation), "dispatch", matches[0], image_id, self.config.image]:
+        if peer_reconciliation is None:
+            format_string = "|".join((
+                '{{index .Config.Labels "scientist.platform/run"}}',
+                '{{index .Config.Labels "scientist.platform/generation"}}',
+                '{{index .Config.Labels "scientist.platform/executor"}}',
+                '{{index .Config.Labels "scientist.platform/incarnation"}}',
+                '{{index .Config.Labels "scientist.platform/kind"}}',
+                "{{.Id}}", "{{.Image}}", "{{.Config.Image}}",
+            ))
+            expected = [str(run_id), str(generation), str(executor_id), str(process_incarnation), "dispatch", matches[0], image_id, self.config.image]
+        else:
+            format_string = "|".join((
+                '{{index .Config.Labels "scientist.platform/run"}}',
+                '{{index .Config.Labels "scientist.platform/generation"}}',
+                '{{index .Config.Labels "scientist.platform/executor"}}',
+                '{{index .Config.Labels "scientist.platform/incarnation"}}',
+                '{{index .Config.Labels "scientist.platform/kind"}}',
+                '{{index .Config.Labels "scientist.platform/dispatch-mode"}}',
+                '{{index .Config.Labels "scientist.platform/operation"}}',
+                '{{index .Config.Labels "scientist.platform/peer-reconciliation-attempt"}}',
+                "{{.Id}}", "{{.Image}}", "{{.Config.Image}}",
+            ))
+            expected = [str(run_id), str(generation), str(executor_id), str(process_incarnation), "dispatch", "peer_get_task", operation_id or "", str(peer_reconciliation.attempt), matches[0], image_id, self.config.image]
+        fields = self._docker("inspect", "--format", format_string, matches[0]).split("|")
+        if fields != expected:
             raise RuntimeError("dispatch physical identity differs from durable identity")
-        return self._ref(run_id, generation, executor_id, process_incarnation, matches[0], current_engine)
+        return self._ref(run_id, generation, executor_id, process_incarnation, matches[0], current_engine, operation_id, peer_reconciliation)
 
-    def start(self, db: Session, run_id: UUID, generation: int, network: str, broker_ip: str, executor_id: UUID, process_incarnation: UUID, *, before_mutation: Callable[[str, str | None], None]) -> ExecutorRef:
+    def start(self, db: Session, run_id: UUID, generation: int, network: str, broker_ip: str, executor_id: UUID, process_incarnation: UUID, *, before_mutation: Callable[[str, str | None], None], peer_reconciliation: PeerReconciliationTarget | None = None) -> ExecutorRef:
         if not re.fullmatch(r"scientist-run-[a-f0-9]{12}-g[1-9][0-9]*", network):
             raise RuntimeError("dispatch may join only a generated per-run bridge")
         ip = ipaddress.ip_address(broker_ip)
@@ -516,11 +586,12 @@ class DockerDispatchRuntime:
         engine_id = self.engine_id()
         image_id = self._verified_image_id()
         subnet = self._checked_egress_and_subnet()
-        existing = self.find(db, run_id, generation, executor_id, None, process_incarnation)
+        operation_id = peer_reconciliation.operation_id if peer_reconciliation is not None else None
+        existing = self.find(db, run_id, generation, executor_id, operation_id, process_incarnation, peer_reconciliation=peer_reconciliation)
         if existing is not None:
             if (existing.executor_id, existing.run_id, existing.generation, existing.kind,
                     existing.operation_id, existing.process_incarnation, existing.engine_id) != (
-                    executor_id, run_id, generation, "dispatch", None, process_incarnation, engine_id):
+                    executor_id, run_id, generation, "dispatch", operation_id, process_incarnation, engine_id):
                 raise RuntimeError("dispatch engine incarnation changed")
             self._verify_container_image(existing.container_id, image_id)
             before_mutation(engine_id, existing.container_id)
@@ -528,8 +599,20 @@ class DockerDispatchRuntime:
             self._docker("start", existing.container_id)
             self._ensure_run_network(network, existing.container_id, broker_ip)
             return existing
-        labels = ["--label", f"{_RUN_LABEL}={run_id}", "--label", f"{_GEN_LABEL}={generation}", "--label", f"{_EXEC_LABEL}={executor_id}", "--label", f"{_KIND_LABEL}=dispatch", "--label", f"{_INC_LABEL}={process_incarnation}"]
-        launch_config = self._materialize_launch_config(run_id, generation, executor_id, process_incarnation, engine_id, **({"service_subnet": subnet} if subnet else {}))
+        labels = [
+            "--label", f"{_RUN_LABEL}={run_id}",
+            "--label", f"{_GEN_LABEL}={generation}",
+            "--label", f"{_EXEC_LABEL}={executor_id}",
+            "--label", f"{_KIND_LABEL}=dispatch",
+            "--label", f"{_INC_LABEL}={process_incarnation}",
+        ]
+        if peer_reconciliation is not None:
+            labels.extend((
+                "--label", f"{_MODE_LABEL}=peer_get_task",
+                "--label", f"{_OPERATION_LABEL}={operation_id}",
+                "--label", f"{_RECONCILIATION_ATTEMPT_LABEL}={peer_reconciliation.attempt}",
+            ))
+        launch_config = self._materialize_launch_config(run_id, generation, executor_id, process_incarnation, engine_id, **({"service_subnet": subnet} if subnet else {}), peer_reconciliation=peer_reconciliation)
         mounts = ["--mount", f"type=bind,src={launch_config},dst={self.config.config_path},readonly", *self._secret_mounts()]
         before_mutation(engine_id, None)
         container_id = self._docker(
@@ -547,10 +630,26 @@ class DockerDispatchRuntime:
         if self.config.egress_network is not None:
             self._docker("network", "connect", self.config.egress_network, container_id)
         self._docker("start", container_id)
-        details = self._docker("inspect", "--format", "{{.Id}}|{{.State.Running}}|{{index .Config.Labels \"scientist.platform/run\"}}|{{index .Config.Labels \"scientist.platform/generation\"}}|{{index .Config.Labels \"scientist.platform/executor\"}}|{{index .Config.Labels \"scientist.platform/kind\"}}|{{index .Config.Labels \"scientist.platform/incarnation\"}}|{{.Image}}|{{.Config.Image}}", container_id).split("|")
-        if details != [container_id, "true", str(run_id), str(generation), str(executor_id), "dispatch", str(process_incarnation), image_id, self.config.image]:
+        if peer_reconciliation is None:
+            details = self._docker("inspect", "--format", "{{.Id}}|{{.State.Running}}|{{index .Config.Labels \"scientist.platform/run\"}}|{{index .Config.Labels \"scientist.platform/generation\"}}|{{index .Config.Labels \"scientist.platform/executor\"}}|{{index .Config.Labels \"scientist.platform/kind\"}}|{{index .Config.Labels \"scientist.platform/incarnation\"}}|{{.Image}}|{{.Config.Image}}", container_id).split("|")
+            expected_details = [container_id, "true", str(run_id), str(generation), str(executor_id), "dispatch", str(process_incarnation), image_id, self.config.image]
+        else:
+            details = self._docker("inspect", "--format", "|".join((
+                "{{.Id}}", "{{.State.Running}}",
+                '{{index .Config.Labels "scientist.platform/run"}}',
+                '{{index .Config.Labels "scientist.platform/generation"}}',
+                '{{index .Config.Labels "scientist.platform/executor"}}',
+                '{{index .Config.Labels "scientist.platform/kind"}}',
+                '{{index .Config.Labels "scientist.platform/incarnation"}}',
+                '{{index .Config.Labels "scientist.platform/dispatch-mode"}}',
+                '{{index .Config.Labels "scientist.platform/operation"}}',
+                '{{index .Config.Labels "scientist.platform/peer-reconciliation-attempt"}}',
+                "{{.Image}}", "{{.Config.Image}}",
+            )), container_id).split("|")
+            expected_details = [container_id, "true", str(run_id), str(generation), str(executor_id), "dispatch", str(process_incarnation), "peer_get_task", operation_id or "", str(peer_reconciliation.attempt), image_id, self.config.image]
+        if details != expected_details:
             raise RuntimeError("dispatch start identity changed")
-        return self._ref(run_id, generation, executor_id, process_incarnation, container_id, engine_id)
+        return self._ref(run_id, generation, executor_id, process_incarnation, container_id, engine_id, operation_id, peer_reconciliation)
 
     def _checked_egress_and_subnet(self) -> str | None:
         """Fail closed unless the egress network is the owned, ICC-disabled bridge; return the services subnet to pin."""
@@ -609,25 +708,44 @@ class DockerDispatchRuntime:
         self._docker("network", "connect", "--ip", broker_ip, network, container_id)
 
     def inactive(self, db: Session, executor: ExecutorRef, operation_id: str) -> bool:
-        if executor.kind != "dispatch":
+        if (executor.kind != "dispatch" or
+                (executor.operation_id is not None and executor.operation_id != operation_id)):
             return False
-        return dispatch_is_inactive(db, executor.run_id, operation_id, executor.generation, probe=self._probe_inactive)
+        try:
+            self._scope_for_executor(executor)
+        except RuntimeError:
+            return False
+        return dispatch_is_inactive(
+            db,
+            executor.run_id,
+            operation_id,
+            executor.generation,
+            probe=lambda incarnation, engine, container: self._probe_inactive(
+                incarnation, engine, container, executor=executor
+            ),
+        )
 
     def _assert_physical_identity(self, executor: ExecutorRef, deadline: float | None = None) -> None:
+        _, scope_format, scope_expected = self._scope_labels(executor)
         image_id = self._verified_image_id(deadline)
-        fmt = "{{.Id}}|{{.State.Running}}|{{index .Config.Labels \"scientist.platform/run\"}}|{{index .Config.Labels \"scientist.platform/generation\"}}|{{index .Config.Labels \"scientist.platform/executor\"}}|{{index .Config.Labels \"scientist.platform/kind\"}}|{{index .Config.Labels \"scientist.platform/incarnation\"}}|{{.Image}}|{{.Config.Image}}"
+        fmt = "|".join((
+            "{{.Id}}", "{{.State.Running}}",
+            '{{index .Config.Labels "scientist.platform/run"}}',
+            '{{index .Config.Labels "scientist.platform/generation"}}',
+            '{{index .Config.Labels "scientist.platform/executor"}}',
+            '{{index .Config.Labels "scientist.platform/kind"}}',
+            '{{index .Config.Labels "scientist.platform/incarnation"}}',
+            *scope_format,
+            "{{.Image}}", "{{.Config.Image}}",
+        ))
         inspect = self._run_docker_before if deadline is not None else self._docker
-        actual = (
-            inspect(deadline, "inspect", "--format", fmt, executor.container_id)
-            if deadline is not None
-            else inspect("inspect", "--format", fmt, executor.container_id)
-        ).split("|")
+        actual = inspect(deadline, "inspect", "--format", fmt, executor.container_id).split("|") if deadline is not None else inspect("inspect", "--format", fmt, executor.container_id).split("|")
         expected = [
             executor.container_id, "true", str(executor.run_id), str(executor.generation),
             str(executor.executor_id), "dispatch", str(executor.process_incarnation),
-            image_id, self.config.image,
+            *scope_expected, image_id, self.config.image,
         ]
-        if len(actual) != len(expected) or actual != expected:
+        if actual != expected:
             raise RuntimeError("dispatch readiness physical identity is not active")
 
     def _probe_dispatch_container(self, executor: ExecutorRef, address: str, deadline: float) -> None:
@@ -716,45 +834,70 @@ class DockerDispatchRuntime:
         check_deadline()
         return True
 
-    def _probe_inactive(self, incarnation: UUID, engine_id: str, container_id: str) -> bool:
+    def _probe_inactive(
+        self,
+        incarnation: UUID,
+        engine_id: str,
+        container_id: str,
+        *,
+        executor: ExecutorRef | None = None,
+    ) -> bool:
         try:
             if self.engine_id() != engine_id:
                 return False
+            if executor is not None and (
+                executor.container_id != container_id
+                or executor.process_incarnation != incarnation
+                or executor.engine_id != engine_id
+            ):
+                return False
+            target = self._scope_for_executor(executor) if executor is not None else self._peer_reconciliation_by_container.get(container_id)
             found = self._docker("ps", "-aq", "--no-trunc", "--filter", f"id={container_id}").splitlines()
             if not found:
                 return self.engine_id() == engine_id
             if found != [container_id]:
                 return False
-            details = self._docker("inspect", "--format", "{{index .Config.Labels \"scientist.platform/incarnation\"}}|{{.State.Running}}|{{.Id}}", container_id).split("|")
-            return details == [str(incarnation), "false", container_id] and self.engine_id() == engine_id
+            scope_format = list(self._reconciliation_label_format()) if target is not None else []
+            scope_expected = ["peer_get_task", target.operation_id, str(target.attempt)] if target is not None else []
+            fields = [
+                '{{index .Config.Labels "scientist.platform/incarnation"}}',
+                "{{.State.Running}}", "{{.Id}}", *scope_format,
+            ]
+            details = self._docker("inspect", "--format", "|".join(fields), container_id).split("|")
+            return details == [str(incarnation), "false", container_id, *scope_expected] and self.engine_id() == engine_id
         except Exception:
             return False
 
     def stop(self, db: Session, executor: ExecutorRef, grace_seconds: int) -> bool:
-        if (executor.kind != "dispatch" or type(grace_seconds) is not int or not 0 <= grace_seconds <= 120):
+        if executor.kind != "dispatch" or type(grace_seconds) is not int or not 0 <= grace_seconds <= 120:
             return False
         try:
-            if self.engine_id() != executor.engine_id:
-                return False
-            if not re.fullmatch(r"[a-f0-9]{64}", executor.container_id):
+            _, scope_format, scope_expected = self._scope_labels(executor)
+            if self.engine_id() != executor.engine_id or not re.fullmatch(r"[a-f0-9]{64}", executor.container_id):
                 return False
             listed = self._docker("ps", "-aq", "--no-trunc", "--filter", f"id={executor.container_id}").splitlines()
             if not listed:
                 return self.engine_id() == executor.engine_id
             if listed != [executor.container_id]:
                 return False
-            inspect = "{{index .Config.Labels \"scientist.platform/executor\"}}|{{index .Config.Labels \"scientist.platform/run\"}}|{{index .Config.Labels \"scientist.platform/generation\"}}|{{index .Config.Labels \"scientist.platform/kind\"}}|{{index .Config.Labels \"scientist.platform/incarnation\"}}|{{.Id}}|{{.State.Running}}"
-            try:
-                details = self._docker("inspect", "--format", inspect, executor.container_id).split("|")
-            except Exception:
-                if self.engine_id() != executor.engine_id:
-                    return False
-                remaining = self._docker("ps", "-aq", "--no-trunc", "--filter", f"id={executor.container_id}").splitlines()
-                return not remaining and self.engine_id() == executor.engine_id
-            expected = [str(executor.executor_id), str(executor.run_id), str(executor.generation), "dispatch", str(executor.process_incarnation), executor.container_id]
-            if len(details) != 7 or details[:6] != expected or details[6] not in {"true", "false"}:
+            inspect = "|".join((
+                '{{index .Config.Labels "scientist.platform/executor"}}',
+                '{{index .Config.Labels "scientist.platform/run"}}',
+                '{{index .Config.Labels "scientist.platform/generation"}}',
+                '{{index .Config.Labels "scientist.platform/kind"}}',
+                '{{index .Config.Labels "scientist.platform/incarnation"}}',
+                *scope_format,
+                "{{.Id}}", "{{.State.Running}}",
+            ))
+            expected = [
+                str(executor.executor_id), str(executor.run_id), str(executor.generation),
+                "dispatch", str(executor.process_incarnation), *scope_expected,
+                executor.container_id,
+            ]
+            details = self._docker("inspect", "--format", inspect, executor.container_id).split("|")
+            if len(details) != len(expected) + 1 or details[:-1] != expected or details[-1] not in {"true", "false"}:
                 return False
-            if details[6] == "true":
+            if details[-1] == "true":
                 self._docker("stop", "--time", str(grace_seconds), executor.container_id)
             if self.engine_id() != executor.engine_id:
                 return False
@@ -763,11 +906,8 @@ class DockerDispatchRuntime:
                 return self.engine_id() == executor.engine_id
             if remaining != [executor.container_id]:
                 return False
-            try:
-                details = self._docker("inspect", "--format", inspect, executor.container_id).split("|")
-            except Exception:
-                return False
-            if len(details) != 7 or details[:6] != expected or details[6] != "false":
+            details = self._docker("inspect", "--format", inspect, executor.container_id).split("|")
+            if len(details) != len(expected) + 1 or details[:-1] != expected or details[-1] != "false":
                 return False
             self._docker("rm", "--force", executor.container_id)
             remaining = self._docker("ps", "-aq", "--no-trunc", "--filter", f"id={executor.container_id}").splitlines()

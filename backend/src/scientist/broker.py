@@ -991,3 +991,73 @@ def _operation_result(row) -> OperationResult:
     ref = ObjectRef.model_validate(result["ref"]) if result.get("ref") else None
     return OperationResult(operation_id=row.operation_id, state=row.state, result=ref,
                            usage_tokens=result.get("usage_tokens", row.usage_tokens))
+
+
+def reconcile_peer_from_dispatch(identity) -> OperationResult:
+    """Trusted one-shot entrypoint; no caller-selected endpoints or remote identities."""
+    from scientist.dispatch_authority import BoundDispatchTransport
+    if (identity.mode != "peer_get_task" or identity.peer_reconciliation is None or
+            not isinstance(_transport, BoundDispatchTransport) or
+            _transport.executor_id != identity.executor_id or
+            _transport.incarnation != identity.process_incarnation):
+        raise DomainError("forbidden", 403)
+    return _transport.reconcile_peer(identity.run_id,identity.generation,identity.peer_reconciliation)
+
+
+def http_reconcile_peer(scope, generation: int) -> OperationResult:
+    import asyncio
+    from google.protobuf.json_format import MessageToDict
+    from scientist.a2a_outbound import PeerOutboundCallbacks,reconcile_peer_task
+    from scientist import peer_http_exchange,peer_receipt_runtime
+    from scientist.db import session
+    from scientist.peer_reconciliation_scope import load_peer_read_scope
+    from scientist.dispatch_authority import validate_peer_reader
+
+    request,target=scope.request,scope.target
+    release=target.peer_release
+    if release is None or target.credential_id is None:
+        raise DomainError("forbidden",403)
+    with session() as db:
+        credential=read_secret(db,target.credential_id)
+    origin=target.approved_recipients[0]
+    captured=[]
+    def capture(_run,_op,task,_accounting):
+        captured.append(json.dumps(MessageToDict(task),ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode())
+    callbacks=PeerOutboundCallbacks(prepare=peer_receipt_runtime.prepare_submission,
+        record_remote_identity=peer_receipt_runtime.record_remote_identity,
+        mark_unknown=peer_receipt_runtime.mark_unknown,persist_result=capture)
+    try:
+        asyncio.run(reconcile_peer_task(release,request.run_id,request.operation_id,scope.remote_task_id,scope.remote_context_id,
+            attempt=scope.attempt,endpoint_url=target.url,expected_authority=urlsplit(origin).netloc,callbacks=callbacks,
+            exchange=peer_http_exchange.pinned_exchange(origin,credential,request_bytes_limit=release.request_bytes_limit)))
+        if len(captured)!=1:
+            raise DomainError("provider_unavailable",502)
+        data=captured[0]
+        with session() as db:
+            refreshed = load_peer_read_scope(db, request.run_id, request.operation_id,
+                                             generation, scope.attempt)
+            validate_peer_reader(db, scope, generation)
+            task_context = json.loads(data).get("contextId") or None
+            if (refreshed.remote_task_id != scope.remote_task_id or
+                    refreshed.remote_context_id != task_context or
+                    (scope.remote_context_id is not None and
+                     refreshed.remote_context_id != scope.remote_context_id)):
+                raise DomainError("forbidden", 403)
+            current=_load_run(db,request.run_id,lock=True)
+            operation=db.execute(text("SELECT * FROM operations WHERE run_id=:run AND operation_id=:op FOR UPDATE"),
+                                 {"run":request.run_id,"op":request.operation_id}).one()
+            if current.generation!=generation or operation.state!="unknown" or operation.payload_hash.strip()!=_fingerprint(request):
+                raise DomainError("forbidden",403)
+            ref=_persist(db,request.run_id,data,"application/json")
+            staged=dict(operation.result or {})
+            staged["ref"]=ref.model_dump(mode="json")
+            staged["peer_task_terminal"]=json.loads(data).get("status",{}).get("state") in {
+                "TASK_STATE_COMPLETED","TASK_STATE_FAILED","TASK_STATE_CANCELED","TASK_STATE_REJECTED"}
+            db.execute(text("UPDATE operations SET result=CAST(:result AS jsonb) WHERE run_id=:run AND operation_id=:op AND state='unknown'"),
+                       {"run":request.run_id,"op":request.operation_id,"result":json.dumps(staged,separators=(",",":"))})
+            db.commit()
+    except Exception:
+        peer_receipt_runtime.mark_unknown(request.run_id,request.operation_id,"reconciliation_failed")
+        return OperationResult(operation_id=request.operation_id,state="unknown",result=None,usage_tokens=None)
+    # GetTask supplies no accounting contract. Reading/storing never settles tokens or resumes a run.
+    return OperationResult(operation_id=request.operation_id,state="unknown",result=ref,usage_tokens=None)
