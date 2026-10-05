@@ -1,6 +1,7 @@
 """Validated shared API and persistence contracts; run as a module to publish TS/JSON."""
 
 import json
+from hashlib import sha256
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union
@@ -14,6 +15,16 @@ class Contract(BaseModel):
 
 
 ShortText = Annotated[str, Field(min_length=1, max_length=200)]
+
+
+def canonical_peer_parameters_bytes(parameters: dict[str, Any]) -> bytes:
+    """Canonical UTF-8 JSON bytes for the immutable SDK parameter object."""
+    if not isinstance(parameters, dict) or any(not isinstance(key, str) for key in parameters):
+        raise ValueError("approved peer parameters must be a JSON object")
+    try:
+        return json.dumps(parameters, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("approved peer parameters must contain only finite JSON values") from exc
 
 
 class Principal(Contract):
@@ -42,6 +53,48 @@ class PackageSpec(Contract):
     sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
 
 
+class PeerDataRef(Contract):
+    """One immutable, project-scoped input captured in a run snapshot."""
+
+    kind: Literal["file", "finding"]
+    record_id: UUID
+    version_digest: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
+
+
+class PeerReleaseSpec(Contract):
+    """Narrow owner-approved release and bounded A2A request parameters."""
+
+    release_id: UUID
+    peer_id: UUID
+    endpoint_fingerprint: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
+    purpose: str = Field(min_length=1, max_length=1000)
+    input_snapshot_digest: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
+    data_refs: list[PeerDataRef] = Field(default_factory=list, max_length=100)
+    approved_parameters: dict[str, Any]
+    parameters_sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
+    message_id: str = Field(min_length=1, max_length=200)
+    method: Literal["SendMessage"] = "SendMessage"
+    allow_get_task: bool = False
+    request_bytes_limit: int = Field(ge=1, le=1_048_576)
+    timeout_ms: int = Field(ge=1, le=30_000)
+    reserved_tokens: int = Field(ge=0, le=1_000_000)
+    reconciliation_limit: int = Field(ge=1, le=10)
+
+    @model_validator(mode="after")
+    def validate_release(self):
+        if not self.purpose.strip() or not self.message_id.strip():
+            raise ValueError("peer release purpose and message_id must not be blank")
+        identities = [(ref.kind, ref.record_id) for ref in self.data_refs]
+        if len(identities) != len(set(identities)):
+            raise ValueError("peer release data references must be unique")
+        body = canonical_peer_parameters_bytes(self.approved_parameters)
+        if len(body) > self.request_bytes_limit:
+            raise ValueError("approved peer parameters exceed request_bytes_limit")
+        if sha256(body).hexdigest() != self.parameters_sha256.lower():
+            raise ValueError("approved peer parameters sha256 does not match parameters_sha256")
+        return self
+
+
 class PlanSpec(Contract):
     input_snapshot_digest: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
     provider_id: UUID
@@ -50,6 +103,7 @@ class PlanSpec(Contract):
     allowed_ops: list[ShortText] = Field(max_length=100)
     data_recipients: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(max_length=100)
     packages: list[PackageSpec] = Field(max_length=200)
+    peer_releases: list[PeerReleaseSpec] = Field(default_factory=list, max_length=20, exclude_if=lambda value: not value)
     token_limit: int = Field(ge=0)
     elapsed_limit_ms: int = Field(ge=0)
 
@@ -293,7 +347,7 @@ class DecisionSubmit(Contract):
         return self
 
 
-MODELS = (Principal, APIError, ObjectRef, PackageSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
+MODELS = (Principal, APIError, ObjectRef, PackageSpec, PeerDataRef, PeerReleaseSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
 
 
 def _ts_type(schema: dict[str, Any]) -> str:

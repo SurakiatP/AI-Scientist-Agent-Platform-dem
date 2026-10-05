@@ -26,6 +26,30 @@ export interface PackageSpec {
   sha256: string;
 }
 
+export interface PeerDataRef {
+  kind: "file" | "finding";
+  record_id: string;
+  version_digest: string;
+}
+
+export interface PeerReleaseSpec {
+  release_id: string;
+  peer_id: string;
+  endpoint_fingerprint: string;
+  purpose: string;
+  input_snapshot_digest: string;
+  data_refs?: PeerDataRef[];
+  approved_parameters: Record<string, unknown>;
+  parameters_sha256: string;
+  message_id: string;
+  method?: "SendMessage";
+  allow_get_task?: boolean;
+  request_bytes_limit: number;
+  timeout_ms: number;
+  reserved_tokens: number;
+  reconciliation_limit: number;
+}
+
 export interface PlanSpec {
   input_snapshot_digest: string;
   provider_id: string;
@@ -34,6 +58,7 @@ export interface PlanSpec {
   allowed_ops: string[];
   data_recipients: string[];
   packages: PackageSpec[];
+  peer_releases?: PeerReleaseSpec[];
   token_limit: number;
   elapsed_limit_ms: number;
 }

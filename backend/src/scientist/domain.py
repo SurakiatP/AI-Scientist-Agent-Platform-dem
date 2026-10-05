@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from scientist.auth import DomainError, authorize
 from scientist.contracts import ArtifactView, CitationView, DecisionSubmit, FileView, FindingView, PendingDecisionView, PlanSpec, PlanView, MessageView, Principal, ProjectView, RunEvent, RunView, SessionView
+from scientist.contracts import canonical_peer_parameters_bytes
 from scientist import limits, settings
 
 _SNAPSHOT_MAX_BYTES = 1024 * 1024
@@ -90,6 +91,7 @@ def revise_plan(db: Session, owner: Principal, run_id: UUID, expected_revision: 
     snapshot_digest = db.execute(text("SELECT digest FROM input_snapshots WHERE run_id = :run"), {"run": run_id}).scalar_one()
     if plan.input_snapshot_digest != snapshot_digest:
         raise DomainError("revision_conflict", 409)
+    _validate_peer_releases(db, run_id, row.project_id, plan)
     allowed = settings.allowed_recipients(plan.provider_id)  # data_recipients come from configuration only; peers are checked by the broker
     if any(r not in allowed and not r.startswith("peer:") for r in plan.data_recipients):
         raise DomainError("data_destinations_not_configured", 409)
@@ -113,6 +115,7 @@ def approve_run(db: Session, owner: Principal, run_id: UUID, expected_revision: 
         "run": run_id, "revision": row.revision,
     }).scalar_one()
     plan = PlanSpec.model_validate(plan_record)
+    _validate_peer_releases(db, run_id, row.project_id, plan)
     db.execute(text("INSERT INTO approvals (id, run_id, revision, project_id, owner_identity, plan_digest) VALUES (:id, :run, :revision, :project, :owner, :digest)"), {
         "id": uuid4(), "run": run_id, "revision": row.revision, "project": row.project_id,
         "owner": owner.identity, "digest": plan_digest,
@@ -469,6 +472,169 @@ def _event(db: Session, run_id: UUID, revision: int, kind: str, payload: dict[st
 
 def _plan_digest(plan: PlanSpec) -> str:
     return _digest(plan.model_dump(mode="json"))
+
+
+def _validate_peer_releases(db: Session, run_id: UUID, project_id: UUID, plan: PlanSpec) -> None:
+    if not plan.peer_releases:
+        return
+    snapshot = db.execute(text(
+        "SELECT digest, manifest FROM input_snapshots WHERE run_id = :run AND project_id = :project"
+    ), {"run": run_id, "project": project_id}).one_or_none()
+    if snapshot is None:
+        raise DomainError("peer_release_data_unavailable", 409)
+    digest = snapshot.digest.strip().lower()
+    manifest = snapshot.manifest
+    release_ids = [release.release_id for release in plan.peer_releases]
+    if len(release_ids) != len(set(release_ids)):
+        raise DomainError("peer_release_invalid", 400)
+    message_keys = [(release.peer_id, release.message_id) for release in plan.peer_releases]
+    if len(message_keys) != len(set(message_keys)):
+        raise DomainError("peer_release_invalid", 400)
+    for release in plan.peer_releases:
+        if release.input_snapshot_digest.lower() != digest or plan.input_snapshot_digest.lower() != digest:
+            raise DomainError("revision_conflict", 409)
+        _validate_peer_sdk_parameters(release)
+        for ref in release.data_refs:
+            if ref.kind == "file":
+                captured = next((item for item in manifest.get("files", []) if item.get("id") == str(ref.record_id)), None)
+            else:
+                captured = next((item for item in manifest.get("findings", []) if item.get("id") == str(ref.record_id)), None)
+            version_digest = peer_data_version_digest(ref.kind, captured) if captured else None
+            if version_digest is None or version_digest.lower() != ref.version_digest.lower():
+                raise DomainError("peer_release_data_unavailable", 409)
+
+
+def _validate_peer_sdk_parameters(release) -> None:
+    """Parse the exact pinned SDK SendMessage shape only at domain validation time."""
+    try:
+        from google.protobuf.json_format import MessageToDict, ParseDict
+        from a2a.types import a2a_pb2 as a2a
+
+        request = ParseDict(release.approved_parameters, a2a.SendMessageRequest())
+        normalized = MessageToDict(request)
+    except Exception as exc:
+        raise DomainError("peer_release_parameters_invalid", 400) from exc
+    if canonical_peer_parameters_bytes(normalized) != canonical_peer_parameters_bytes(release.approved_parameters):
+        raise DomainError("peer_release_parameters_invalid", 400)
+    if (not request.HasField("message") or request.message.message_id != release.message_id or
+            request.message.role != a2a.ROLE_USER or request.tenant or request.message.task_id or
+            not request.message.parts or request.configuration.HasField("task_push_notification_config")):
+        raise DomainError("peer_release_parameters_invalid", 400)
+    for part in request.message.parts:
+        if part.WhichOneof("content") != "text" or part.metadata or part.filename or part.media_type:
+            raise DomainError("peer_release_parameters_invalid", 400)
+
+
+def peer_data_version_digest(kind: str, captured: dict[str, Any]) -> str:
+    """Return the stable version digest for one record in an immutable run snapshot."""
+    if kind == "file":
+        return str(captured.get("sha256", "")).lower()
+    if kind == "finding":
+        # Finding versions have no mutable row revision. Hash the canonical
+        # captured finding, including its selected citations and artifact ref.
+        return _digest(captured)
+    raise ValueError("unsupported peer data reference kind")
+
+
+def prepare_peer_receipt(db: Session, run_id: UUID, operation_id: str, release_id: UUID) -> None:
+    """Persist the approved message binding before any peer network request."""
+    run = db.execute(text("SELECT project_id, revision, plan_digest FROM runs WHERE id = :run FOR UPDATE"), {"run": run_id}).one_or_none()
+    if run is None:
+        raise DomainError("not_found", 404)
+    operation = db.execute(text(
+        "SELECT kind, state FROM operations WHERE run_id = :run AND operation_id = :operation FOR UPDATE"
+    ), {"run": run_id, "operation": operation_id}).one_or_none()
+    if operation is None or operation.kind != "peer":
+        raise DomainError("peer_operation_missing", 409)
+    prior = db.execute(text(
+        "SELECT release_id, peer_id, message_id FROM peer_outbound_receipts WHERE run_id = :run AND operation_id = :operation"
+    ), {"run": run_id, "operation": operation_id}).one_or_none()
+    plan_record = db.execute(text(
+        "SELECT plan FROM plan_revisions WHERE run_id = :run AND revision = :revision AND project_id = :project"
+    ), {"run": run_id, "revision": run.revision, "project": run.project_id}).scalar_one_or_none()
+    approved = db.execute(text(
+        "SELECT 1 FROM approvals WHERE run_id = :run AND revision = :revision AND project_id = :project AND plan_digest = :digest"
+    ), {"run": run_id, "revision": run.revision, "project": run.project_id, "digest": run.plan_digest}).scalar_one_or_none()
+    if plan_record is None or approved is None:
+        raise DomainError("peer_release_unapproved", 409)
+    plan = PlanSpec.model_validate(plan_record)
+    _validate_peer_releases(db, run_id, run.project_id, plan)
+    release = next((item for item in plan.peer_releases if item.release_id == release_id), None)
+    if release is None:
+        raise DomainError("peer_release_unapproved", 409)
+    if prior is not None:
+        if (prior.release_id, prior.peer_id, prior.message_id) != (release.release_id, release.peer_id, release.message_id):
+            raise DomainError("peer_operation_conflict", 409)
+        return
+    if operation.state != "reserved":
+        raise DomainError("peer_operation_not_dispatchable", 409)
+    # Serialize competing operation IDs before checking durable release/message uniqueness.
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": f"peer-release:{run_id}:{release.release_id}"})
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": f"peer-message:{release.peer_id}:{release.message_id}"})
+    release_owner = db.execute(text(
+        "SELECT operation_id FROM peer_outbound_receipts WHERE run_id=:run AND release_id=:release"
+    ), {"run": run_id, "release": release.release_id}).scalar_one_or_none()
+    if release_owner is not None:
+        raise DomainError("peer_release_already_prepared", 409)
+    message_owner = db.execute(text(
+        "SELECT run_id, operation_id FROM peer_outbound_receipts WHERE peer_id=:peer AND message_id=:message"
+    ), {"peer": release.peer_id, "message": release.message_id}).one_or_none()
+    if message_owner is not None:
+        raise DomainError("peer_message_already_prepared", 409)
+    db.execute(text("""
+        INSERT INTO peer_outbound_receipts
+            (run_id, project_id, operation_id, release_id, peer_id, message_id,
+             endpoint_fingerprint, parameters_sha256, state)
+        VALUES (:run, :project, :operation, :release, :peer, :message,
+                :endpoint, :parameters, 'prepared')
+    """), {
+        "run": run_id, "project": run.project_id, "operation": operation_id,
+        "release": release.release_id, "peer": release.peer_id,
+        "message": release.message_id, "endpoint": release.endpoint_fingerprint.lower(),
+        "parameters": release.parameters_sha256.lower(),
+    })
+
+
+def record_peer_remote_identity(
+    db: Session,
+    run_id: UUID,
+    operation_id: str,
+    remote_task_id: str | None = None,
+    remote_context_id: str | None = None,
+) -> None:
+    """Record each returned remote identity monotonically, before result storage."""
+    if (remote_task_id is None and remote_context_id is None) or any(
+        value is not None and (not value.strip() or len(value) > 200)
+        for value in (remote_task_id, remote_context_id)
+    ):
+        raise DomainError("peer_identity_invalid", 400)
+    receipt = db.execute(text(
+        "SELECT remote_task_id, remote_context_id FROM peer_outbound_receipts WHERE run_id=:run AND operation_id=:operation FOR UPDATE"
+    ), {"run": run_id, "operation": operation_id}).one_or_none()
+    if receipt is None:
+        raise DomainError("peer_receipt_missing", 409)
+    if ((receipt.remote_task_id is not None and remote_task_id not in (None, receipt.remote_task_id)) or
+            (receipt.remote_context_id is not None and remote_context_id not in (None, receipt.remote_context_id))):
+        raise DomainError("peer_identity_conflict", 409)
+    db.execute(text("""
+        UPDATE peer_outbound_receipts
+        SET remote_task_id = COALESCE(remote_task_id, :task),
+            remote_context_id = COALESCE(remote_context_id, :context),
+            state = CASE WHEN COALESCE(remote_task_id, :task) IS NOT NULL THEN 'accepted' ELSE state END
+        WHERE run_id=:run AND operation_id=:operation
+    """), {"task": remote_task_id, "context": remote_context_id, "run": run_id, "operation": operation_id})
+
+
+def mark_peer_receipt_unknown(db: Session, run_id: UUID, operation_id: str) -> None:
+    """Retain a prepared outbound binding when the remote outcome is unknown."""
+    updated = db.execute(text("""
+        UPDATE peer_outbound_receipts SET state='unknown'
+        WHERE run_id=:run AND operation_id=:operation AND state='prepared'
+    """), {"run": run_id, "operation": operation_id}).rowcount
+    if not updated:
+        exists = db.execute(text("SELECT 1 FROM peer_outbound_receipts WHERE run_id=:run AND operation_id=:operation"), {"run": run_id, "operation": operation_id}).scalar_one_or_none()
+        if exists is None:
+            raise DomainError("peer_receipt_missing", 409)
 
 
 def _digest(value: Any) -> str:
