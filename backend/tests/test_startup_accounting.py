@@ -112,6 +112,8 @@ class _ObservedDispatchEngine:
             self.created = True
             return self.container_id
         if command == "inspect":
+            if "NetworkSettings" in args[2]:
+                return "{}"  # no extra (egress) network attached
             if self.verification == "image-mismatch":
                 return "sha256:" + "f" * 64 + "|" + self.image
             if self.created:

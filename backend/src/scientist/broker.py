@@ -580,7 +580,7 @@ def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: Oper
             raise DomainError("forbidden", 403)
         return DispatchTarget("llm", recipient, tuple(plan.data_recipients), plan.provider_id, model=plan.model)
     elif request.kind == "search":
-        _reject_fields(payload, {"url", "query", "timeout_seconds"})
+        _reject_fields(payload, {"url", "timeout_seconds"})
         url = payload.get("url")
         if not isinstance(url, str):
             raise DomainError("forbidden", 400)
@@ -654,6 +654,9 @@ def _approved_recipient(plan: PlanSpec, recipient: object) -> None:
 def _validate_url(url: object, recipients: list[str], *, allow_lan: bool = False) -> tuple[str, int, str, str]:
     if not isinstance(url, str) or len(url) > 2048:
         raise DomainError("forbidden", 403)
+    # urlsplit strips \t\r\n and accepts spaces/NUL/non-ASCII; http.client would then fail after reservation.
+    if not url.isascii() or any(c <= " " or c == "\x7f" for c in url):
+        raise DomainError("forbidden", 403)
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise DomainError("forbidden", 403)
@@ -723,6 +726,8 @@ def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[b
             )
         except ModelPayloadError as exc:
             raise DomainError("forbidden", 400) from exc
+    elif target.kind in {"search", "package"}:
+        outbound = {}  # public GET: the validated URL carries the query; no body is ever sent
     else:
         body_fields = {"credential_id", "url", "source", "endpoint", "destination", "recipient", "provider_id", "model", "peer_id", "timeout_seconds"}
         outbound = {key: value for key, value in request.payload.items() if key not in body_fields}
@@ -732,7 +737,7 @@ def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[b
     timeout = min(float(request.payload.get("timeout_seconds", _MAX_TIMEOUT_SECONDS)), _MAX_HTTP_TOTAL_SECONDS)
     deadline = time.monotonic() + timeout
     connection = _PinnedHTTPSConnection(host, ip, port, timeout)
-    headers = {"Content-Type": "application/json", "Host": host}
+    headers = {"Host": host} if target.kind in {"search", "package"} else {"Content-Type": "application/json", "Host": host}
     if target.kind == "llm" and target.credential_id is not None:
         secret = read_secret(_active_session.get(), target.credential_id)
         headers["Authorization"] = f"Bearer {secret}"
@@ -743,16 +748,16 @@ def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[b
     try:
         if time.monotonic() >= deadline:
             raise DomainError("provider_unavailable", 502)
-        connection.request("GET" if target.kind == "package" else "POST", path,
-                           body=None if target.kind == "package" else body, headers=headers)
+        get = target.kind in {"search", "package"}
+        connection.request("GET" if get else "POST", path, body=None if get else body, headers=headers)
         response = connection.getresponse()
         if response.status < 200 or response.status >= 300 or response.getheader("Location"):
             raise DomainError("provider_unavailable", 502)
         data = response.read(_MAX_RESPONSE_BYTES + 1)
-        if len(data) > _MAX_RESPONSE_BYTES or time.monotonic() > deadline:
-            raise DomainError("provider_unavailable", 502)
-        if target.kind == "package":
-            return data, 0
+        if len(data) > _MAX_RESPONSE_BYTES or time.monotonic() > deadline or getattr(response, "length", None):
+            raise DomainError("provider_unavailable", 502)  # oversize, late, or Content-Length bytes still outstanding
+        if target.kind in {"search", "package"}:
+            return data, 0  # raw bytes: public APIs return lists, XML or text, not an OperationResult object
         payload = json.loads(data)
         usage = payload.get("usage_tokens", payload.get("usage", {}).get("total_tokens"))
         if target.kind != "llm" and usage is None:

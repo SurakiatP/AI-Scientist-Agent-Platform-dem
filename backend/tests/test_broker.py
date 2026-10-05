@@ -1342,3 +1342,139 @@ def test_stop_queued_with_reserved_op_unproven_fence_waits(broker_fixture, monke
     supervisor.stop(db, run_id, 1)
     run = db.execute(text("SELECT state, waiting_reason FROM runs WHERE id=:r"), {"r": run_id}).one()
     assert (run.state, run.waiting_reason) == ("waiting_input", "executor_quiescence_unproven")
+
+
+def _search_connection(monkeypatch, body=b'[{"title":"x"}]', constructed=None):
+    captured = {}
+
+    class Response:
+        status = 200
+        def getheader(self, name):
+            return None
+        def read(self, limit):
+            return body
+
+    class Connection:
+        def __init__(self, host, ip, port, timeout):
+            if constructed is not None:
+                constructed.append(1)
+            captured["target"] = (host, port, ip)
+        def request(self, method, path, body=None, headers=None):
+            captured.update(method=method, path=path, body=body, headers=headers)
+        def getresponse(self):
+            return Response()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(broker, "_PinnedHTTPSConnection", Connection)
+    return captured
+
+
+def test_search_uses_get_without_body_and_preserves_query(broker_fixture, monkeypatch):
+    db, _, run_id, _, stored = broker_fixture
+    monkeypatch.setattr(broker, "_transport", None)
+    captured = _search_connection(monkeypatch, body=b'[{"title":"x"}]')
+    url = "https://research.example/works?query=a%20b&rows=2&filter=from-pub-date:2020"
+    req = request(run_id, "get-search").model_copy(update={"payload": {"url": url}})
+    result = broker.execute(db, broker.issue_capability(db, run_id, 1, 300), req)
+    assert result.state == "committed"
+    assert captured["method"] == "GET"
+    assert captured["body"] is None
+    assert captured["path"] == "/works?query=a%20b&rows=2&filter=from-pub-date:2020"
+    assert list(stored.values()) == [b'[{"title":"x"}]']
+    assert db.execute(text("SELECT usage_tokens FROM runs WHERE id = :run"), {"run": run_id}).scalar_one() == 0
+
+
+def test_search_non_json_response_is_stored(broker_fixture, monkeypatch):
+    db, _, run_id, _, stored = broker_fixture
+    monkeypatch.setattr(broker, "_transport", None)
+    _search_connection(monkeypatch, body=b"<xml>not json</xml>")
+    broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id, "xml-search"))
+    assert list(stored.values()) == [b"<xml>not json</xml>"]
+
+
+def test_search_oversized_response_is_refused(broker_fixture, monkeypatch):
+    db, _, run_id, _, stored = broker_fixture
+    monkeypatch.setattr(broker, "_transport", None)
+    _search_connection(monkeypatch, body=b"x" * (2 * 1024 * 1024 + 1))
+    result = broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id, "big-search"))
+    assert result.state != "committed"
+    assert not stored
+
+
+@pytest.mark.parametrize("url,resolver_calls", [
+    ("https://unconfigured.example/works", 0),
+    ("https://research.example:8443/works", 0),
+    ("http://research.example/works", 0),
+    ("https://user:pw@research.example/works", 0),
+    ("https://169.254.169.254/latest", 0),
+    ("https://research.example/works", 1),  # resolves to a private address
+])
+def test_search_refused_before_dns_or_connection(broker_fixture, monkeypatch, url, resolver_calls):
+    db, _, run_id, _, stored = broker_fixture
+    monkeypatch.setattr(broker, "_transport", None)
+    constructed, calls = [], []
+    _search_connection(monkeypatch, constructed=constructed)
+    private = resolver_calls == 1
+    monkeypatch.setattr(broker, "_resolver", lambda host, port: calls.append(host) or ["10.0.0.5" if private else "8.8.8.8"])
+    req = request(run_id, "refused").model_copy(update={"payload": {"url": url}})
+    with pytest.raises(DomainError) as err:
+        broker.execute(db, broker.issue_capability(db, run_id, 1, 300), req)
+    assert err.value.args[0] == "forbidden"
+    assert len(calls) == resolver_calls
+    assert constructed == []
+    assert db.execute(text("SELECT count(*) FROM operations WHERE run_id = :run"), {"run": run_id}).scalar_one() == 0
+    assert db.execute(text("SELECT reserved_tokens FROM runs WHERE id = :run"), {"run": run_id}).scalar_one() == 0
+
+
+def test_search_rejects_query_payload_field(broker_fixture):
+    db, _, run_id, transport, _ = broker_fixture
+    req = request(run_id, "q-field").model_copy(update={"payload": {"url": "https://research.example/works", "query": "x"}})
+    with pytest.raises(DomainError) as err:
+        broker.execute(db, broker.issue_capability(db, run_id, 1, 300), req)
+    assert err.value.args[0] == "forbidden"
+    assert transport.calls == 0
+
+
+@pytest.mark.parametrize("suffix", ["?query=a b", "?query=é", "?query=a\tb", "?query=a\r\nb", "?query=a\x00b", "?q=\x7f"])
+def test_search_url_with_control_space_or_non_ascii_is_refused_before_reservation(broker_fixture, monkeypatch, suffix):
+    db, _, run_id, _, _ = broker_fixture
+    monkeypatch.setattr(broker, "_transport", None)
+    constructed = []
+    _search_connection(monkeypatch, constructed=constructed)
+    req = request(run_id, "bad-url").model_copy(update={"payload": {"url": "https://research.example/works" + suffix}})
+    with pytest.raises(DomainError) as err:
+        broker.execute(db, broker.issue_capability(db, run_id, 1, 300), req)
+    assert (err.value.code, err.value.status) == ("forbidden", 403)
+    assert constructed == []
+    assert db.execute(text("SELECT state FROM runs WHERE id = :run"), {"run": run_id}).scalar_one() == "running"
+    assert db.execute(text("SELECT count(*) FROM operations WHERE run_id = :run"), {"run": run_id}).scalar_one() == 0
+    assert db.execute(text("SELECT reserved_tokens FROM runs WHERE id = :run"), {"run": run_id}).scalar_one() == 0
+
+
+def test_search_truncated_body_is_not_committed(broker_fixture, monkeypatch):
+    db, _, run_id, _, stored = broker_fixture
+    monkeypatch.setattr(broker, "_transport", None)
+
+    class Response:
+        status = 200
+        length = 10  # bytes the server promised but never delivered
+        def getheader(self, name):
+            return None
+        def read(self, limit):
+            return b"partial"
+
+    class Connection:
+        def __init__(self, *args):
+            pass
+        def request(self, *args, **kwargs):
+            pass
+        def getresponse(self):
+            return Response()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(broker, "_PinnedHTTPSConnection", Connection)
+    result = broker.execute(db, broker.issue_capability(db, run_id, 1, 300), request(run_id, "truncated"))
+    assert result.state != "committed"
+    assert not stored

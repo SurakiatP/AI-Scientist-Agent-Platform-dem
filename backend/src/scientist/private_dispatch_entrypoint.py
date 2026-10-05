@@ -1,15 +1,19 @@
 """Private-only HTTP composition for a trusted per-run dispatch container."""
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 import stat
 import time
 from io import BytesIO
 from pathlib import Path
 import boto3
+from botocore.config import Config
 
 import uvicorn
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
 from scientist import broker, objects
 from scientist import checkpoints
@@ -36,6 +40,40 @@ def _read_secret(name: str) -> bytes:
     if not value:
         raise RuntimeError("private dispatch prerequisites unavailable")
     return value
+
+
+def _resolve_inside(host: str, port: int, subnet: ipaddress.IPv4Network, resolver) -> str:
+    """Resolve once; every answer must lie in the services subnet, so no name can leave it."""
+    try:
+        addresses = [ipaddress.ip_address(item.split("%", 1)[0]) for item in resolver(host, port)]
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("service host resolution failed") from exc
+    if not addresses or any(address not in subnet for address in addresses):
+        raise RuntimeError("service host resolves outside the services network")
+    return str(addresses[0])
+
+
+def _pin_database_url(service_subnet: str, database_url: str, require_auth: str, *, resolver=None) -> str:
+    """Database url with hostaddr + require_auth from one in-subnet resolution (shared with the readiness probe)."""
+    resolver = resolver or (lambda host, port: [item[4][0] for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)])
+    subnet = ipaddress.ip_network(service_subnet)
+    url = make_url(database_url)
+    query_host = url.query.get("host", "")
+    hosts = ([url.host] if url.host else []) + (query_host.split(",") if isinstance(query_host, str) and query_host else [])
+    if (len(hosts) != 1 or not isinstance(query_host, str) or "," in hosts[0] or hosts[0].startswith("/")
+            or "hostaddr" in url.query or "require_auth" in url.query):
+        raise RuntimeError("database url must name exactly one TCP service host without hostaddr or require_auth")
+    db_ip = _resolve_inside(hosts[0], url.port or 5432, subnet, resolver)
+    pinned = url.update_query_dict({"hostaddr": db_ip, "require_auth": require_auth}).render_as_string(hide_password=False)
+    return pinned
+
+
+def _pin_service_hosts(service_subnet: str, database_url: str, s3_host: str, s3_port: int, require_auth: str, *, resolver=None) -> tuple[str, str]:
+    """Return (pinned database url, S3 endpoint) built from IPs resolved exactly once."""
+    resolver = resolver or (lambda host, port: [item[4][0] for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)])
+    pinned = _pin_database_url(service_subnet, database_url, require_auth, resolver=resolver)
+    subnet = ipaddress.ip_network(service_subnet)
+    return pinned, f"http://{_resolve_inside(s3_host, s3_port, subnet, resolver)}:{s3_port}"
 
 
 def _wait_for_active_executor(identity: DispatchIdentity, container_id: str, timeout: float = 60.0) -> None:
@@ -111,17 +149,20 @@ def create_dispatch_app(identity: DispatchIdentity):
 def main() -> None:
     config = parse_dispatch_config(_CONFIG.read_bytes())
     secret_values = {name: _read_secret(name).decode("utf-8") for name in config.secret_files}
+    database_url, s3_endpoint = secret_values["database_url"], "http://scientist-minio:9000"
+    if config.service_subnet is not None:  # egress is attached: bind to IPs resolved once inside the services subnet
+        database_url, s3_endpoint = _pin_service_hosts(config.service_subnet, database_url, "scientist-minio", 9000, config.db_require_auth)
     # Runtime modules use these only inside this trusted private process.
-    os.environ["SCIENTIST_DATABASE_URL"] = secret_values["database_url"]
-    database.DATABASE_URL = secret_values["database_url"]
+    os.environ["SCIENTIST_DATABASE_URL"] = database_url
+    database.DATABASE_URL = database_url
     os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(_SECRETS / "master_key")
     os.environ["SCIENTIST_S3_ACCESS_KEY"] = secret_values["s3_access_key"]
     os.environ["SCIENTIST_S3_SECRET_KEY"] = secret_values["s3_secret_key"]
     os.environ["SCIENTIST_BROKER_CAPABILITY_KEY"] = secret_values["broker_capability_key"]
-    os.environ["SCIENTIST_S3_ENDPOINT"] = "http://scientist-minio:9000"
+    os.environ["SCIENTIST_S3_ENDPOINT"] = s3_endpoint
     os.environ["SCIENTIST_OBJECT_BUCKET"] = "scientist-b5"
     objects.configure(boto3.client(
-        "s3", endpoint_url="http://scientist-minio:9000",
+        "s3", endpoint_url=s3_endpoint, config=Config(s3={"addressing_style": "path"}),
         aws_access_key_id=secret_values["s3_access_key"],
         aws_secret_access_key=secret_values["s3_secret_key"], region_name="us-east-1",
     ), bucket="scientist-b5")

@@ -338,6 +338,8 @@ _real_open = builtins.open
 def _open(path, *args, **kwargs):
     if path == "/run/scientist/secrets/database_url":
         return io.StringIO("postgresql+psycopg://synthetic@127.0.0.1/test")
+    if path == "/run/scientist/dispatch/config.json":
+        return io.StringIO("{}")  # no service_subnet: no egress, unpinned as before
     return _real_open(path, *args, **kwargs)
 builtins.open = _open
 """
@@ -558,3 +560,239 @@ def test_dispatch_result_persistence_receives_project_id(
 
     assert result.project_id == project_id
     assert calls == [(db, project_id, content, "application/octet-stream")]
+
+
+_EGRESS = "scientist-platform-egress"
+
+
+def _egress_config(egress):
+    from dataclasses import replace
+    return replace(_config(), egress_network=egress)
+
+
+@pytest.mark.parametrize("name", ["bridge", "host", "none", "scientist-run-x", "scientist-platform-services", "scientist-platform-egress-UP", "scientist-platform-egress-" + "a" * 41])
+def test_dispatch_config_rejects_non_allowlisted_egress_network(name):
+    with pytest.raises(ValueError):
+        _egress_config(name)
+
+
+@pytest.mark.parametrize("name", ["scientist-b5-egress-test", _EGRESS, _EGRESS + "-abc-1"])
+def test_dispatch_config_accepts_owned_egress_network(name):
+    assert _egress_config(name).egress_network == name
+
+
+_SERVICES = "scientist-b5-services-test"
+
+
+def _fake_docker(calls, *, egress=("bridge|false|b5|false"), attached=(_SERVICES,), subnet="172.30.0.0/24", created="c" * 64):
+    def docker(*args):
+        calls.append(args)
+        if args[0] == "create":
+            return created
+        if args[:2] == ("network", "inspect"):
+            if args[-1] == _SERVICES:
+                return subnet + " "
+            return egress
+        if args[0] == "inspect" and "NetworkSettings" in args[2]:
+            return json.dumps({name: {} for name in attached})
+        return ""
+    return docker
+
+
+def _start_calls(monkeypatch, config, **fake):
+    runtime = DockerDispatchRuntime(config)
+    calls = []
+    monkeypatch.setattr(runtime, "engine_id", lambda: "engine-1")
+    monkeypatch.setattr(runtime, "_verified_image_id", lambda: "sha256:" + "b" * 64)
+    monkeypatch.setattr(runtime, "_verify_container_image", lambda *a: None)
+    monkeypatch.setattr(runtime, "_materialize_launch_config", lambda *a, **k: calls.append(("materialize", k)) or "/tmp/launch.json")
+    monkeypatch.setattr(runtime, "_secret_mounts", lambda: [])
+    monkeypatch.setattr(runtime, "_ensure_run_network", lambda *a, **k: None)
+    monkeypatch.setattr(runtime, "_ref", lambda *a, **k: "ref")
+    fake.pop("existing", None)
+    monkeypatch.setattr(runtime, "find", lambda *a, **k: None)
+    monkeypatch.setattr(runtime, "_docker", _fake_docker(calls, **fake))
+    return runtime, calls
+
+
+def _run_start(runtime, existing=None):
+    try:
+        runtime.start(None, uuid4(), 1, "scientist-run-aaaaaaaaaaaa-g1", "172.29.42.2", uuid4(), uuid4(), before_mutation=lambda *a: None)
+    except RuntimeError:
+        pass  # post-start identity inspection is not the subject here
+
+
+def test_dispatch_create_attaches_egress_network_only_when_configured(monkeypatch):
+    runtime, calls = _start_calls(monkeypatch, _egress_config(_EGRESS))
+    _run_start(runtime)
+    create = next(c for c in calls if c[0] == "create")
+    assert create.count("--network") == 1 and create[create.index("--network") + 1] == _SERVICES
+    assert not any(_EGRESS in part for part in create)
+    connect = ("network", "connect", _EGRESS, "c" * 64)
+    order = [c[0] for c in calls]
+    assert order.index("create") < calls.index(connect) < order.index("start")
+
+
+@pytest.mark.parametrize("egress", ["overlay|false|b5|false", "bridge|true|b5|false", "bridge|false||false", "bridge|false|b5|true", "bridge|false|b5|"])
+def test_dispatch_refuses_unsafe_egress_network_before_any_mutation(monkeypatch, egress):
+    runtime, calls = _start_calls(monkeypatch, _egress_config(_EGRESS), egress=egress)
+    _run_start(runtime)
+    assert not any(c[0] in {"create", "start"} or c[:2] == ("network", "connect") for c in calls)
+
+
+def test_dispatch_launch_config_receives_service_subnet(monkeypatch):
+    runtime, calls = _start_calls(monkeypatch, _egress_config(_EGRESS))
+    _run_start(runtime)
+    assert next(c for c in calls if c[0] == "materialize")[1]["service_subnet"] == "172.30.0.0/24"
+
+
+def _existing_ref():
+    return ExecutorRef(uuid4(), uuid4(), 1, "dispatch", None, uuid4(), "engine-1", "d" * 64)
+
+
+def _restart(monkeypatch, config, attached):
+    ref = _existing_ref()
+    runtime, calls = _start_calls(monkeypatch, config, existing=ref, attached=attached)
+    monkeypatch.setattr(runtime, "find", lambda *a, **k: ref)
+    try:
+        runtime.start(None, ref.run_id, 1, "scientist-run-aaaaaaaaaaaa-g1", "172.29.42.2", ref.executor_id, ref.process_incarnation, before_mutation=lambda *a: None)
+    except RuntimeError:
+        pass
+    return ref, calls
+
+
+def test_dispatch_restart_connects_missing_egress_before_start(monkeypatch):
+    ref, calls = _restart(monkeypatch, _egress_config(_EGRESS), (_SERVICES,))
+    connect = ("network", "connect", _EGRESS, ref.container_id)
+    assert calls.index(connect) < calls.index(("start", ref.container_id))
+
+
+def test_dispatch_restart_disconnects_unconfigured_egress_before_start(monkeypatch):
+    ref, calls = _restart(monkeypatch, _config(), (_SERVICES, _EGRESS))
+    disconnect = ("network", "disconnect", _EGRESS, ref.container_id)
+    assert calls.index(disconnect) < calls.index(("start", ref.container_id))
+
+
+def test_dispatch_restart_with_matching_egress_changes_nothing(monkeypatch):
+    ref, calls = _restart(monkeypatch, _egress_config(_EGRESS), (_SERVICES, _EGRESS))
+    assert not any(c[:2] in {("network", "connect"), ("network", "disconnect")} for c in calls)
+
+
+def test_worker_create_has_single_run_network_and_no_egress(monkeypatch):
+    from types import SimpleNamespace
+    from scientist import supervisor
+    engine = supervisor.DockerWorkerEngine()
+    image_id = "sha256:" + "a" * 64
+    commands = []
+    monkeypatch.setattr(supervisor, "_require_config", lambda: SimpleNamespace(image=image_id, image_digest=image_id))
+    monkeypatch.setattr(engine, "engine_id", lambda: "owned-engine")
+
+    def docker(*args, **kwargs):
+        commands.append(args)
+        if args[:2] == ("image", "inspect"):
+            return image_id + "|[]"
+        if args[0] == "create":
+            return "b" * 64
+        return image_id
+    monkeypatch.setattr(engine, "_docker", docker)
+    try:
+        engine.create_worker(image_id, uuid4(), 1, uuid4(), uuid4(), "scientist-run-aaaaaaaaaaaa-g1", "http://172.29.32.2:8123")
+    except Exception:
+        pass
+    create = next(c for c in commands if c[0] == "create")
+    assert create.count("--network") == 1
+    assert create[create.index("--network") + 1].startswith("scientist-run-")
+    assert not any("egress" in part for part in create)
+
+
+def test_dispatch_without_egress_network_has_no_egress(monkeypatch):
+    runtime, calls = _start_calls(monkeypatch, _config())
+    _run_start(runtime)
+    assert not any("egress" in str(part) for call in calls for part in call)
+    assert any(c[0] == "start" for c in calls) and not any(c[:2] == ("network", "inspect") for c in calls)
+
+
+def test_launch_config_carries_service_subnet_and_scram_default():
+    base = dict(schema_version=1, run_id=uuid4(), generation=1, executor_id=uuid4(), process_incarnation=uuid4(), engine_id="e",
+                runtime_commit=RUNTIME_COMMIT, image_digest="sha256:" + "a" * 64, skills_digest="b" * 64, environment_digest="c" * 64,
+                provider_destinations={}, secret_files={n: n for n in __import__("scientist.dispatch_runtime", fromlist=["x"])._SECRET_NAMES})
+    identity = DispatchIdentity(**base, service_subnet="172.30.0.0/24")
+    assert identity.service_subnet == "172.30.0.0/24" and identity.db_require_auth == "scram-sha-256"
+    for bad in ("0.0.0.0/0", "fd00::/64", "not-a-net", "172.30.0.5/24"):
+        with pytest.raises(Exception):
+            DispatchIdentity(**base, service_subnet=bad)
+
+
+def _pin(db_url, resolved, subnet="172.30.0.0/24"):
+    return private_dispatch_entrypoint._pin_service_hosts(
+        subnet, db_url, "scientist-minio", 9000, "scram-sha-256", resolver=lambda host, port: resolved[host])
+
+
+def test_service_hosts_resolving_inside_subnet_are_pinned_to_ips():
+    resolved = {"scientist-minio": ["172.30.0.5"], "scientist-postgres": ["172.30.0.6"]}
+    url, endpoint = _pin("postgresql+psycopg://scientist-postgres/scientist", resolved)
+    assert endpoint == "http://172.30.0.5:9000"
+    assert "hostaddr=172.30.0.6" in url and "//scientist-postgres/" in url and "require_auth=scram-sha-256" in url
+
+
+@pytest.mark.parametrize("minio,postgres", [("8.8.8.8", "172.30.0.6"), ("172.30.0.5", "8.8.8.8"), ("172.30.1.5", "172.30.0.6")])
+def test_service_hosts_outside_subnet_refuse_startup(minio, postgres):
+    with pytest.raises(RuntimeError):
+        _pin("postgresql+psycopg://scientist-postgres/scientist", {"scientist-minio": [minio], "scientist-postgres": [postgres]})
+
+
+@pytest.mark.parametrize("url", [
+    "postgresql+psycopg://a,b/scientist", "postgresql+psycopg:///scientist?host=a,b", "postgresql+psycopg:///scientist?host=/var/run/postgresql",
+    "postgresql+psycopg://scientist-postgres/scientist?hostaddr=8.8.8.8", "postgresql+psycopg:///scientist"])
+def test_service_hosts_refuse_multi_host_socket_or_preset_hostaddr(url):
+    with pytest.raises(RuntimeError):
+        _pin(url, {"scientist-minio": ["172.30.0.5"], "scientist-postgres": ["172.30.0.6"], "a": ["172.30.0.7"], "b": ["172.30.0.8"]})
+
+
+def test_service_host_with_any_outside_address_is_refused():
+    with pytest.raises(RuntimeError):
+        _pin("postgresql+psycopg://scientist-postgres/scientist", {"scientist-minio": ["172.30.0.5", "8.8.8.8"], "scientist-postgres": ["172.30.0.6"]})
+
+
+def test_db_require_auth_is_only_scram():
+    base = dict(schema_version=1, run_id=uuid4(), generation=1, executor_id=uuid4(), process_incarnation=uuid4(), engine_id="e",
+                runtime_commit=RUNTIME_COMMIT, image_digest="sha256:" + "a" * 64, skills_digest="b" * 64, environment_digest="c" * 64,
+                provider_destinations={}, secret_files={n: n for n in __import__("scientist.dispatch_runtime", fromlist=["x"])._SECRET_NAMES})
+    for bad in ("md5", "password", "none", "gss"):
+        with pytest.raises(Exception):
+            DispatchIdentity(**base, db_require_auth=bad)
+
+
+def _run_probe(monkeypatch, tmp_path, answer, subnet="172.30.0.0/24"):
+    """Execute the real readiness-probe source against a stub psycopg and fake mounted files."""
+    import builtins, socket as socket_module, types
+    from scientist import dispatch_runtime
+    connected = []
+
+    class Connection:
+        @staticmethod
+        async def connect(url, **kwargs):
+            connected.append(url)
+            raise RuntimeError("stop after connect")
+
+    stub = types.ModuleType("psycopg")
+    stub.AsyncConnection = Connection
+    monkeypatch.setitem(sys.modules, "psycopg", stub)
+    files = {"/run/scientist/secrets/database_url": "postgresql+psycopg://scientist-postgres/scientist",
+             "/run/scientist/dispatch/config.json": json.dumps({"service_subnet": subnet, "db_require_auth": "scram-sha-256"})}
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda path, *a, **k: __import__("io").StringIO(files[path]) if path in files else real_open(path, *a, **k))
+    monkeypatch.setattr(socket_module, "getaddrinfo", lambda host, port, **k: [(0, 0, 0, "", (answer, port))])
+    monkeypatch.setattr(sys, "argv", ["probe", "172.29.42.2", "8123", "5", "e", "r", "1", "i", "eng", "c"])
+    with pytest.raises(SystemExit):
+        exec(compile(dispatch_runtime._READINESS_PROBE, "probe", "exec"), {"__name__": "probe"})
+    return connected
+
+
+def test_readiness_probe_connects_with_pinned_in_subnet_url(monkeypatch, tmp_path):
+    (url,) = _run_probe(monkeypatch, tmp_path, "172.30.0.6")
+    assert "hostaddr=172.30.0.6" in url and "require_auth=scram-sha-256" in url and url.startswith("postgresql://")
+
+
+def test_readiness_probe_refuses_outside_subnet_resolution(monkeypatch, tmp_path):
+    assert _run_probe(monkeypatch, tmp_path, "8.8.8.8") == []

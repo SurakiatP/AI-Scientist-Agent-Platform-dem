@@ -616,3 +616,19 @@ def test_main_signal_during_startup_recovery_skips_work_and_url(iso, tmp_path, m
             signal.signal(number, handler)
     assert order == ["bind"] and closed == [1]
     assert [t for t in threading.enumerate() if t.name == "scientist-host-loop"] == []
+
+
+def test_config_rejects_non_allowlisted_egress_network(tmp_path):
+    good = _config_dict(tmp_path)
+    for name in ("bridge", "host", "none", "scientist-run-x", "scientist-platform-services"):
+        with pytest.raises(host.ConfigError):
+            host.load_config(_write(tmp_path, {**good, "egress_network": name}, "bad.json"))
+
+
+def test_compose_passes_egress_network_to_dispatch(tmp_path):
+    base = _config_dict(tmp_path)
+    cfg = host.load_config(_write(tmp_path, {**base, "egress_network": "scientist-platform-egress"}))
+    assert cfg.egress_network == "scientist-platform-egress"
+    host.compose(cfg, engine=FakeEngine(), s3=FakeS3())
+    assert supervisor._config.dispatch.config.egress_network == "scientist-platform-egress"
+    assert host.load_config(_write(tmp_path, base, "none.json")).egress_network is None

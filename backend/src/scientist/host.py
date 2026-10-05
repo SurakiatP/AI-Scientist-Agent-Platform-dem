@@ -31,7 +31,7 @@ from scientist import broker, objects, settings, supervisor
 from scientist import db as database
 from scientist.app import create_app
 from scientist.contracts import PlanSpec
-from scientist.dispatch_runtime import _SECRET_NAMES, DispatchServiceConfig, DockerDispatchRuntime, _parse_template
+from scientist.dispatch_runtime import _SECRET_NAMES, DispatchServiceConfig, check_egress_network, DockerDispatchRuntime, _parse_template
 from scientist.domain import _event
 from scientist.private_worker_api import RuntimePins, WorkerController
 from scientist.runtime_contracts import RUNTIME_COMMIT, BootstrapMetadata, RuntimeContextV1
@@ -93,6 +93,7 @@ class HostConfig(BaseModel):
     worker_image: str
     dispatch_image: str
     service_network: str
+    egress_network: str | None = None
     skills_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     environment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     s3_endpoint: str
@@ -117,6 +118,13 @@ class HostConfig(BaseModel):
         if (url.drivername != "postgresql+psycopg" or url.password is not None or url.username is not None
                 or set(url.query) - {"host", "port", "dbname"} or not local):
             raise ValueError("database url must be a passwordless local postgresql+psycopg url")
+        return value
+
+    @field_validator("egress_network")
+    @classmethod
+    def _egress(cls, value: str | None) -> str | None:
+        if value is not None:
+            check_egress_network(value)
         return value
 
     @field_validator("worker_image", "dispatch_image")
@@ -238,7 +246,7 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
         raise HostError("launcher_dir") from None
     dispatch = DockerDispatchRuntime(DispatchServiceConfig(
         image=cfg.dispatch_image, image_digest=_IMAGE.fullmatch(cfg.dispatch_image).group(1),
-        service_network=cfg.service_network, config_path="/run/scientist/dispatch/config.json",
+        service_network=cfg.service_network, egress_network=cfg.egress_network, config_path="/run/scientist/dispatch/config.json",
         secrets_dir="/run/scientist/secrets", host_config_file=str(template_path),
         host_secrets_dir=str(cfg.secrets_dir), launcher_dir=str(launcher)), engine=engine)
 

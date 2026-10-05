@@ -100,6 +100,10 @@ executor_id, run_id, generation, incarnation, engine_id, container_id = sys.argv
 deadline = time.monotonic() + budget
 ''' + _READINESS_SOCKET_CODE + r'''async def main():
     url = open("/run/scientist/secrets/database_url", encoding="utf-8").read().strip()
+    launch = json.load(open("/run/scientist/dispatch/config.json", encoding="utf-8"))
+    if launch.get("service_subnet"):  # egress attached: same single in-subnet resolution + SCRAM as the entrypoint
+        from scientist.private_dispatch_entrypoint import _pin_database_url
+        url = _pin_database_url(launch["service_subnet"], url, launch.get("db_require_auth", "scram-sha-256"))
     if url.startswith("postgresql+psycopg://"):
         url = "postgresql://" + url[len("postgresql+psycopg://"):]
     if not url.startswith(("postgresql://", "postgres://")):
@@ -154,6 +158,18 @@ class DispatchIdentity(BaseModel):
     environment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     provider_destinations: Mapping[UUID, str] = Field(max_length=32)
     secret_files: dict[str, str]
+    # Launch-only (not in the static template): services subnet the entrypoint must pin its clients inside.
+    service_subnet: str | None = None
+    db_require_auth: str = Field(default="scram-sha-256", pattern=r"^scram-sha-256$")
+
+    @field_validator("service_subnet")
+    @classmethod
+    def validate_subnet(cls, value: str | None) -> str | None:
+        if value is not None:
+            net = ipaddress.ip_network(value, strict=True)
+            if net.version != 4 or not net.is_private or net.prefixlen < 16:
+                raise ValueError("service subnet must be a private IPv4 network")
+        return value
 
     @field_validator("provider_destinations")
     @classmethod
@@ -257,6 +273,12 @@ def _parse_template(data: bytes) -> DispatchTemplate:
         raise ValueError("invalid trusted dispatch template") from exc
 
 
+def check_egress_network(name: str | None) -> None:
+    if name is not None and name not in {"scientist-b5-egress-test", "scientist-platform-egress"} \
+            and not re.fullmatch(r"scientist-platform-egress-[a-z0-9-]{1,40}", name):
+        raise ValueError("dispatch may join only an owned egress network")
+
+
 @dataclass(frozen=True)
 class DispatchServiceConfig:
     image: str
@@ -268,8 +290,10 @@ class DispatchServiceConfig:
     host_config_file: str = "/run/host-scientist/dispatch/config.json"
     host_secrets_dir: str = "/run/host-scientist/secrets"
     launcher_dir: str = "/run/host-scientist/dispatch-launches"
+    egress_network: str | None = None  # absent: dispatch has no internet path and search fails closed
 
     def __post_init__(self) -> None:
+        check_egress_network(self.egress_network)
         if not re.fullmatch(r"[^\s@]+@sha256:[a-f0-9]{64}", self.image) or not self.image.endswith("@" + self.image_digest):
             raise ValueError("dispatch image must be pinned by its configured digest")
         if self.service_network not in {"scientist-b5-services-test", "scientist-platform-services"} and not re.fullmatch(r"scientist-platform-services-[a-z0-9-]{1,40}", self.service_network):
@@ -351,7 +375,7 @@ class DockerDispatchRuntime:
             raise RuntimeError("owned Docker engine version changed")
         return engine_id
 
-    def _materialize_launch_config(self, run_id: UUID, generation: int, executor_id: UUID, incarnation: UUID, engine_id: str) -> Path:
+    def _materialize_launch_config(self, run_id: UUID, generation: int, executor_id: UUID, incarnation: UUID, engine_id: str, *, service_subnet: str | None = None) -> Path:
         template_path = Path(self.config.host_config_file)
         try:
             template_stat = template_path.lstat()
@@ -379,6 +403,7 @@ class DockerDispatchRuntime:
             "executor_id": executor_id,
             "process_incarnation": incarnation,
             "engine_id": engine_id,
+            **({"service_subnet": service_subnet} if service_subnet is not None else {}),
         })
         path = launcher / f"dispatch-{run_id.hex}-g{generation}-{executor_id.hex}-{incarnation.hex}.json"
         content = launch.model_dump_json().encode("utf-8")
@@ -444,6 +469,7 @@ class DockerDispatchRuntime:
             raise RuntimeError("dispatch requires its reserved private bridge address")
         engine_id = self.engine_id()
         image_id = self._verified_image_id()
+        subnet = self._checked_egress_and_subnet()
         existing = self.find(db, run_id, generation, executor_id, None, process_incarnation)
         if existing is not None:
             if (existing.executor_id, existing.run_id, existing.generation, existing.kind,
@@ -452,11 +478,12 @@ class DockerDispatchRuntime:
                 raise RuntimeError("dispatch engine incarnation changed")
             self._verify_container_image(existing.container_id, image_id)
             before_mutation(engine_id, existing.container_id)
+            self._sync_egress_attachment(existing.container_id)
             self._docker("start", existing.container_id)
             self._ensure_run_network(network, existing.container_id, broker_ip)
             return existing
         labels = ["--label", f"{_RUN_LABEL}={run_id}", "--label", f"{_GEN_LABEL}={generation}", "--label", f"{_EXEC_LABEL}={executor_id}", "--label", f"{_KIND_LABEL}=dispatch", "--label", f"{_INC_LABEL}={process_incarnation}"]
-        launch_config = self._materialize_launch_config(run_id, generation, executor_id, process_incarnation, engine_id)
+        launch_config = self._materialize_launch_config(run_id, generation, executor_id, process_incarnation, engine_id, **({"service_subnet": subnet} if subnet else {}))
         mounts = ["--mount", f"type=bind,src={launch_config},dst={self.config.config_path},readonly", *self._secret_mounts()]
         before_mutation(engine_id, None)
         container_id = self._docker(
@@ -471,11 +498,47 @@ class DockerDispatchRuntime:
         if not re.fullmatch(r"[a-f0-9]{64}", container_id):
             raise RuntimeError("Docker returned an invalid dispatch container identity")
         self._ensure_run_network(network, container_id, broker_ip)
+        if self.config.egress_network is not None:
+            self._docker("network", "connect", self.config.egress_network, container_id)
         self._docker("start", container_id)
         details = self._docker("inspect", "--format", "{{.Id}}|{{.State.Running}}|{{index .Config.Labels \"scientist.platform/run\"}}|{{index .Config.Labels \"scientist.platform/generation\"}}|{{index .Config.Labels \"scientist.platform/executor\"}}|{{index .Config.Labels \"scientist.platform/kind\"}}|{{index .Config.Labels \"scientist.platform/incarnation\"}}|{{.Image}}|{{.Config.Image}}", container_id).split("|")
         if details != [container_id, "true", str(run_id), str(generation), str(executor_id), "dispatch", str(process_incarnation), image_id, self.config.image]:
             raise RuntimeError("dispatch start identity changed")
         return self._ref(run_id, generation, executor_id, process_incarnation, container_id, engine_id)
+
+    def _checked_egress_and_subnet(self) -> str | None:
+        """Fail closed unless the egress network is the owned, ICC-disabled bridge; return the services subnet to pin."""
+        if self.config.egress_network is None:
+            return None
+        try:
+            fields = self._docker("network", "inspect", "--format",
+                                  "{{.Driver}}|{{.Internal}}|{{index .Labels \"scientist.platform/egress\"}}|{{index .Options \"com.docker.network.bridge.enable_icc\"}}",
+                                  self.config.egress_network).split("|")
+            subnets = self._docker("network", "inspect", "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}", self.config.service_network).split()
+        except Exception as exc:
+            raise RuntimeError("dispatch egress or services network inspection failed") from exc
+        if len(fields) != 4 or fields[0] != "bridge" or fields[1] != "false" or not fields[2] or fields[3] != "false":
+            raise RuntimeError("dispatch egress network is not the owned ICC-disabled bridge")
+        v4 = [item for item in subnets if ":" not in item]
+        if len(v4) != 1:
+            raise RuntimeError("services network must expose exactly one IPv4 subnet")
+        return v4[0]
+
+    def _sync_egress_attachment(self, container_id: str) -> None:
+        try:
+            attached = set(json.loads(self._docker("inspect", "--format", "{{json .NetworkSettings.Networks}}", container_id)))
+        except Exception as exc:
+            raise RuntimeError("dispatch network attachment inspection failed") from exc
+        wanted = self.config.egress_network
+        for name in sorted(attached):
+            if name != wanted:
+                try:
+                    check_egress_network(name)
+                except ValueError:
+                    continue
+                self._docker("network", "disconnect", name, container_id)
+        if wanted is not None and wanted not in attached:
+            self._docker("network", "connect", wanted, container_id)
 
     def _verify_container_image(self, container_id: str, image_id: str) -> None:
         details = self._docker("inspect", "--format", "{{.Image}}|{{.Config.Image}}", container_id).split("|")
