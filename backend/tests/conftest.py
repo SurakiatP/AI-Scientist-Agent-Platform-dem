@@ -72,11 +72,19 @@ def project_session(db):
     return project_id, session_id
 
 
+class _AnyProvider(dict):
+    """Test default: every provider id resolves to the fixture destination."""
+
+    def get(self, key, default=None):
+        return "https://research.example"
+
+
 @pytest.fixture(autouse=True)
 def _configured_recipients(monkeypatch):
+    from scientist import settings
     # Plans may only name configured destinations; cover the hosts the fixtures use.
     monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", "https://alternate.example,https://packages.example")
-    monkeypatch.setenv("SCIENTIST_PROVIDER_ENDPOINT", "https://research.example")
+    monkeypatch.setattr(settings, "provider_destinations", lambda: _AnyProvider())
 
 
 @pytest.fixture(autouse=True)

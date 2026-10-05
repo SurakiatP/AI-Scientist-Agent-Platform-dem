@@ -138,7 +138,6 @@ def test_revision_conflicts_on_project_and_plan(client):
 
 def test_full_workflow_snapshot_plan_events_artifacts_publish(client, db, monkeypatch):
     monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", "https://api.scholar.example")
-    monkeypatch.setenv("SCIENTIST_PROVIDER_ENDPOINT", "https://llm.example")
     project = new_project(client)
     pid = project["id"]
     session = new_session(client, pid)
@@ -539,14 +538,13 @@ def test_rest_budget_extend_resumes_and_replays_without_second_extension(broker_
 
 def test_patch_plan_cannot_add_unconfigured_recipient(client, db, monkeypatch):
     monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", "https://api.scholar.example")
-    monkeypatch.setenv("SCIENTIST_PROVIDER_ENDPOINT", "https://llm.example")
     project = new_project(client)
     session = new_session(client, project["id"])
     run = submit(client, session["id"])
     plan = client.get(f"/api/v1/runs/{run['run_id']}/plan").json()["plan"]
     bad = client.patch(f"/api/v1/runs/{run['run_id']}/plan", json={"expected_revision": 1, "plan": {**plan, "data_recipients": ["https://evil.example"]}})
     assert (bad.status_code, bad.json()["code"]) == (409, "data_destinations_not_configured")
-    ok = client.patch(f"/api/v1/runs/{run['run_id']}/plan", json={"expected_revision": 1, "plan": {**plan, "data_recipients": ["https://llm.example", "peer:x"]}})
+    ok = client.patch(f"/api/v1/runs/{run['run_id']}/plan", json={"expected_revision": 1, "plan": {**plan, "data_recipients": ["https://research.example", "peer:x"]}})
     assert ok.status_code == 200
 
 

@@ -77,7 +77,7 @@ def revise_plan(db: Session, owner: Principal, run_id: UUID, expected_revision: 
     snapshot_digest = db.execute(text("SELECT digest FROM input_snapshots WHERE run_id = :run"), {"run": run_id}).scalar_one()
     if plan.input_snapshot_digest != snapshot_digest:
         raise DomainError("revision_conflict", 409)
-    allowed = settings.allowed_recipients()  # data_recipients come from configuration only; peers are checked by the broker
+    allowed = settings.allowed_recipients(plan.provider_id)  # data_recipients come from configuration only; peers are checked by the broker
     if any(r not in allowed and not r.startswith("peer:") for r in plan.data_recipients):
         raise DomainError("data_destinations_not_configured", 409)
     digest = _plan_digest(plan)

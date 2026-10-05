@@ -25,7 +25,6 @@ USER_QUESTION = "Synthesize the approved synthetic fixture evidence."
 
 os.environ["SCIENTIST_DATABASE_URL"] = CFG.database_url
 os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(PRIVATE / "master_key")
-os.environ["SCIENTIST_PROVIDER_ENDPOINT"] = "https://research.example"  # D4: the synthetic plan recipient must be a configured destination
 
 import boto3
 from sqlalchemy import text
@@ -381,6 +380,7 @@ def main() -> dict:
                 stages=["synthesis"], allowed_ops=["llm"], data_recipients=["https://research.example"],
                 packages=[], token_limit=20_000, elapsed_limit_ms=60_000,
             )
+            os.environ["SCIENTIST_PROVIDER_DESTINATIONS"] = '{"%s": "https://research.example"}' % provider_id  # D4: bind the plan recipient to this provider
             run = revise_plan(db, owner, run_id, run.revision, plan)
             approve_run(db, owner, run_id, run.revision, run.plan_digest)
             db.commit()
