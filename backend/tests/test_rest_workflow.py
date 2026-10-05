@@ -406,8 +406,10 @@ def test_list_runs_orders_by_creation_then_id_and_messages_match_view(client, db
     db.execute(text("INSERT INTO messages (id, project_id, session_id, role, content) VALUES (:i, :p, :s, 'user', 'hi')"),
                {"i": uuid4(), "p": project["id"], "s": session["id"]})
     db.commit()
-    (message,) = client.get(f"/api/v1/sessions/{session['id']}/messages").json()
-    assert MessageView.model_validate(message).run_id is None
+    messages = client.get(f"/api/v1/sessions/{session['id']}/messages").json()
+    # each submit records its question tied to its run (008); the manual row stays untied
+    assert [m["run_id"] for m in messages[:6]] == created
+    assert MessageView.model_validate(messages[-1]).run_id is None
 
 
 # --- Wave 5b control routes: queued-only owner retry through the real REST host ---

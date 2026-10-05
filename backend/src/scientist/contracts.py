@@ -95,6 +95,7 @@ class RunView(Contract):
     planning_tokens: int = Field(ge=0)
     token_limit: int = Field(ge=0)
     artifacts: list[ArtifactView] = Field(max_length=1000)
+    retry_of: UUID | None = None
 
 
 class OperationRequest(Contract):

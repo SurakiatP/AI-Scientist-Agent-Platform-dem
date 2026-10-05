@@ -73,6 +73,7 @@ export interface RunView {
   planning_tokens: number;
   token_limit: number;
   artifacts: ArtifactView[];
+  retry_of?: null | string;
 }
 
 export interface OperationRequest {
