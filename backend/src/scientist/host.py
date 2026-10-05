@@ -27,7 +27,7 @@ from sqlalchemy import create_engine, make_url, text
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.pool import NullPool
 
-from scientist import broker, objects, settings, supervisor
+from scientist import broker, objects, peer_reconciliation_supervisor, settings, supervisor
 from scientist import db as database
 from scientist.app import create_app
 from scientist.contracts import PlanSpec
@@ -350,6 +350,16 @@ class Host:
             runs = db.execute(text("SELECT id, state, generation FROM runs WHERE state IN ('running','recovering','stopping') ORDER BY id")).all()
         for run in runs:
             self._recover(run.id, "startup_recover", (run.state, run.generation))
+        self._peer_reconciliation_tick(startup=True)
+
+    def _peer_reconciliation_tick(self, *, startup: bool = False) -> None:
+        try:
+            with database.session() as db:
+                peer_reconciliation_supervisor.tick(
+                    db, max_active=self.max_active, startup=startup
+                )
+        except Exception as exc:
+            _log("host.error", "peer_reconciliation", None, type(exc).__name__)
 
     def reap(self) -> None:
         with database.session() as db:
@@ -359,6 +369,7 @@ class Host:
                           AND e.kind = 'worker' AND e.state = 'active') AS container
                 FROM runs r WHERE r.state = 'running' OR (r.state = 'stopping' AND r.cancel_requested) ORDER BY r.id""")).all()
         if not runs:
+            self._peer_reconciliation_tick()
             return
         try:
             alive = self.engine.running_worker_containers()
@@ -369,6 +380,7 @@ class Host:
             # 'stopping' is a stop that died after committing: recover fences and cancels it.
             if run.state == "stopping" or run.expired or (alive is not None and run.container not in alive):
                 self._recover(run.id, "reap", (run.state, run.generation))
+        self._peer_reconciliation_tick()
 
     def _queued(self) -> int:
         with database.session() as db:

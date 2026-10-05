@@ -301,6 +301,21 @@ def test_startup_recovers_only_active_runs(iso, recorders):
 
 
 # 7
+def test_host_ticks_peer_reconciliation_at_startup_and_periodically(iso, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        host.peer_reconciliation_supervisor,
+        "tick",
+        lambda db, *, max_active, startup=False: calls.append((max_active, startup)) or 0,
+    )
+    loop = host.Host(FakeEngine(), max_active=2)
+
+    loop.startup_recover()
+    loop.reap()
+
+    assert calls == [(2, True), (2, False)]
+
+
 def test_reap_recovers_exited_or_expired_only(iso, recorders):
     starts, recovers = recorders
     alive, exited, expired = _approved_run(), _approved_run(), _approved_run()

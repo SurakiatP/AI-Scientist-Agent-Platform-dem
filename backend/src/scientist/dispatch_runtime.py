@@ -587,7 +587,7 @@ class DockerDispatchRuntime:
         image_id = self._verified_image_id()
         subnet = self._checked_egress_and_subnet()
         operation_id = peer_reconciliation.operation_id if peer_reconciliation is not None else None
-        existing = self.find(db, run_id, generation, executor_id, operation_id, process_incarnation, peer_reconciliation=peer_reconciliation)
+        existing = self.find(db, run_id, generation, executor_id, operation_id, process_incarnation, **({"peer_reconciliation": peer_reconciliation} if peer_reconciliation is not None else {}))
         if existing is not None:
             if (existing.executor_id, existing.run_id, existing.generation, existing.kind,
                     existing.operation_id, existing.process_incarnation, existing.engine_id) != (
@@ -612,7 +612,7 @@ class DockerDispatchRuntime:
                 "--label", f"{_OPERATION_LABEL}={operation_id}",
                 "--label", f"{_RECONCILIATION_ATTEMPT_LABEL}={peer_reconciliation.attempt}",
             ))
-        launch_config = self._materialize_launch_config(run_id, generation, executor_id, process_incarnation, engine_id, **({"service_subnet": subnet} if subnet else {}), peer_reconciliation=peer_reconciliation)
+        launch_config = self._materialize_launch_config(run_id, generation, executor_id, process_incarnation, engine_id, **({"service_subnet": subnet} if subnet else {}), **({"peer_reconciliation": peer_reconciliation} if peer_reconciliation is not None else {}))
         mounts = ["--mount", f"type=bind,src={launch_config},dst={self.config.config_path},readonly", *self._secret_mounts()]
         before_mutation(engine_id, None)
         container_id = self._docker(

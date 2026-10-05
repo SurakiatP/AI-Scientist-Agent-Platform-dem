@@ -33,6 +33,7 @@ from scientist.contracts import CheckpointManifest, RunView
 from scientist.domain import _event, _run_view
 from scientist import limits
 from scientist.dispatch_authority import dispatch_is_inactive
+from scientist.peer_reconciliation_config import PeerReconciliationTarget
 from scientist.runtime_contracts import (
     BootstrapMetadata,
     RUNTIME_COMMIT,
@@ -113,11 +114,13 @@ class DispatchRuntime(Protocol):
         self, db: Session, run_id: UUID, generation: int, network: str,
         broker_ip: str, executor_id: UUID, process_incarnation: UUID,
         *, before_mutation: Callable[[str, str | None], None],
+        peer_reconciliation: PeerReconciliationTarget | None = None,
     ) -> ExecutorRef: ...
 
     def find(
         self, db: Session, run_id: UUID, generation: int, executor_id: UUID,
         operation_id: str | None, process_incarnation: UUID,
+        *, peer_reconciliation: PeerReconciliationTarget | None = None,
     ) -> ExecutorRef | None: ...
 
     def inactive(self, db: Session, executor: ExecutorRef, operation_id: str) -> bool: ...
@@ -137,6 +140,19 @@ def _dispatch_operation_is_inactive(
             return False
         return dispatch.inactive(db, executor, operation_id)
 
+    if executor.operation_id is not None:
+        recovery_attempt = db.execute(text("""
+            SELECT peer_reconciliation_attempt
+            FROM runtime_executors WHERE id=:executor AND run_id=:run
+              AND generation=:generation AND kind='dispatch'
+        """), {
+            "executor": executor.executor_id, "run": executor.run_id,
+            "generation": executor.generation,
+        }).scalar_one_or_none()
+        if recovery_attempt is not None:
+            return executor.operation_id == operation_id and probe(
+                executor.process_incarnation, executor.engine_id, executor.container_id
+            )
     return dispatch_is_inactive(
         db, executor.run_id, operation_id, executor.generation, probe=probe
     )
@@ -168,6 +184,22 @@ def _record_dispatch_inactive(
     ).rowcount
     if changed != 1:
         return False
+    peer_attempt = db.execute(text("""
+        SELECT peer_reconciliation_attempt FROM runtime_executors
+        WHERE id=:id AND run_id=:run AND generation=:generation
+    """), {
+        "id": executor_id, "run": executor.run_id,
+        "generation": executor.generation,
+    }).scalar_one_or_none()
+    if peer_attempt is not None and (
+        executor.operation_id is None
+        or not _dispatch_operation_is_inactive(db, dispatch, executor, executor.operation_id)
+    ):
+        db.execute(
+            text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
+            {"id": executor_id},
+        )
+        return False
     for operation_id in operation_ids:
         if not _dispatch_operation_is_inactive(db, dispatch, executor, operation_id):
             db.execute(
@@ -180,6 +212,16 @@ def _record_dispatch_inactive(
 
 def _inactive_executor_proven(executor) -> bool:
     proof = executor["proof"] or {}
+    if (
+        executor.get("peer_reconciliation_attempt") is not None
+        and proof.get("source") == "owned-engine-exact-dispatch-absence"
+    ):
+        return (
+            executor["container_id"] is None
+            and proof.get("engine_id") == executor["engine_id"]
+            and proof.get("executor_id") == str(executor["id"])
+            and proof.get("process_incarnation") == str(executor["process_incarnation"])
+        )
     if proof.get("source") == f"{executor['kind']}-launch-not-attempted":
         return executor["container_id"] is None
     return (
@@ -280,9 +322,15 @@ def claim(db: Session, max_active: int) -> tuple[UUID, int] | None:
     if type(max_active) is not int or not 1 <= max_active <= _MAX_ACTIVE:
         raise ValueError("max_active must be between one and three")
     db.execute(text("SELECT pg_advisory_xact_lock(hashtext('scientist.supervisor.claim'))"))
-    active = db.execute(
-        text("SELECT count(*) FROM runs WHERE state IN ('running','recovering','stopping')")
-    ).scalar_one()
+    active = db.execute(text("""
+        SELECT count(*) FROM runs r
+        WHERE r.state IN ('running','recovering','stopping')
+           OR EXISTS (
+               SELECT 1 FROM runtime_executors e
+               WHERE e.run_id=r.id AND e.peer_reconciliation_attempt IS NOT NULL
+                 AND e.state <> 'inactive'
+           )
+    """)).scalar_one()
     if active >= max_active:
         db.rollback()
         return None
@@ -465,6 +513,149 @@ def start(db: Session, run_id: UUID, generation: int) -> str:
         raise
 
 
+def start_peer_reconciliation(
+    db: Session,
+    run_id: UUID,
+    generation: int,
+    executor_id: UUID,
+    process_incarnation: UUID,
+    target: PeerReconciliationTarget,
+) -> ExecutorRef:
+    """Launch only an approved one-shot GetTask dispatch for a durable attempt.
+
+    This path deliberately bypasses worker bootstrap, capability creation, and
+    worker lifecycle methods. The private dispatch claims its GetTask authority
+    separately, immediately before sending the request.
+    """
+    cfg = _require_config()
+    row = db.execute(text("""
+        SELECT state, operation_id, process_incarnation, engine_id,
+               peer_reconciliation_attempt, peer_reconciliation_started, container_id
+        FROM runtime_executors
+        WHERE id=:executor AND run_id=:run AND generation=:generation
+          AND kind='dispatch' FOR UPDATE
+    """), {"executor": executor_id, "run": run_id, "generation": generation}).mappings().one_or_none()
+    if (
+        row is None or row["state"] != "starting"
+        or row["operation_id"] != target.operation_id
+        or row["process_incarnation"] != process_incarnation
+        or row["peer_reconciliation_attempt"] != target.attempt
+        or row["peer_reconciliation_started"]
+        or row["container_id"] is not None
+    ):
+        raise DomainError("peer_reconciliation_conflict", 409)
+
+    engine_id = cfg.engine.engine_id()
+    if row["engine_id"] is not None and row["engine_id"] != engine_id:
+        raise DomainError("peer_reconciliation_conflict", 409)
+    _bind_engine(db, executor_id, engine_id)
+    intent_written = False
+
+    def before_mutation(dispatch_engine_id: str, container_id: str | None = None) -> None:
+        nonlocal intent_written
+        if not dispatch_engine_id or len(dispatch_engine_id) > 200:
+            raise RuntimeError("engine identity is invalid")
+        updated = db.execute(text("""
+            UPDATE runtime_executors
+            SET engine_id=:engine, proof=CAST(:proof AS jsonb), updated_at=now()
+            WHERE id=:executor AND run_id=:run AND generation=:generation
+              AND kind='dispatch' AND operation_id=:operation
+              AND peer_reconciliation_attempt=:attempt
+              AND peer_reconciliation_started=false AND state='starting'
+              AND (engine_id IS NULL OR engine_id=:engine)
+              AND (container_id IS NULL OR container_id=:container)
+        """), {
+            "engine": dispatch_engine_id,
+            "proof": json.dumps({
+                "source": "dispatch-launch-intent", "run_id": str(run_id),
+                "generation": generation, "executor_id": str(executor_id),
+                "process_incarnation": str(process_incarnation),
+                "peer_reconciliation_attempt": target.attempt,
+                "container_id": container_id,
+            }, sort_keys=True),
+            "executor": executor_id, "run": run_id, "generation": generation,
+            "operation": target.operation_id, "attempt": target.attempt,
+            "container": container_id,
+        }).rowcount
+        if updated != 1:
+            db.rollback()
+            raise RuntimeError("peer dispatch launch intent was not durable")
+        db.commit()
+        intent_written = True
+
+    try:
+        network = cfg.engine.create_run_network(run_id)
+        ref = cfg.dispatch.start(
+            db, run_id, generation, network, cfg.broker_ip, executor_id,
+            process_incarnation, before_mutation=before_mutation,
+            peer_reconciliation=target,
+        )
+        if (
+            ref.executor_id != executor_id or ref.run_id != run_id
+            or ref.generation != generation or ref.kind != "dispatch"
+            or ref.operation_id != target.operation_id
+            or ref.process_incarnation != process_incarnation
+            or ref.engine_id != engine_id
+        ):
+            raise RuntimeError("peer dispatch identity differs durable attempt")
+        _bind_executor(db, ref)
+        current = db.execute(text("""
+            SELECT state, waiting_reason, generation, cancel_requested
+            FROM runs WHERE id=:run FOR UPDATE
+        """), {"run": run_id}).mappings().one_or_none()
+        if (
+            current is None or current["state"] != "waiting_input"
+            or current["waiting_reason"] != "unknown_outcome"
+            or current["generation"] != generation or current["cancel_requested"]
+        ):
+            raise DomainError("revision_conflict", 409)
+        changed = db.execute(text("""
+            UPDATE runtime_executors
+            SET state='active', proof=CAST(:proof AS jsonb), updated_at=now()
+            WHERE id=:executor AND run_id=:run AND generation=:generation
+              AND kind='dispatch' AND operation_id=:operation
+              AND peer_reconciliation_attempt=:attempt
+              AND state IN ('starting', 'active')
+              AND peer_reconciliation_started=false
+        """), {
+            "proof": json.dumps({
+                "source": "peer-reconciliation-dispatch-active",
+                "engine_id": ref.engine_id, "container_id": ref.container_id,
+                "attempt": target.attempt,
+            }, sort_keys=True),
+            "executor": executor_id, "run": run_id, "generation": generation,
+            "operation": target.operation_id, "attempt": target.attempt,
+        }).rowcount
+        if changed != 1:
+            raise RuntimeError("peer dispatch could not become active")
+        db.commit()
+        if not cfg.dispatch.ready(db, ref, cfg.broker_ip, cfg.broker_port):
+            raise RuntimeError("private peer dispatch did not become ready")
+        return ref
+    except Exception:
+        db.rollback()
+        if not intent_written:
+            db.execute(text("""
+                UPDATE runtime_executors
+                SET state='inactive', proof=CAST(:proof AS jsonb), updated_at=now()
+                WHERE id=:executor AND run_id=:run AND generation=:generation
+                  AND kind='dispatch' AND peer_reconciliation_attempt=:attempt
+                  AND state='starting' AND container_id IS NULL
+                  AND peer_reconciliation_started=false
+            """), {
+                "proof": json.dumps({
+                    "source": "dispatch-launch-not-attempted",
+                    "run_id": str(run_id), "generation": generation,
+                    "executor_id": str(executor_id),
+                    "process_incarnation": str(process_incarnation),
+                }, sort_keys=True),
+                "executor": executor_id, "run": run_id,
+                "generation": generation, "attempt": target.attempt,
+            })
+            db.commit()
+        raise
+
+
 def stop(db: Session, run_id: UUID, grace_seconds: int) -> RunView:
     if type(grace_seconds) is not int or not 0 <= grace_seconds <= 120:
         raise ValueError("grace_seconds must be between zero and 120")
@@ -621,9 +812,16 @@ def recover(db: Session, run_id: UUID, *, budget_resume: bool = False) -> RunVie
             ref = None
             if missing_physical_identity:
                 try:
+                    peer_reconciliation = None
+                    if executor.get("peer_reconciliation_attempt") is not None:
+                        peer_reconciliation = PeerReconciliationTarget(
+                            operation_id=executor["operation_id"],
+                            attempt=executor["peer_reconciliation_attempt"],
+                        )
                     ref = cfg.dispatch.find(
                         db, run_id, executor["generation"], executor["id"],
                         executor["operation_id"], executor["process_incarnation"],
+                        **({"peer_reconciliation": peer_reconciliation} if peer_reconciliation is not None else {}),
                     )
                 except Exception:
                     ref = None
@@ -932,6 +1130,8 @@ def _matches_executor(row, ref: ExecutorRef) -> bool:
         and ref.kind == row["kind"]
         and ref.operation_id == row["operation_id"]
         and ref.process_incarnation == row["process_incarnation"]
+        and ref.engine_id == row["engine_id"]
+        and ref.container_id == row["container_id"]
         and bool(re.fullmatch(r"[a-f0-9]{64}", ref.container_id))
         and bool(ref.engine_id)
         and len(ref.engine_id) <= 200

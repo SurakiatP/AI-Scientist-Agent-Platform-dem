@@ -623,23 +623,52 @@ def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: Oper
             raise DomainError("forbidden", 403)
         from scientist.domain import _validate_peer_releases
         from scientist.settings import _origin
-        _validate_peer_releases(db, request.run_id, project_id, plan)
-        peer_id = str(release.peer_id)
-        destination = _peer_destinations.get(peer_id)
-        if (not destination or _origin(destination) != destination or
-                hashlib.sha256(destination.encode()).hexdigest() != release.endpoint_fingerprint.lower()):
-            raise DomainError("forbidden", 403)
-        delegated = db.execute(text("SELECT 1 FROM delegations WHERE project_id = :project AND peer_id = :peer AND revoked_at IS NULL AND :action = ANY(actions)"),
-                               {"project": project_id, "peer": release.peer_id, "action": "peer"}).scalar_one_or_none()
-        if delegated is None:
-            raise DomainError("forbidden", 403)
-        credential = db.execute(text("SELECT id FROM credentials WHERE project_id=:project AND provider=:provider AND model IS NULL ORDER BY created_at DESC,id LIMIT 1"),
-                                {"project": project_id, "provider": f"peer:{peer_id}"}).scalar_one_or_none()
-        if credential is None:
-            raise DomainError("forbidden", 403)
-        if len(destination + "/a2a") > 2048:
-            raise DomainError("forbidden", 403)
-        return DispatchTarget("peer", destination + "/a2a", (destination,), credential_id=credential, peer_release=release)
+        return _validate_peer_target(db, request.run_id, project_id, plan, release)
+
+
+def validate_peer_reconciliation(
+    db: Session, run_id: UUID, project_id: UUID, plan: PlanSpec, release_id: UUID,
+) -> DispatchTarget:
+    """Check current config, delegation, and credential before reserving recovery."""
+    release = next((item for item in plan.peer_releases if item.release_id == release_id), None)
+    if release is None or not release.allow_get_task:
+        raise DomainError("peer_release_unapproved", 409)
+    return _validate_peer_target(db, run_id, project_id, plan, release)
+
+
+def _validate_peer_target(
+    db: Session, run_id: UUID, project_id: UUID, plan: PlanSpec, release: PeerReleaseSpec,
+) -> DispatchTarget:
+    """Shared live peer binding checks for SendMessage and recovery GetTask."""
+    from scientist.domain import _validate_peer_releases
+    from scientist.settings import _origin
+
+    _validate_peer_releases(db, run_id, project_id, plan)
+    peer_id = str(release.peer_id)
+    destination = _peer_destinations.get(peer_id)
+    if (
+        not destination or _origin(destination) != destination
+        or hashlib.sha256(destination.encode()).hexdigest() != release.endpoint_fingerprint.lower()
+    ):
+        raise DomainError("forbidden", 403)
+    delegated = db.execute(text("""
+        SELECT 1 FROM delegations
+        WHERE project_id=:project AND peer_id=:peer AND revoked_at IS NULL
+          AND :action=ANY(actions)
+    """), {"project": project_id, "peer": release.peer_id, "action": "peer"}).scalar_one_or_none()
+    if delegated is None:
+        raise DomainError("forbidden", 403)
+    credential = db.execute(text("""
+        SELECT id FROM credentials
+        WHERE project_id=:project AND provider=:provider AND model IS NULL
+        ORDER BY created_at DESC,id LIMIT 1
+    """), {"project": project_id, "provider": f"peer:{peer_id}"}).scalar_one_or_none()
+    if credential is None or len(destination + "/a2a") > 2048:
+        raise DomainError("forbidden", 403)
+    return DispatchTarget(
+        "peer", destination + "/a2a", (destination,),
+        credential_id=credential, peer_release=release,
+    )
 
 
 
