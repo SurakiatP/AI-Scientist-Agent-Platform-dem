@@ -1,5 +1,5 @@
-# The reviewed prerequisite supplies Python 3.13.14 and uv.lock dependencies.
-ARG DEPENDENCY_IMAGE=scientist-server-prerequisite@sha256:4912c149defb100b6c48c2d2674d98f0cd52183b1727ad26fd6fe3d260b696af
+# The reviewed prerequisite supplies Python 3.13.14 and locked MCP/A2A dependencies.
+ARG DEPENDENCY_IMAGE=scientist-server-protocol-prerequisite@sha256:65f1c54e8407793b4da6a7523bf76d64963f2046eb9614ea74d11a67a0bad9ca
 FROM ${DEPENDENCY_IMAGE}
 COPY --chown=65532:65532 backend/src/ /opt/scientist/backend/src/
 COPY --chown=65532:65532 backend/migrations/ /opt/scientist/backend/migrations/
