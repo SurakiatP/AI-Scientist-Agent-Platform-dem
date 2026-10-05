@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "a2a_specification": "1.0.1",
+  "sdk": {
+    "distribution": "a2a-sdk",
+    "version": "1.2.1"
+  },
+  "binding": {
+    "protocol": "JSONRPC",
+    "version": "1.0",
+    "endpoint": "/a2a",
+    "agent_card": "/.well-known/agent-card.json",
+    "required_header": {
+      "A2A-Version": "1.0"
+    },
+    "streaming": "SSE",
+    "v0_3_compatibility": false
+  },
+  "authentication": {
+    "rpc": "scoped external bearer only",
+    "agent_card": "public product metadata",
+    "owner_cookie": false,
+    "bootstrap_token": false,
+    "outbound_credential_forwarding": false
+  },
+  "methods": [
+    "SendMessage",
+    "SendStreamingMessage",
+    "GetTask",
+    "ListTasks",
+    "CancelTask",
+    "SubscribeToTask"
+  ],
+  "unsupported": [
+    "owner approval",
+    "owner decisions",
+    "push notifications",
+    "extended agent card",
+    "historical message replay",
+    "status_timestamp_after list filter",
+    "tenant selection",
+    "non-text input parts",
+    "outbound peer dispatch"
+  ],
+  "submission": {
+    "metadata_field": "SendMessageRequest.metadata",
+    "message_role": "ROLE_USER",
+    "question": "ordered text parts joined with newline",
+    "message_id": "1..200 characters; caller-scoped durable idempotency key",
+    "context_id": "server-generated or a context already bound to this caller/project/session",
+    "task_id": "must be absent; follow-up submission creates another owner-reviewed run",
+    "owner_approval": "always required; submission does not execute research",
+    "configuration": {
+      "accepted_output_modes": [
+        "text/plain"
+      ],
+      "return_immediately": "supported; owner review is always returned immediately",
+      "history_length": 0,
+      "push_notifications": false
+    }
+  },
+  "submission_metadata_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "project_id",
+      "session_id",
+      "provider_id",
+      "model"
+    ],
+    "properties": {
+      "project_id": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "session_id": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "provider_id": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "model": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "input_ids": {
+        "type": "array",
+        "maxItems": 1000,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "default": []
+      }
+    }
+  },
+  "authorization": {
+    "submit": "work:submit",
+    "task_reads_lists_subscriptions": "result:read",
+    "cancel": "work:cancel plus own submission",
+    "task_context_artifact_isolation": "caller binding is required even with grants to the same project",
+    "result_metadata": "result:read; project:read alone grants no artifact metadata or bytes"
+  },
+  "durability": {
+    "storage": "PostgreSQL a2a_contexts, a2a_tasks, a2a_messages and the domain run ledger",
+    "transaction": "submission and all transport mappings commit atomically",
+    "replay": "same caller/message ID and content fingerprint returns the existing run across restart",
+    "changed_payload": "safe protocol conflict; never creates another run",
+    "disconnect": "does not cancel committed work"
+  },
+  "state_mapping": {
+    "planning": "TASK_STATE_SUBMITTED",
+    "queued": "TASK_STATE_SUBMITTED",
+    "running": "TASK_STATE_WORKING",
+    "recovering": "TASK_STATE_WORKING",
+    "stopping": "TASK_STATE_WORKING",
+    "awaiting_approval": "TASK_STATE_INPUT_REQUIRED",
+    "waiting_input": "TASK_STATE_INPUT_REQUIRED",
+    "completed": "TASK_STATE_COMPLETED",
+    "failed": "TASK_STATE_FAILED",
+    "canceled": "TASK_STATE_CANCELED",
+    "rejected": "TASK_STATE_REJECTED"
+  },
+  "subscriptions": {
+    "first_event": "authoritative current Task snapshot",
+    "updates": "new snapshot when revision or event cursor changes",
+    "terminal_tasks": "current terminal snapshot then stream closes; GetTask remains available",
+    "authorization_recheck_seconds_default": 0.25,
+    "authorization_recheck_seconds_maximum": 1,
+    "max_duration_seconds": 300,
+    "reconnect": "fresh snapshot; no promise of full history"
+  },
+  "artifacts": {
+    "endpoint": "/a2a/artifacts/{artifact_id}",
+    "authentication": "bearer plus task caller binding and result:read",
+    "reference": "SDK Artifact with Part.url, declared mediaType and size/hash/partial metadata",
+    "verification": "entire recorded size and SHA-256 checked before response headers or bytes",
+    "delivery": "application/octet-stream attachment; no-store and nosniff",
+    "revocation": "recheck before every 64 KiB chunk; stop delivery on denial; declared length detects truncation",
+    "maximum_bytes": 26214400,
+    "public_urls": false
+  },
+  "limits": {
+    "request_bytes": 2097152,
+    "list_page_size_default": 50,
+    "list_page_size_maximum": 100,
+    "question_characters": 100000
+  },
+  "deployment": {
+    "base_url": "operator supplies the actual advertised origin",
+    "listeners": "loopback by default; LAN requires explicit TLS and restricted host/origin configuration in the containing application",
+    "stop_callback": "parent injects supervisor-backed on_stop(db, run_id); absent callback rejects active cancellation"
+  },
+  "acceptance_scope": "synthetic real-SDK loopback HTTP/SSE plus dedicated PostgreSQL; outbound peers and deployment live gates remain separate"
+}

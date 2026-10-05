@@ -1,0 +1,190 @@
+{
+  "protocol": "MCP Streamable HTTP",
+  "sdk": "mcp==2.3.0",
+  "endpoint": "/mcp",
+  "methods": [
+    "POST"
+  ],
+  "auth": "Authorization: Bearer <scoped external access token>",
+  "resources": [
+    {
+      "uriTemplate": "scientist://artifacts/{artifact_id}",
+      "description": "Read authorized artifact metadata by application artifact identity."
+    },
+    {
+      "uriTemplate": "scientist://artifacts/{artifact_id}/content",
+      "description": "Read bounded, hash-verified artifact bytes with the caller's result:read grant.",
+      "mimeType": "application/octet-stream"
+    }
+  ],
+  "tools": [
+    {
+      "name": "list_projects",
+      "description": "List projects granted to the authenticated bearer.",
+      "result": "{projects: ProjectView[], next_cursor: string|null}",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "limit": {
+            "type": "integer",
+            "default": 50
+          }
+        }
+      }
+    },
+    {
+      "name": "attach_input",
+      "description": "Attach a supported, bounded input file to a granted project.",
+      "result": "FileView",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "type": "string"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "declared_size": {
+            "type": "integer"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "content_base64": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "filename",
+          "declared_size",
+          "content_type",
+          "content_base64"
+        ]
+      }
+    },
+    {
+      "name": "submit_research",
+      "description": "Submit research to the owner's approval queue. Submission is durable and returns promptly.",
+      "result": "RunView",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "submission_key": {
+            "type": "string"
+          },
+          "question": {
+            "type": "string"
+          },
+          "input_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "session_id",
+          "submission_key",
+          "question",
+          "input_ids",
+          "provider_id",
+          "model"
+        ]
+      }
+    },
+    {
+      "name": "get_research",
+      "description": "Read an authorized research run snapshot.",
+      "result": "RunView",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ]
+      }
+    },
+    {
+      "name": "get_research_events",
+      "description": "Read application event history after a bounded sequence cursor.",
+      "result": "{events: RunEvent[], cursor: integer|null, cursor_expired: boolean}",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          },
+          "after": {
+            "type": "integer",
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "default": 100
+          }
+        },
+        "required": [
+          "run_id"
+        ]
+      }
+    },
+    {
+      "name": "list_results",
+      "description": "List result metadata for an authorized research run.",
+      "result": "{results: ArtifactView[]}",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ]
+      }
+    },
+    {
+      "name": "request_stop",
+      "description": "Request cancellation of an authorized submitted run.",
+      "result": "RunView",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ]
+      }
+    }
+  ]
+}
