@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunView } from '../../../contracts/api-types';
 import { ApiError, apiErrorMessage, request } from './api';
@@ -7,6 +7,7 @@ import { ArtifactCard, ArtifactViewer, INITIAL_VISUAL_STATE, type VisualState } 
 import type { DecisionRequiredPayload } from '../../../contracts/api-types';
 import { RunProgress, type DecisionChoice } from './RunProgress';
 import { useRunEvents } from './useRunEvents';
+import { PeerReleaseReview } from './PeerReleaseReview';
 import './research.css';
 
 const text = (language: 'th' | 'en', en: string, th: string) => language === 'th' ? th : en;
@@ -46,6 +47,8 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const [pendingDecisions, setPendingDecisions] = useState<PendingDecisionView[]>([]);
   const [archived, setArchived] = useState<RunView[]>([]);
   const [plan, setPlan] = useState<PlanView | null>(null);
+  const [peerReview, setPeerReview] = useState({ key: '', ready: false });
+  const peerReviewReady = useCallback((key: string, ready: boolean) => setPeerReview({ key, ready }), []);
   const [stagesText, setStagesText] = useState('');
   const [planNote, setPlanNote] = useState('');
   const [error, setError] = useState('');
@@ -180,13 +183,17 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     }
   };
   const dirty = plan !== null && stagesText.trim() !== plan.plan.stages.join('\n');
+  const reviewKey = plan ? `${plan.run_id}:${plan.revision}:${plan.plan_digest}` : '';
+  const peerReviewRequired = plan?.plan.peer_releases !== undefined
+    && (!Array.isArray(plan.plan.peer_releases) || plan.plan.peer_releases.length > 0);
+  const approvalReady = !peerReviewRequired || (peerReview.key === reviewKey && peerReview.ready);
   async function savePlan() {
     if (!plan) return;
     const next = await guarded(() => request<RunView>(`/api/v1/runs/${plan.run_id}/plan`, { ...json({ expected_revision: plan.revision, plan: { ...plan.plan, stages: stagesText.split('\n').map((s) => s.trim()).filter(Boolean) } }), method: 'PATCH' }));
     if (next) { setRun(next); loadPlan(plan.run_id); setPlanNote(text(language, 'Edits saved. Review the updated plan before approving.', 'บันทึกการแก้ไขแล้ว ตรวจสอบแผนที่อัปเดตก่อนอนุมัติ')); }
   }
   async function approve() {
-    if (!plan || dirty) return;
+    if (!plan || dirty || !approvalReady) return;
     try {
       setRun(await request<RunView>(`/api/v1/runs/${plan.run_id}/approve`, json({ expected_revision: plan.revision, plan_digest: plan.plan_digest })));
     } catch (reason) {
@@ -215,11 +222,12 @@ function ChatSession({ pollMs }: { pollMs: number }) {
         <dt>{text(language, 'Data recipients', 'ผู้รับข้อมูล')}</dt><dd>{plan.plan.data_recipients.join(', ') || text(language, 'None', 'ไม่มี')}</dd>
         <dt>{text(language, 'Packages', 'แพ็กเกจ')}</dt><dd>{plan.plan.packages.map((p) => `${p.name} ${p.version}`).join(', ') || text(language, 'None', 'ไม่มี')}</dd>
         <dt>{text(language, 'Limits', 'ขีดจำกัด')}</dt><dd>{plan.plan.token_limit} {text(language, 'tokens', 'โทเคน')} · {Math.round(plan.plan.elapsed_limit_ms / 1000)} {text(language, 's', 'วินาที')}</dd></dl>
+      {peerReviewRequired && <PeerReleaseReview key={reviewKey} reviewKey={reviewKey} releases={plan.plan.peer_releases} language={language} onReady={peerReviewReady} />}
       <label htmlFor="plan-stages">{text(language, 'Research stages (one per line)', 'ขั้นตอนการวิจัย (หนึ่งบรรทัดต่อหนึ่งขั้นตอน)')}</label>
       <textarea id="plan-stages" value={stagesText} onChange={(e) => setStagesText(e.target.value)} />
       {planNote && <p role="status">{planNote}</p>}
       <button type="button" className="button button-quiet button-small" disabled={!dirty} onClick={() => void savePlan()}>{text(language, 'Save edits', 'บันทึกการแก้ไข')}</button>
-      <button type="button" className="button button-small" disabled={dirty} onClick={() => void approve()}>{text(language, 'Approve plan', 'อนุมัติแผน')}</button>
+      <button type="button" className="button button-small" disabled={dirty || !approvalReady} onClick={() => void approve()}>{text(language, 'Approve plan', 'อนุมัติแผน')}</button>
       {dirty && <p>{text(language, 'Save your edits and review the new plan; the previous approval no longer applies.', 'บันทึกการแก้ไขและตรวจทานแผนใหม่ การอนุมัติก่อนหน้าไม่มีผลแล้ว')}</p>}
     </section>}
     {run && run.artifacts.length > 0 && <section aria-label={text(language, 'Outputs', 'ผลลัพธ์')}><h2>{text(language, 'Outputs', 'ผลลัพธ์')}</h2>{run.artifacts.map(card)}</section>}

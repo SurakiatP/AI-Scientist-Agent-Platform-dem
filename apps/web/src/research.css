@@ -13,3 +13,15 @@
 .table-scroll th, .table-scroll td { padding: 6px 10px; border: 1px solid var(--line); text-align: left; }
 .math-block pre { font-family: var(--mono); }
 .file-chip { display: inline-flex; gap: 6px; align-items: center; margin: 0 6px 6px 0; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; }
+.peer-release-review { margin-block: 1.5rem; }
+.peer-release-card { margin-block: 1rem; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--surface); min-width: 0; overflow-wrap: anywhere; }
+.peer-release-card h4 { margin-block: 0 .75rem; }
+.peer-release-card dd, .peer-release-card li { overflow-wrap: anywhere; }
+.peer-release-card small, .peer-release-card li code { display: block; margin-block: .35rem; }
+.peer-digest { font-family: ui-monospace, monospace; font-size: .8rem; overflow-wrap: anywhere; }
+.peer-release-card summary { cursor: pointer; padding-block: .75rem; font-weight: 600; }
+.peer-release-card pre, .peer-payload-dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 26rem; overflow: auto; padding: 1rem; border: 1px solid var(--line); border-radius: .75rem; font-size: .85rem; }
+.peer-payload-dialog { width: min(90vw, 75rem); max-height: 90vh; padding: 1.5rem; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 1rem; }
+.peer-payload-dialog::backdrop { background: rgb(4 24 45 / 65%); backdrop-filter: blur(4px); }
+.peer-payload-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.peer-payload-dialog pre { max-height: 65vh; }
