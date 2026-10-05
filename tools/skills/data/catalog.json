@@ -1,0 +1,45 @@
+{
+ "repository": "K-Dense-AI/scientific-agent-skills",
+ "commit": "154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+ "skill_count": 177,
+ "upstream_main_at_check": "154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+ "checked_on": "2026-10-05",
+ "watch_branches": [
+  {
+   "branch": "claude/microfluidic-design-skill-1o5uz6",
+   "tip": "2c66d91",
+   "skill_count": 162,
+   "adds": [
+    "docx",
+    "microfluidic-design",
+    "pdf",
+    "pptx",
+    "xlsx"
+   ],
+   "drops": 20,
+   "action": "watch only; not on main; do not import"
+  },
+  {
+   "branch": "feat/google-deep-research",
+   "tip": "df8fa36",
+   "skill_count": 149,
+   "adds": [
+    "docx",
+    "iso-13485-certification",
+    "pdf",
+    "pptx",
+    "xlsx"
+   ],
+   "drops": 33,
+   "action": "watch only; not on main; do not import"
+  },
+  {
+   "branch": "orion/add-k-dense-web-gif",
+   "tip": "7232cf7",
+   "skill_count": 0,
+   "adds": [],
+   "drops": 177,
+   "action": "stale (ancestor of pin, old layout); ignore"
+  }
+ ]
+}

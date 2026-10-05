@@ -1,0 +1,26 @@
+{
+ "note": "Hand-maintained evidence ledger. A status becomes true only when its evidence entry is filled. Builder enforces the ladder implemented -> validated -> enabled.",
+ "platform_verified": {
+  "commit": "c1e7126",
+  "date": "2026-10-05",
+  "facts": [
+   "runtime/skills-manifest.json bundles paper-lookup, literature-review, scientific-writing as files only (67 resources)",
+   "worker exposes only the reviewed todo_list tool; skip_context_files=True; no instruction loader",
+   "no capability registry or typed scientific tool in backend/ or runtime/",
+   "research.build_plan allows ops search and llm; broker search is a generic URL fetch to configured destinations",
+   "research.verify_citation exists and is reusable",
+   "server Python 3.13 (pyproject >=3.13,<3.14); worker Python 3.14.7 (ADR-008)"
+  ]
+ },
+ "main_gates": {
+  "B5": {"status": "accepted", "date": "2026-10-04", "meaning": "runtime containment, recovery, budget and fault gates"},
+  "B6": {"status": "source merged; paper-workflow live acceptance pending", "date": "2026-10-05", "meaning": "REST resources and initial paper workflow"},
+  "I1-host": {"status": "live-accepted", "date": "2026-10-05", "meaning": "host process and claim loop slice of I1"},
+  "I1": {"status": "remaining I1 scope per main plan", "date": null, "meaning": "MCP adapter (SDK pin reused by outbound MCP client)"},
+  "I2": {"status": "pending", "date": null, "meaning": "A2A inbound/outbound, reconciliation"},
+  "F4": {"status": "pending", "date": null, "meaning": "actual API/events UI integration"},
+  "I3": {"status": "pending", "date": null, "meaning": "local deployment, encrypted volumes, backup/restore"},
+  "I4": {"status": "pending", "date": null, "meaning": "security evidence and full acceptance"}
+ },
+ "skills": {}
+}
