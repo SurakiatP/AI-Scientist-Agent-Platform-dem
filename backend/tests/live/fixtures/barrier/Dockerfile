@@ -1,3 +1,3 @@
-FROM scientist-server-budget-candidate:20261005-09@sha256:dac5a1ffea8fb666de237dbaf9f59d6a11b9398e1c342fc0822f398eed69474c
+FROM scientist-server-budget-candidate:20261005-10@sha256:a936a03d4a152bb2680577f1f2ec1d06a882cd69ab1b34ccd280017421a8b9bf
 COPY --chown=65532:65532 sitecustomize.py /opt/scientist/backend/src/sitecustomize.py
 ENV SCIENTIST_B5_FAULT=after_result_commit_before_delivery
