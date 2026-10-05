@@ -48,7 +48,6 @@ PG_CONTAINER, MINIO_CONTAINER = "scientist-b5-postgres", "scientist-b5-minio"
 
 os.environ["SCIENTIST_DATABASE_URL"] = DB_URL
 os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(PRIVATE / "master_key")  # path only; never read here
-os.environ["SCIENTIST_PROVIDER_ENDPOINT"] = "https://research.example"  # D4: the synthetic plan recipient must be a configured destination
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import boto3  # noqa: E402
@@ -243,6 +242,7 @@ class H:
             plan = PlanSpec(input_snapshot_digest=snapshot, provider_id=credential, model=model, stages=["synthesis"],
                             allowed_ops=["llm"], data_recipients=["https://research.example"], packages=[],
                             token_limit=token_limit, elapsed_limit_ms=elapsed_limit_ms)
+            os.environ["SCIENTIST_PROVIDER_DESTINATIONS"] = '{"%s": "https://research.example"}' % credential  # D4: bind the plan recipient to this provider
             run = revise_plan(db, owner, run.run_id, run.revision, plan)
             approve_run(db, owner, run.run_id, run.revision, run.plan_digest)
             db.commit()

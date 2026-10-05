@@ -19,14 +19,16 @@ _SNAPSHOT_MAX_BYTES = 1024 * 1024
 
 def submit_run(db: Session, principal: Principal, project_id: UUID, session_id: UUID,
                submission_key: str, question: str, input_ids: list[UUID],
-               provider_id: UUID, model: str) -> RunView:
+               provider_id: UUID, model: str, retry_of: UUID | None = None) -> RunView:
     authorize(db, principal, "work:submit", project_id)
     if not 1 <= len(submission_key) <= 200 or not question.strip() or len(question) > 100000 or not model.strip() or len(model) > 200:
         raise DomainError("forbidden", 400)
     if len(input_ids) > 1000:
         raise DomainError("request_too_large", 413)
     request = {"question": question, "input_ids": [str(i) for i in input_ids], "provider_id": str(provider_id), "model": model}
-    payload_hash = _digest({"project_id": str(project_id), "session_id": str(session_id), **request})
+    # retry_of joins the hash only when set, so pre-008 submission hashes stay valid.
+    payload_hash = _digest({"project_id": str(project_id), "session_id": str(session_id), **request,
+                            **({"retry_of": str(retry_of)} if retry_of else {})})
     # ponytail: one PostgreSQL advisory lock per caller/key; replace with per-key row locks only if contention matters.
     db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"), {"lock_key": f"{principal.identity}:{submission_key}"})
     existing = db.execute(text("SELECT id, submission_hash FROM runs WHERE caller_identity = :caller AND submission_key = :key"), {
@@ -43,6 +45,14 @@ def submit_run(db: Session, principal: Principal, project_id: UUID, session_id: 
         raise DomainError("not_found", 404)
     if len(input_ids) != len(set(input_ids)):
         raise DomainError("forbidden", 400)
+    if retry_of:
+        prior = db.execute(text("SELECT state, caller_identity FROM runs WHERE id = :id AND project_id = :project FOR UPDATE"),
+                           {"id": retry_of, "project": project_id}).one_or_none()
+        # Same own-submission rule as stop: external callers may only retry runs they submitted.
+        if prior is None or (principal.kind == "external" and prior.caller_identity != principal.identity):
+            raise DomainError("not_found", 404)
+        if prior.state not in ("failed", "canceled"):
+            raise DomainError("revision_conflict", 409)
     manifest = _capture_snapshot(db, project_id, session_id, request)
     encoded_manifest = json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     if len(encoded_manifest.encode()) > _SNAPSHOT_MAX_BYTES:
@@ -51,10 +61,13 @@ def submit_run(db: Session, principal: Principal, project_id: UUID, session_id: 
     run_id = uuid4()
     db.execute(text("""
         INSERT INTO runs (id, project_id, session_id, caller_identity, submission_key, submission_hash,
-                          state, token_limit)
-        VALUES (:id, :project, :session, :caller, :key, :hash, 'awaiting_approval', 0)
+                          state, token_limit, retry_of)
+        VALUES (:id, :project, :session, :caller, :key, :hash, 'awaiting_approval', 0, :retry_of)
     """), {"id": run_id, "project": project_id, "session": session_id, "caller": principal.identity,
-          "key": submission_key, "hash": payload_hash})
+          "key": submission_key, "hash": payload_hash, "retry_of": retry_of})
+    # Snapshot captured above, so the question is not in its own conversation; retries record their (possibly edited) question too.
+    db.execute(text("INSERT INTO messages (id, project_id, session_id, role, content, run_id) VALUES (:id, :project, :session, 'user', :content, :run)"),
+               {"id": uuid4(), "project": project_id, "session": session_id, "content": question, "run": run_id})
     db.execute(text("INSERT INTO input_snapshots (id, project_id, run_id, digest, manifest) VALUES (:id, :project, :run, :digest, CAST(:manifest AS jsonb))"), {
         "id": uuid4(), "project": project_id, "run": run_id, "digest": digest,
         "manifest": encoded_manifest,
@@ -77,7 +90,7 @@ def revise_plan(db: Session, owner: Principal, run_id: UUID, expected_revision: 
     snapshot_digest = db.execute(text("SELECT digest FROM input_snapshots WHERE run_id = :run"), {"run": run_id}).scalar_one()
     if plan.input_snapshot_digest != snapshot_digest:
         raise DomainError("revision_conflict", 409)
-    allowed = settings.allowed_recipients()  # data_recipients come from configuration only; peers are checked by the broker
+    allowed = settings.allowed_recipients(plan.provider_id)  # data_recipients come from configuration only; peers are checked by the broker
     if any(r not in allowed and not r.startswith("peer:") for r in plan.data_recipients):
         raise DomainError("data_destinations_not_configured", 409)
     digest = _plan_digest(plan)
@@ -354,7 +367,7 @@ def _run_view(db: Session, run_id: UUID) -> RunView:
                    state=row.state, stage=row.stage, waiting_reason=row.waiting_reason, error_code=row.error_code,
                    plan_digest=row.plan_digest.strip() if row.plan_digest else None, latest_cursor=row.latest_cursor,
                    usage_tokens=row.usage_tokens, reserved_tokens=row.reserved_tokens, planning_tokens=row.planning_tokens,
-                   token_limit=row.token_limit, artifacts=artifacts)
+                   token_limit=row.token_limit, artifacts=artifacts, retry_of=row.retry_of)
 
 
 def _insert_plan(db: Session, run_id: UUID, project_id: UUID, revision: int, plan: PlanSpec, digest: str) -> None:
@@ -605,8 +618,8 @@ def list_messages(db: Session, principal: Principal, session_id: UUID, after_seq
     if after_sequence < 0 or not 1 <= limit <= 500:
         raise DomainError("cursor_expired", 400)
     session_project(db, principal, session_id)
-    return [MessageView(id=r.id, sequence=r.sequence, role=r.role, content=r.content, created_at=r.created_at.astimezone(timezone.utc)).model_dump(mode="json")
-            for r in db.execute(text("SELECT id, sequence, role, content, created_at FROM messages WHERE session_id = :s AND sequence > :a ORDER BY sequence LIMIT :l"),
+    return [MessageView(id=r.id, sequence=r.sequence, role=r.role, content=r.content, created_at=r.created_at.astimezone(timezone.utc), run_id=r.run_id).model_dump(mode="json")
+            for r in db.execute(text("SELECT id, sequence, role, content, created_at, run_id FROM messages WHERE session_id = :s AND sequence > :a ORDER BY sequence LIMIT :l"),
                                 {"s": session_id, "a": after_sequence, "l": limit})]
 
 

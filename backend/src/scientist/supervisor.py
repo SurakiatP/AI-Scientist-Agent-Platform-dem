@@ -1078,6 +1078,12 @@ class DockerWorkerEngine:
             raise RuntimeError("owned Docker engine version changed")
         return engine_id
 
+    def running_worker_containers(self) -> set[str]:
+        """Full IDs of every running worker container on the owned engine (one listing)."""
+        ids = self._docker("ps", "-q", "--no-trunc", "--filter", f"label={_KIND_LABEL}=worker",
+                           "--filter", "status=running")
+        return {item for item in ids.splitlines() if item}
+
     def create_run_network(self, run_id: UUID, generation: int, executor_id: UUID) -> tuple[str, str]:
         digest = hashlib.sha256(f"{run_id}:{generation}".encode()).digest()
         used = set()

@@ -95,7 +95,7 @@ def unknown() -> None:
             "fixture_image_digest": c.digest_of(counter),
             "evidence": {"run_id": str(h.run_id), "services_restarted": restarted, "provider_attempts": current["provider_attempts"],
                          "reserved_tokens": current["run"]["reserved_tokens"], "usage_tokens": current["run"]["usage_tokens"],
-                         "generation": 1, "cleanup": cleanup}})
+                         "generation": 1, "cleanup": cleanup, "repo": dict(c.REPO)}})
 
 
 if __name__ == "__main__":

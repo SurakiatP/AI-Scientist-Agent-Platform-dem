@@ -1,11 +1,15 @@
+import json
 from uuid import uuid4
 
 import pytest
 
+from scientist import settings
 from scientist.auth import DomainError
 from scientist.contracts import Principal
 from scientist.domain import submit_run
 from scientist.research import build_plan, verify_citation
+
+_REAL_DESTINATIONS = settings.provider_destinations  # captured before conftest's autouse stub
 
 # Fixture records below are explicitly labeled test data, not real publications.
 DOI_RECORD = {"doi": "10.0000/Fixture.1", "title": "Fixture Study of Test Data", "year": 2020, "authors": ["A. Tester"]}
@@ -49,16 +53,20 @@ def test_nonexistent_identifier_and_unsafe_url_are_not_trusted():
     assert unsafe["original_url"] is None
 
 
-def _run(db, project_session):
+PROVIDER = uuid4()
+
+
+def _run(db, project_session, provider=None):
     project_id, session_id = project_session
     owner = Principal(identity=uuid4(), kind="owner")
-    return owner, submit_run(db, owner, project_id, session_id, f"k-{uuid4()}", "question", [], uuid4(), "fixture")
+    return owner, submit_run(db, owner, project_id, session_id, f"k-{uuid4()}", "question", [], provider or PROVIDER, "fixture")
 
 
 @pytest.fixture(autouse=True)
 def _destinations(monkeypatch):
     monkeypatch.setenv("SCIENTIST_SCHOLARLY_ENDPOINTS", "https://api.scholar.example,https://meta.example/v1")
-    monkeypatch.setenv("SCIENTIST_PROVIDER_ENDPOINT", "https://llm.example")
+    monkeypatch.setattr(settings, "provider_destinations", _REAL_DESTINATIONS)
+    monkeypatch.setenv("SCIENTIST_PROVIDER_DESTINATIONS", json.dumps({str(PROVIDER): "https://llm.example"}))
 
 
 def test_build_plan_has_stages_for_search_verify_synthesize(db, project_session):
@@ -140,7 +148,7 @@ def test_unsafe_configured_endpoints_are_dropped_and_plan_not_ready(db, project_
 
 def test_missing_provider_destination_is_not_ready(db, project_session, monkeypatch):
     owner, run = _run(db, project_session)
-    monkeypatch.delenv("SCIENTIST_PROVIDER_ENDPOINT")
+    monkeypatch.delenv("SCIENTIST_PROVIDER_DESTINATIONS")
     with pytest.raises(DomainError, match="data_destinations_not_configured"):
         build_plan(db, owner, run.run_id, ["x"])
 

@@ -43,12 +43,38 @@ def scholarly_endpoints() -> list[str]:
     return list(dict.fromkeys(o for v in raw.split(",") if (o := _origin(v))))
 
 
-# SCIENTIST_PROVIDER_ENDPOINT must equal the dispatch template's provider destination exactly;
-# per-provider_id keying is a follow-up.
-def provider_endpoint() -> str | None:
-    return _origin(os.environ.get("SCIENTIST_PROVIDER_ENDPOINT", ""))
+_MAX_DESTINATIONS_BYTES = 16 * 1024
 
 
-def allowed_recipients() -> set[str]:
-    provider = provider_endpoint()
+# The broker/dispatch template keep their own provider map; if it disagrees with this one, dispatch
+# fails closed (403) and the approved plan never runs, so operators must configure both identically.
+def provider_destinations() -> dict[str, str]:
+    """`{provider_id: origin}` from SCIENTIST_PROVIDER_DESTINATIONS; any invalid entry fails the whole map closed."""
+    import json
+    from uuid import UUID
+    raw = os.environ.get("SCIENTIST_PROVIDER_DESTINATIONS", "")
+    if not raw or len(raw.encode()) > _MAX_DESTINATIONS_BYTES:
+        return {}
+    try:
+        # Exact duplicate keys void the map (json.loads would silently keep the last one).
+        data = json.loads(raw, object_pairs_hook=lambda pairs: dict(pairs) if len(dict(pairs)) == len(pairs) else None)
+        if not isinstance(data, dict):
+            return {}
+        out = {str(UUID(k)): v for k, v in data.items()}
+        if len(out) != len(data) or any(str(UUID(k)) != k.lower() for k in data) or any(not isinstance(v, str) or _origin(v) != v for v in out.values()):
+            return {}
+        return out
+    except (ValueError, TypeError):
+        return {}
+
+
+def provider_endpoint(provider_id) -> str | None:
+    try:
+        return provider_destinations().get(str(provider_id).lower())
+    except (ValueError, TypeError):
+        return None
+
+
+def allowed_recipients(provider_id) -> set[str]:
+    provider = provider_endpoint(provider_id)
     return set(scholarly_endpoints()) | ({provider} if provider else set())

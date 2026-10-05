@@ -64,6 +64,7 @@ class RunCreate(Body):
     input_ids: list[UUID] = Field(default_factory=list)
     provider_id: UUID
     model: str
+    retry_of: UUID | None = None
 
 
 class PlanPatch(Body):
@@ -240,7 +241,7 @@ def create_run(request: Request, session_id: UUID, body: RunCreate):
     with database_session() as db:
         project_id = domain.session_project(db, _principal(request), session_id, "work:submit")
         run = domain.submit_run(db, _principal(request), project_id, session_id, body.submission_key, body.question,
-                                body.input_ids, body.provider_id, body.model)
+                                body.input_ids, body.provider_id, body.model, body.retry_of)
         db.commit()
         return run
 

@@ -27,7 +27,7 @@ def build_plan(db: Session, owner: Principal, run_id: UUID, search_terms: list[s
     current = get_plan(db, owner, run_id).plan
     stages = [f"Search literature: {t}" for t in terms] + ["Verify references", "Synthesize evidence"]
     # Destinations come only from validated configuration, never from the request or search terms.
-    provider, scholarly = settings.provider_endpoint(), settings.scholarly_endpoints()
+    provider, scholarly = settings.provider_endpoint(current.provider_id), settings.scholarly_endpoints()
     if not provider or not scholarly:
         raise DomainError("data_destinations_not_configured", 409)
     return current.model_copy(update={"stages": stages, "allowed_ops": ["search", "llm"], "data_recipients": [*scholarly, provider]})
