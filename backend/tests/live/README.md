@@ -33,11 +33,55 @@ Exit codes: 0 PASS, 1 FAIL, 77 NOT RUN. The run writes logs and `summary.json` i
 Running a single script directly is diagnostic only, never acceptance. Unit tests stay `uv run pytest`.
 Per-run dispatch template and launch files are written under private_dir and removed by exact-label cleanup.
 
+## Host HTTP gate (`host_http`, after the matrix)
+
+`b5_host_http_acceptance.py [host-happy|host-stop|host-extend|host-restart-retry]` (no argument runs all four, in
+order, stopping at the first failure). Each case starts the real `scientist.host` as a subprocess (environment
+an allowlist of non-secret variables plus `PGUSER`; `host.json` carries no database username; `SCIENTIST_PROVIDER_DESTINATIONS` identical to `host.json`), reads the
+owner-bootstrap URL from its private state dir, bootstraps over `http://127.0.0.1:<free port>` with matching
+Host/Origin and CSRF, and drives project, session, run, plan, approve, stop, decisions and SSE only through REST.
+The harness never calls `supervisor.claim/start/recover/stop` (they are replaced by raising stubs in the harness
+process); it only reads the database and Docker, creates one synthetic credential row per case (bound to the
+REST-created project), and releases the stall fixture. Private files live in `<private_dir>/host-<UTC stamp>/<case>/`
+(mode 0700, removed on success, kept on failure). Before each host start it refuses if any other approved queued run,
+active run, or labelled running container exists (the host claims and recovers any run).
+
+- `host-happy`: run completes over REST and SSE delivers `run.state completed`; exactly one provider attempt;
+  executors inactive with exact proof; host logs hold no bootstrap token, CSRF/session value, secret-file value,
+  or other 32+ character token-like string (compared in memory only, never printed).
+- `host-stop`: `POST /runs/{id}/stop` returns 200 `canceled` twice (idempotent); the stalled operation is `unknown` with
+  its reservation unchanged; after releasing the stall there are zero late effects and still one attempt.
+- `host-extend`: host starts with `poll_seconds=30` (the loop waits one full period before its first tick) and runs A
+  (`token_limit=0`) and B approved right after; A's budget-park event and B's `running` event must be within 5 s of
+  each other, and A must park before B starts, so one tick handled both (poll 30 makes a second tick impossible in 5 s). The budget decision id is read
+  over HTTP (`event-page`, `decision.required`) and must equal the DB value; `POST decisions choice=extend`
+  (`add_tokens`/`add_elapsed_ms`) is first sent with a 1 ms read timeout (lost response); after the DB shows the decision
+  resolved, the same key is resent (200) and `token_limit`/`elapsed_limit_ms` must equal original + grant exactly once.
+  The host then requeues and completes A; one attempt per run.
+- `host-restart-retry`: stall fixture; host #1 is SIGTERMed (exit 0) while the operation is in flight, host #2's startup
+  recovery fences it: operation `unknown` with unchanged reservation, run `waiting_input/unknown_outcome`, and the pending
+  `owner_decisions` row has `issued_at` later than a DB-clock `t2` taken just before host #2 started. After releasing
+  the stall: zero late effects, one attempt (the case fails with "stall window exceeded" if host #2 was not ready within
+  19 s of the attempt, because the fixture self-releases after 20 s). `issued_at` must also be at or before the DB-clock
+  time host #2 became ready. Then four retry POSTs with the same key released by a 4-thread barrier (own
+  clients, shared cookie and CSRF) must all return 200 with identical bodies; same key with `choice=stop` returns 409 `idempotency_conflict`. Exactly one `retry-*`
+  operation bound to the original (`retry_identity`), original still `unknown`, one attempt per operation, run completes.
+
+The gate runs the same storage-headroom monitor as the matrix actors (a breach interrupts, then fail-closed cleanup).
+
+**Test-only resolver override**: `https://research.example` is NXDOMAIN, so the `--launch` mode of the script wraps
+`host.compose` to set `broker._resolver` to a fixed global address after composition. This is not product behavior
+and never runs outside this gate; the counter fixture image (dispatch image) supplies the synthetic provider.
+
+Evidence (in the run evidence dir): `b5-matrix-<case>.json` (proof, with `evidence.repo` identity),
+`b5-matrix-<case>-failure.json` on failure, and `host-<case>-<n>-stdout.log` / `-stderr.log` per host start.
+`b5_matrix_budget.py owner-retry` and `b5_matrix_restart.py unknown` proofs now also carry `evidence.repo`.
+
 ## Provenance (original under ignored `.local/` -> here, sha256 of the original)
 
 Deliberate divergences: `b5_matrix_common.py` / `b5_matrix_budget.py` (W5b, ADR-014): the owner-retry case no longer passes `dispatch_is_inactive` to `broker.configure` (the proof is registered by `supervisor.configure`) and submits the retry as a REST `POST /runs/{id}/decisions` through `create_app()` with both routers instead of calling `broker.resolve_unknown` directly; all assertions are unchanged, so their sha256 below no longer matches. The live files that now differ from the reviewed originals are `b5_matrix_common.py`, `b5_matrix_budget.py` and three `b5_native_*` scripts (P1: the module-level provider endpoint line was removed; each run sets `SCIENTIST_PROVIDER_DESTINATIONS` for its own provider id just before `revise_plan`); the sha256 table records the reviewed originals, not the current files. `b5_containment_acceptance.py` now differs from the reviewed original (its sha256 below no longer matches). `create_network` skips 172.29.x subnets already used by existing Docker networks instead of trusting the UUID-derived one. `b5_matrix_checkpoint_faults.py` and `b5_supervisor_matrix.py` also differ: a storage outage now expects `storage_unavailable` and no `reason_fixture_attested`.
 
-Fixture Dockerfiles are re-pinned to the server image they were last built from (server -09 `dac5a1ff…`, 2026-10-05); the table below records the reviewed -08 originals.
+Fixture Dockerfiles are re-pinned to the server image they were last built from (server -10 `a936a03d…`, 2026-10-05); the table below records the reviewed -08 originals.
 
 | Original | New | sha256 |
 |---|---|---|

@@ -191,7 +191,8 @@ def owner_retry() -> None:
         c.emit("owner-retry", {"schema_version": 1, "case": "owner-retry", "status": "PASS", "worker_image_digest": c.WORKER_IMAGE,
                "server_image_digest": c.SERVER_DIGEST, "fixture_image_digest": c.digest_of(counter),
                "evidence": {"run_id": str(h.run_id), "provider_attempts": 2, "operations": [(o["state"]) for o in ops],
-                            "reserved_tokens_after": run["reserved_tokens"], "generation": gen, "cleanup": cleanup}})
+                            "reserved_tokens_after": run["reserved_tokens"], "generation": gen, "cleanup": cleanup,
+                         "repo": dict(c.REPO)}})
 
 
 if __name__ == "__main__":

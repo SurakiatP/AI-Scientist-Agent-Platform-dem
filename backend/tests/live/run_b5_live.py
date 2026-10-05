@@ -101,6 +101,7 @@ def main() -> int:
     env["SCIENTIST_DATABASE_URL"] = CFG.database_url  # preflight-verified values only
     gates = [(name, [sys.executable, str(HERE / script)]) for name, script in GATES]
     gates.append(("matrix", ["zsh", str(HERE / "b5_matrix_run_serial.sh"), *MATRIX]))
+    gates.append(("host_http", [sys.executable, str(HERE / "b5_host_http_acceptance.py")]))
     results, status = [], "PASS"
     try:
         preflight(CFG, CFG.root)
