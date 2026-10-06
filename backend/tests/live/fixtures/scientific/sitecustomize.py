@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import sys
 import time
 from pathlib import Path
 
@@ -79,6 +81,47 @@ def _hold_boundary(status, receipt_committed, first_for_run, targeted):
     return status == 200 and receipt_committed and first_for_run and targeted
 
 
+_SAFE_ERROR_CODES = frozenset({
+    "scientific_binding_unavailable", "storage_unavailable", "forbidden", "invalid_request",
+    "generation_conflict", "checkpoint_conflict", "context_mismatch", "run_inactive",
+    "invalid_boundary", "expired",
+})
+
+
+def _error_code(status, response):
+    if status == 422:
+        return "validation_error"
+    chunks = []
+    remaining = 4096
+    for message in response:
+        if message.get("type") != "http.response.body":
+            continue
+        chunk = message.get("body", b"")
+        if isinstance(chunk, bytes) and chunk:
+            chunks.append(chunk[:remaining])
+            remaining -= min(remaining, len(chunk))
+            if not remaining:
+                break
+    body = b"".join(chunks)
+    try:
+        payload = json.loads(body)
+        if isinstance(payload, dict):
+            candidate = payload.get("code") if "code" in payload else payload.get("detail")
+        else:
+            candidate = None
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        candidate = None
+    return candidate if isinstance(candidate, str) and candidate in _SAFE_ERROR_CODES else "other"
+
+
+def _diagnose(status, code):
+    if type(status) is not int or not 100 <= status <= 599:
+        status = 0
+    if not isinstance(code, str) or (code not in _SAFE_ERROR_CODES and code not in ("validation_error", "other")):
+        code = "other"
+    print(f"scientific-fixture-response status={status} code={code}", file=sys.stderr, flush=True)
+
+
 def _synthetic_model(request, target):
     stage = _stage(request, target)
     from sqlalchemy import text
@@ -110,9 +153,19 @@ class _BoundaryAckBarrier:
         response = []
         async def capture(message):
             response.append(message)
-        await self.app(scope, receive, capture)
+        try:
+            await self.app(scope, receive, capture)
+        except Exception as exc:
+            name = type(exc).__name__
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", name):
+                name = "Exception"
+            print(f"scientific-fixture-exception status=500 code=other exception_class={name}",
+                  file=sys.stderr, flush=True)
+            raise
         start = next((m for m in response if m.get("type") == "http.response.start"), None)
         if start is None or start.get("status") != 200:
+            status = start.get("status", 0) if start is not None else 0
+            _diagnose(status, _error_code(status, response))
             for message in response:
                 await send(message)
             return

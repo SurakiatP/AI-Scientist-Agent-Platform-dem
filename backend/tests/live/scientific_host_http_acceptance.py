@@ -2,8 +2,10 @@
 """W1 real-host acceptance: synthetic provider, sealed profile, receipt recovery and HTTP API."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,8 +83,69 @@ def self_check() -> None:
     present = SimpleNamespace(q=lambda query: [{"relation": "w1_boundary_barriers"}])
     assert not _boundary_barrier_table_ready(absent)
     assert _boundary_barrier_table_ready(present)
+    _self_check_boundary_diagnostics(fixture)
     _self_check_b5_prerequisites()
     print(json.dumps({"status": "PASS", "check": "scientific-driver-prerequisites"}))
+
+
+def _self_check_boundary_diagnostics(fixture) -> None:
+    secret = "SYNTHETIC_PRIVATE_DETAIL_MUST_NOT_APPEAR"
+    original = [
+        {"type": "http.response.start", "status": 403,
+         "headers": [(b"authorization", secret.encode()), (b"x-request-id", b"synthetic-id")]},
+        {"type": "http.response.body",
+         "body": json.dumps({"code": "forbidden", "message": secret, "request_id": secret}).encode(),
+         "more_body": False},
+    ]
+
+    async def app_for(messages, sent):
+        async def app(scope, receive, send):
+            for message in messages:
+                await send(message)
+        async def send(message):
+            sent.append(message)
+        await fixture._BoundaryAckBarrier(app, SimpleNamespace(run_id=uuid4(), generation=1))(
+            {"type": "http", "path": "/control/boundary"}, lambda: None, send)
+
+    for messages, expected in (
+        (original, "scientific-fixture-response status=403 code=forbidden\n"),
+        ([original[0], dict(original[1], body=json.dumps({"detail": "scientific_binding_unavailable"}).encode())],
+         "scientific-fixture-response status=403 code=scientific_binding_unavailable\n"),
+        ([dict(original[0], status=422), original[1]],
+         "scientific-fixture-response status=422 code=validation_error\n"),
+        ([original[0], dict(original[1], body=json.dumps({"code": secret, "message": secret}).encode())],
+         "scientific-fixture-response status=403 code=other\n"),
+        ([original[0], dict(original[1], body=json.dumps({"detail": {"code": "forbidden"}}).encode())],
+         "scientific-fixture-response status=403 code=other\n"),
+        ([original[0], dict(original[1], body=json.dumps({"detail": ["forbidden"]}).encode())],
+         "scientific-fixture-response status=403 code=other\n"),
+        ([original[0], dict(original[1], body=json.dumps({"detail": secret}).encode())],
+         "scientific-fixture-response status=403 code=other\n"),
+    ):
+        sent, output = [], io.StringIO()
+        with redirect_stderr(output):
+            asyncio.run(app_for(messages, sent))
+        if sent != messages or output.getvalue() != expected or len(expected) > 128 or secret in output.getvalue():
+            raise AssertionError("fixture response diagnostic changed response bytes or emitted unsafe content")
+
+    failure = RuntimeError(secret)
+    async def broken_app(scope, receive, send):
+        raise failure
+    wrapper = fixture._BoundaryAckBarrier(broken_app, SimpleNamespace(run_id=uuid4(), generation=1))
+    output = io.StringIO()
+    try:
+        with redirect_stderr(output):
+            asyncio.run(wrapper({"type": "http", "path": "/control/boundary"}, lambda: None,
+                                lambda message: asyncio.sleep(0)))
+    except RuntimeError as caught:
+        if caught is not failure:
+            raise AssertionError("fixture did not reraise the original app exception")
+    else:
+        raise AssertionError("fixture swallowed an unhandled app exception")
+    diagnostic = output.getvalue()
+    expected = "scientific-fixture-exception status=500 code=other exception_class=RuntimeError\n"
+    if diagnostic != expected or secret in diagnostic:
+        raise AssertionError("fixture exception diagnostic contains unsafe content")
 
 
 def _self_check_b5_prerequisites() -> None:
