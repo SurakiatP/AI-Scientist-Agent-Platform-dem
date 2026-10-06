@@ -242,6 +242,13 @@ def write_browser_session(api, host, destination: Path) -> Path:
     return destination
 
 
+def configure_host_database(host) -> None:
+    passfile = os.environ.get("PGPASSFILE")
+    if not passfile:
+        raise RuntimeError("W2 PostgreSQL passfile not configured")
+    host.env["PGPASSFILE"] = passfile
+
+
 def run() -> None:
     try:
         raw, _core, config_path = load_config()
@@ -322,6 +329,7 @@ def run() -> None:
         "web_dist_dir": str(_repo_path(raw["web_dist_dir"])),
     })
     host.env["SCIENTIST_SCHOLARLY_ENDPOINTS"] = SCHOLARLY_ENDPOINTS
+    configure_host_database(host)
     host.cfg_path.write_text(json.dumps(host.cfg, sort_keys=True))
     host.cfg_path.chmod(0o600)
     shutil.copytree(raw["sealed_profile_evidence_dir"], host.state / "profiles")

@@ -102,6 +102,7 @@ def _load_runtime():
 
 
 def _host(common, host_http, raw, evidence_dir: Path, label: str, provider_id: uuid.UUID):
+    from w2_scientific_acceptance import configure_host_database
     root = evidence_dir / label
     root.mkdir(mode=0o700, exist_ok=False)
     host = host_http.HostProc(label, root, provider_id, raw["scientific_fixture_image"], 0.5)
@@ -115,6 +116,7 @@ def _host(common, host_http, raw, evidence_dir: Path, label: str, provider_id: u
         "web_dist_dir": str(Path(raw["web_dist_dir"]).resolve()),
     })
     host.env["SCIENTIST_SCHOLARLY_ENDPOINTS"] = "https://api.crossref.org"
+    configure_host_database(host)
     host.cfg_path.write_text(json.dumps(host.cfg, sort_keys=True))
     host.cfg_path.chmod(0o600)
     import shutil
@@ -387,6 +389,7 @@ def _run_recovery() -> None:
         host2.cfg_path.write_text(json.dumps(host2.cfg, sort_keys=True))
         host2.cfg_path.chmod(0o600)
         host2.env["SCIENTIST_SCHOLARLY_ENDPOINTS"] = "https://api.crossref.org"
+        w2.configure_host_database(host2)
         api.close()
         api = host2.start()
         fenced = wait_for(
