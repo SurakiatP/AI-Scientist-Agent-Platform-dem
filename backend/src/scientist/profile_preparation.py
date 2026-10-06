@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import hmac
 import json
+import re
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Callable, Literal
 from uuid import UUID, uuid4
@@ -22,10 +23,12 @@ from scientist.contracts import (PreparationJobView, PreparationSubmit, Principa
 ROOT = Path(__file__).resolve().parents[3]
 PROFILE_ID = "prof.worker-base@py3.14.7"
 _SHA = r"^[a-f0-9]{64}$"
+_IMAGE_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 Digest = Annotated[str, Field(pattern=_SHA)]
 Positive = Annotated[StrictInt, Field(ge=1)]
 _builder: Callable[["Profile", UUID], dict] | None = None
 _evidence_key: bytes | None = None
+_expected_image_digest: str | None = None
 
 
 class _Record(BaseModel):
@@ -158,18 +161,31 @@ def configure_evidence_key(key: bytes | None) -> None:
     _evidence_key = key
 
 
-def configure_builder(callback: Callable[[Profile, UUID], dict] | None, *, evidence_key: bytes | None = None) -> None:
+def configure_builder(
+    callback: Callable[[Profile, UUID], dict] | None,
+    *,
+    expected_image_digest: str | None = None,
+    evidence_key: bytes | None = None,
+) -> None:
     """Trusted host only. Reuse a private host key; never accept it through owner APIs.
 
     The callback must enforce the profile's time/resource limits and verify actual
     build/scan/SBOM/license/isolation files before returning their proof summaries.
     No callback is configured by imports or by a setup/read/preparation request.
     """
-    global _builder
+    global _builder, _expected_image_digest
     if callback is not None and (not callable(callback) or evidence_key is None):
         raise ValueError("trusted builder requires evidence authentication")
+    if expected_image_digest is not None and (
+        not isinstance(expected_image_digest, str)
+        or _IMAGE_DIGEST.fullmatch(expected_image_digest) is None
+    ):
+        raise ValueError("worker image digest invalid")
+    if evidence_key is not None and (not isinstance(evidence_key, bytes) or len(evidence_key) < 32):
+        raise ValueError("preparation evidence key is invalid")
     configure_evidence_key(evidence_key)
     _builder = callback
+    _expected_image_digest = expected_image_digest
 
 
 def _owner_project(db: Session, owner: Principal, project_id: UUID) -> None:
@@ -221,14 +237,22 @@ def _signature(proof: dict) -> str:
     return hmac.new(_evidence_key, b"scientist.profile-preparation.v1\0" + _bytes(proof), "sha256").hexdigest()
 
 
-def _verified(row) -> BuildProof | None:
+def _verified(row, *, expected_image_digest: str | None = None) -> BuildProof | None:
     try:
+        expected = _expected_image_digest if expected_image_digest is None else expected_image_digest
+        if not isinstance(expected, str) or _IMAGE_DIGEST.fullmatch(expected) is None:
+            return None
         envelope = row.evidence
         if not isinstance(envelope, dict) or set(envelope) != {"proof", "signature"}:
             return None
         if not hmac.compare_digest(_signature(envelope["proof"]), envelope["signature"]):
             return None
-        return _validate_proof(envelope["proof"], _profile(row.profile_id, row.version, row.manifest_sha256.strip()), row.id)
+        proof = _validate_proof(
+            envelope["proof"], _profile(row.profile_id, row.version, row.manifest_sha256.strip()), row.id
+        )
+        if proof.image_digest != expected:
+            return None
+        return proof
     except (ValueError, TypeError, DomainError):
         return None
 
@@ -347,7 +371,8 @@ def validate_binding_for_run(db: Session, project_id: UUID, binding: ScientificB
     if not require_ready:
         return
     row = _latest(db, owner, profile)
-    proof = _verified(row) if row is not None and row.state == "ready" else None
+    proof = (_verified(row, expected_image_digest=binding.image_digest)
+             if row is not None and row.state == "ready" else None)
     if proof is None or proof.image_digest != binding.image_digest:
         raise DomainError("scientific_environment_not_ready", 409)
 

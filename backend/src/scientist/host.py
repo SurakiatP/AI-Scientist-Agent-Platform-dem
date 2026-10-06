@@ -305,7 +305,9 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
         except Exception as exc:
             raise BuildFailure('environment_unavailable') from exc
         return accepted(profile, job_id)
-    profile_preparation.configure_builder(prepare_profile, evidence_key=capability_key)
+    profile_preparation.configure_builder(
+        prepare_profile, expected_image_digest=pin, evidence_key=capability_key
+    )
     os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(cfg.secrets_dir / "master_key")
     global _destinations
     _destinations = dict(cfg.provider_destinations)

@@ -147,7 +147,7 @@ def test_cross_owner_builds_cannot_overlap(db, owner):
         with session() as connection:
             return prep.process_next_job(connection, owner_identity=identity)
 
-    prep.configure_builder(builder, evidence_key=b"k" * 32)
+    prep.configure_builder(builder, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     with ThreadPoolExecutor(max_workers=2) as pool:
         running = pool.submit(process, owner.identity)
         try:
@@ -174,7 +174,7 @@ def test_unknown_build_blocks_another_owner(db, owner):
         calls.append(job_id)
         raise prep.BuildOutcomeUnknown()
 
-    prep.configure_builder(builder, evidence_key=b"k" * 32)
+    prep.configure_builder(builder, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     assert prep.process_next_job(db, owner_identity=owner.identity) == first.id
     assert prep.process_next_job(db, owner_identity=other.identity) is None
     assert calls == [first.id]
@@ -225,14 +225,17 @@ def test_host_evidence_is_signed_current_and_not_public(db, owner):
             observed.append(state)
         return proof(profile, job_id)
 
-    prep.configure_builder(builder, evidence_key=b"k" * 32)
+    prep.configure_builder(builder, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     prep.process_next_job(db, owner_identity=owner.identity)
     view = prep.get_job(db, owner, project, job.id)
     assert observed == ["building"]
     assert view.state == "ready" and view.evidence_verified
     assert "evidence" not in view.model_dump() and "signature" not in view.model_dump()
-    prep.configure_builder(None, evidence_key=b"k" * 32)
+    prep.configure_builder(None, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     assert prep.get_job(db, owner, project, job.id).state == "ready"
+    prep.configure_builder(None, evidence_key=b"k" * 32)
+    assert prep.get_job(db, owner, project, job.id).state == "blocked"
+    prep.configure_builder(None, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     prep.configure_evidence_key(b"x" * 32)
     assert prep.get_job(db, owner, project, job.id).state == "blocked"
     prep.configure_evidence_key(b"k" * 32)
@@ -295,7 +298,7 @@ def test_trusted_progress_cannot_skip_evidence_or_move_backwards(db, owner):
             prep.record_stage(db, job_id, "complete")
         return proof(profile, job_id)
 
-    prep.configure_builder(builder, evidence_key=b"k" * 32)
+    prep.configure_builder(builder, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     prep.process_next_job(db, owner_identity=owner.identity)
     assert prep.get_job(db, owner, project, job.id).state == "ready"
 
@@ -310,9 +313,99 @@ def test_immutable_prebuilt_image_can_be_rechecked_without_rebuilding(db, owner)
         result["built_at"] = (datetime.now(timezone.utc)-timedelta(days=30)).isoformat()
         return result
 
-    prep.configure_builder(verifier, evidence_key=b"k" * 32)
+    prep.configure_builder(verifier, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     prep.process_next_job(db, owner_identity=owner.identity)
     assert prep.get_job(db, owner, project, job.id).state == "ready"
+
+
+def test_stale_ready_image_is_not_reused_but_exact_replay_is_idempotent(db, owner):
+    project = new_project(db)
+    key = b"k" * 32
+    image_a = "sha256:" + "a" * 64
+    image_b = "sha256:" + "b" * 64
+    first_body = submission()
+    first = prep.request_preparation(db, owner, project, first_body)
+    db.commit()
+    prep.configure_builder(
+        lambda profile, job_id: {**proof(profile, job_id), "image_digest": image_a},
+        expected_image_digest=image_a,
+        evidence_key=key,
+    )
+    prep.process_next_job(db, owner_identity=owner.identity)
+    old_evidence = db.execute(
+        text("SELECT evidence FROM profile_preparations WHERE id=:id"), {"id": first.id}
+    ).scalar_one()
+    assert prep.get_job(db, owner, project, first.id).state == "ready"
+
+    builder_calls = []
+    prep.configure_builder(
+        lambda profile, job_id: builder_calls.append(job_id)
+        or {**proof(profile, job_id), "image_digest": image_b},
+        expected_image_digest=image_b,
+        evidence_key=key,
+    )
+    replacement_body = submission()
+    replacement = prep.request_preparation(db, owner, project, replacement_body)
+    assert replacement.id != first.id
+    assert replacement.state == "queued"
+    assert prep.get_job(db, owner, project, first.id).state == "blocked"
+    assert prep.get_setup(db, owner, project).profiles[0].state == "preparing"
+    assert builder_calls == []
+
+    replay = prep.request_preparation(db, owner, project, first_body)
+    assert replay.id == first.id and replay.state == "blocked"
+    assert builder_calls == []
+    assert db.execute(
+        text("SELECT evidence FROM profile_preparations WHERE id=:id"), {"id": first.id}
+    ).scalar_one() == old_evidence
+
+    assert prep.process_next_job(db, owner_identity=owner.identity) == replacement.id
+    assert prep.get_job(db, owner, project, replacement.id).state == "ready"
+    reused = prep.request_preparation(db, owner, project, submission())
+    assert reused.id == replacement.id and reused.state == "ready"
+    assert builder_calls == [replacement.id]
+
+    with pytest.raises(DomainError):
+        prep.validate_binding_for_run(
+            db, project, binding(image_digest=image_a), owner=owner
+        )
+
+
+def test_wrong_image_builder_output_never_has_a_ready_view_or_reuse(db, owner):
+    project = new_project(db)
+    expected = "sha256:" + "a" * 64
+    wrong = "sha256:" + "b" * 64
+    job = prep.request_preparation(db, owner, project, submission())
+    db.commit()
+    calls = []
+    prep.configure_builder(
+        lambda profile, job_id: calls.append(job_id)
+        or {**proof(profile, job_id), "image_digest": wrong},
+        expected_image_digest=expected,
+        evidence_key=b"k" * 32,
+    )
+
+    assert prep.process_next_job(db, owner_identity=owner.identity) == job.id
+    assert prep.get_job(db, owner, project, job.id).state == "blocked"
+    assert prep.get_setup(db, owner, project).profiles[0].state == "blocked"
+    replacement = prep.request_preparation(db, owner, project, submission())
+    assert replacement.id != job.id and replacement.state == "queued"
+    assert calls == [job.id]
+
+
+def test_malformed_worker_image_pin_does_not_change_trusted_builder_configuration():
+    callback = lambda *_: {}
+    image = "sha256:" + "a" * 64
+    prep.configure_builder(callback, expected_image_digest=image, evidence_key=b"k" * 32)
+    with pytest.raises(ValueError):
+        prep.configure_builder(lambda *_: {}, expected_image_digest="sha256:bad", evidence_key=b"x" * 32)
+    assert prep._builder is callback
+    assert prep._expected_image_digest == image
+    assert prep._evidence_key == b"k" * 32
+
+    prep.configure_builder(None)
+    assert prep._builder is None
+    assert prep._expected_image_digest is None
 
 
 @pytest.mark.parametrize("mutate", [
@@ -337,7 +430,7 @@ def test_failed_or_unproven_build_cannot_become_ready(db, owner, mutate):
         mutate(result)
         return result
 
-    prep.configure_builder(builder, evidence_key=b"k" * 32)
+    prep.configure_builder(builder, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     prep.process_next_job(db, owner_identity=owner.identity)
     view = prep.get_job(db, owner, project, job.id)
     assert view.state == "failed" and not view.evidence_verified
@@ -353,7 +446,7 @@ def test_unknown_launch_is_never_replayed(db, owner):
         calls.append(1)
         raise prep.BuildOutcomeUnknown()
 
-    prep.configure_builder(builder, evidence_key=b"k" * 32)
+    prep.configure_builder(builder, expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
     prep.process_next_job(db, owner_identity=owner.identity)
     assert prep.get_job(db, owner, project, job.id).state == "unknown"
     assert prep.process_next_job(db, owner_identity=owner.identity) is None and calls == [1]

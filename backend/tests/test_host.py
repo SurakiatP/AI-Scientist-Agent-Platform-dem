@@ -72,7 +72,7 @@ def iso(monkeypatch):
 @pytest.fixture(autouse=True)
 def restore_globals(monkeypatch):
     for module, names in ((supervisor, ["_config"]), (checkpoints, ["_trusted_pins"]),
-                          (profile_preparation, ["_builder", "_evidence_key"]),
+                          (profile_preparation, ["_builder", "_evidence_key", "_expected_image_digest"]),
                           (scientific_authority, ["_bundle_root"]),
                           (objects, ["_configured_client", "BUCKET"]),
                           (broker, ["_capability_key", "_provider_destinations", "_resolver", "_transport",
@@ -216,6 +216,7 @@ def test_config_rejects_unsafe_values(tmp_path):
 # 2
 def test_compose_configures_runtime(tmp_path):
     cfg, s3, engine = _compose(tmp_path)
+    assert profile_preparation._expected_image_digest == WORKER_DIGEST
     assert supervisor._config is not None and supervisor._config.engine is engine
     assert supervisor._config.image == f"registry.local/worker@{WORKER_DIGEST}"
     assert broker._dispatch_inactivity_proof is not None
