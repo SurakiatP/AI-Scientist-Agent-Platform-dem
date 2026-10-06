@@ -71,7 +71,7 @@ class ExecutorRef:
     operation_id: str | None
     process_incarnation: UUID
     engine_id: str
-    container_id: str
+    container_id: str | None
 
 
 @dataclass(frozen=True)
@@ -247,6 +247,8 @@ class RuntimeConfig:
     capability_factory: Callable[[Session, UUID, int], str]
     dispatch: DispatchRuntime
     engine: "DockerWorkerEngine"
+    compute_engine: object | None = None
+    compute_image_digest: str | None = None
 
 
 _config: RuntimeConfig | None = None
@@ -266,6 +268,8 @@ def configure(
     capability_factory: Callable[[Session, UUID, int], str],
     dispatch: DispatchRuntime,
     engine: "DockerWorkerEngine | None" = None,
+    compute_engine: object | None = None,
+    compute_image_digest: str | None = None,
 ) -> None:
     """Install trusted runtime inputs; worker requests cannot set these values."""
     global _config
@@ -280,6 +284,8 @@ def configure(
         or not re.fullmatch(r"[a-f0-9]{64}", skills_digest)
         or not re.fullmatch(r"[a-f0-9]{64}", environment_digest)
         or not 1 <= broker_port <= 65535
+        or ((compute_engine is None) != (compute_image_digest is None))
+        or (compute_image_digest is not None and not re.fullmatch(r"sha256:[a-f0-9]{64}", compute_image_digest))
     ):
         raise ValueError("runtime image and trusted pins must be immutable")
     try:
@@ -293,6 +299,7 @@ def configure(
         skills_digest=skills_digest, environment_digest=environment_digest,
         bootstrap_factory=bootstrap_factory, capability_factory=capability_factory,
         dispatch=dispatch, engine=engine or DockerWorkerEngine(),
+        compute_engine=compute_engine, compute_image_digest=compute_image_digest,
     )
     checkpoints.configure_trusted_pins(
         image_digest=image_digest, skills_digest=skills_digest,
@@ -745,6 +752,68 @@ def recover(db: Session, run_id: UUID, *, budget_resume: bool = False) -> RunVie
             continue
         missing_physical_identity = not executor["container_id"] or not executor["engine_id"]
 
+        if executor["kind"] == "compute":
+            if cfg.compute_engine is None or cfg.compute_image_digest is None:
+                uncertain = True
+                db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
+                           {"id": executor["id"]})
+                continue
+            from scientist.compute_runtime import find_compute, stop_compute
+            operation_id = str(executor["compute_operation_id"])
+            intent = ExecutorRef(
+                executor["id"], run_id, executor["generation"], "compute", operation_id,
+                executor["process_incarnation"], executor["engine_id"], executor["container_id"],
+            )
+            try:
+                ref = find_compute(cfg.compute_engine, intent, expected_image_digest=cfg.compute_image_digest)
+            except Exception:
+                ref = False
+            if ref is False or ref is None or not _matches_executor(
+                {**executor, "container_id": ref.container_id, "engine_id": ref.engine_id}, ref
+            ):
+                uncertain = True
+                db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
+                           {"id": executor["id"]})
+                continue
+            if executor["state"] == "unknown" and not _requalify_unknown_executor(db, executor, ref):
+                uncertain = True
+                continue
+            if missing_physical_identity:
+                try:
+                    _bind_executor(db, ref)
+                except Exception:
+                    uncertain = True
+                    db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
+                               {"id": executor["id"]})
+                    continue
+            try:
+                stop_compute(cfg.compute_engine, ref, expected_image_digest=cfg.compute_image_digest)
+            except Exception:
+                uncertain = True
+                db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
+                           {"id": executor["id"]})
+                continue
+            proof = {
+                "source": "owned-engine-exact-container",
+                "engine_id": ref.engine_id,
+                "container_id": ref.container_id,
+                "stopped_at": datetime.now(timezone.utc).isoformat(),
+            }
+            changed = db.execute(text("""
+                UPDATE runtime_executors SET state='inactive', proof=CAST(:proof AS jsonb), updated_at=now()
+                WHERE id=:id AND run_id=:run AND generation=:generation AND kind='compute'
+                  AND compute_operation_id=:operation AND container_id=:container
+                  AND engine_id=:engine AND process_incarnation=:incarnation
+            """), {
+                "proof": json.dumps(proof, sort_keys=True), "id": ref.executor_id,
+                "run": ref.run_id, "generation": ref.generation, "operation": ref.operation_id,
+                "container": ref.container_id, "engine": ref.engine_id,
+                "incarnation": ref.process_incarnation,
+            }).rowcount
+            if changed != 1:
+                uncertain = True
+            continue
+
         if executor["kind"] == "worker":
             ref = None
             if missing_physical_identity:
@@ -1017,7 +1086,7 @@ def _fence_generation(db: Session, run_id: UUID, generation: int | None, grace_s
     db.execute(text("SELECT pg_advisory_xact_lock(hashtext('scientist.supervisor.claim'))"))
     rows = db.execute(text("""
         SELECT * FROM runtime_executors WHERE run_id=:run
-            AND (CAST(:generation AS integer) IS NULL OR generation=:generation)
+          AND (CAST(:generation AS integer) IS NULL OR generation=:generation)
         ORDER BY CASE kind WHEN 'worker' THEN 0 ELSE 1 END, id FOR UPDATE
     """), {"run": run_id, "generation": generation}).mappings().all()
     complete = True
@@ -1036,64 +1105,69 @@ def _fence_generation(db: Session, run_id: UUID, generation: int | None, grace_s
             continue
         pending_rows.append((row, _executor_ref(row)))
 
-    # Safety: the caller already committed the stopping/cancel_requested broker reservation, which
-    # requires state='running', so no new effect can start; stopping concurrently adds no risk and
-    # worker-first ordering adds no safety. Threads never touch the SQLAlchemy session
-    # (DockerDispatchRuntime.stop ignores db), so only Docker calls run in parallel.
     def stop_one(ref: ExecutorRef) -> bool:
         try:
             if ref.kind == "worker":
                 return bool(cfg.engine.stop_worker(ref, grace_seconds))
-            return bool(cfg.dispatch.stop(None, ref, grace_seconds))  # type: ignore[arg-type]
+            if ref.kind == "dispatch":
+                return bool(cfg.dispatch.stop(None, ref, grace_seconds))  # type: ignore[arg-type]
+            if ref.kind == "compute" and cfg.compute_engine is not None and cfg.compute_image_digest is not None:
+                from scientist.compute_runtime import stop_compute
+                stop_compute(cfg.compute_engine, ref, expected_image_digest=cfg.compute_image_digest)
+                return True
         except Exception:
             return False
+        return False
 
-    outcomes: list[bool] = []
+    outcomes = []
     if pending_rows:
         with ThreadPoolExecutor(max_workers=min(len(pending_rows), 8)) as pool:
             outcomes = list(pool.map(stop_one, [ref for _, ref in pending_rows]))
 
     for (row, ref), stopped in zip(pending_rows, outcomes):
-        if ref.kind == "worker":
-            ok = stopped
-            if ok:
-                proof = {
-                    "source": "owned-engine-generation-fence",
-                    "engine_id": ref.engine_id,
-                    "container_id": ref.container_id,
-                    "stopped_at": datetime.now(timezone.utc).isoformat(),
-                }
-                ok = db.execute(text("""
-                    UPDATE runtime_executors
-                    SET state='inactive', proof=CAST(:proof AS jsonb), updated_at=now()
-                    WHERE id=:id AND run_id=:run AND generation=:generation
-                      AND kind='worker' AND container_id=:container AND engine_id=:engine
-                      AND process_incarnation=:incarnation
-                """), {
-                    "proof": json.dumps(proof, sort_keys=True),
-                    "id": ref.executor_id,
-                    "run": ref.run_id,
-                    "generation": ref.generation,
-                    "container": ref.container_id,
-                    "engine": ref.engine_id,
-                    "incarnation": ref.process_incarnation,
-                }).rowcount == 1
+        proof = {
+            "source": "owned-engine-generation-fence",
+            "engine_id": ref.engine_id,
+            "container_id": ref.container_id,
+            "stopped_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if not stopped:
+            ok = False
+        elif ref.kind == "worker":
+            ok = db.execute(text("""
+                UPDATE runtime_executors SET state='inactive', proof=CAST(:proof AS jsonb), updated_at=now()
+                WHERE id=:id AND run_id=:run AND generation=:generation AND kind='worker'
+                  AND container_id=:container AND engine_id=:engine AND process_incarnation=:incarnation
+            """), {
+                "proof": json.dumps(proof, sort_keys=True), "id": ref.executor_id,
+                "run": ref.run_id, "generation": ref.generation, "container": ref.container_id,
+                "engine": ref.engine_id, "incarnation": ref.process_incarnation,
+            }).rowcount == 1
+        elif ref.kind == "compute":
+            ok = db.execute(text("""
+                UPDATE runtime_executors SET state='inactive', proof=CAST(:proof AS jsonb), updated_at=now()
+                WHERE id=:id AND run_id=:run AND generation=:generation AND kind='compute'
+                  AND compute_operation_id=:operation AND container_id=:container
+                  AND engine_id=:engine AND process_incarnation=:incarnation
+            """), {
+                "proof": json.dumps(proof, sort_keys=True), "id": ref.executor_id,
+                "run": ref.run_id, "generation": ref.generation, "operation": ref.operation_id,
+                "container": ref.container_id, "engine": ref.engine_id,
+                "incarnation": ref.process_incarnation,
+            }).rowcount == 1
+        elif ref.kind == "dispatch":
+            pending = db.execute(text("""
+                SELECT operation_id FROM operations WHERE run_id=:run AND generation=:generation
+                  AND state IN ('reserved','unknown')
+            """), {"run": run_id, "generation": row["generation"]}).scalars().all()
+            ok = _record_dispatch_inactive(db, cfg.dispatch, row["id"], ref, pending, proof)
         else:
-            pending = db.execute(text("""SELECT operation_id FROM operations WHERE run_id=:run AND generation=:generation
-                AND state IN ('reserved','unknown')"""),
-                {"run": run_id, "generation": row["generation"]}).scalars().all()
-            proof = {"source": "owned-engine-generation-fence", "engine_id": ref.engine_id,
-                     "container_id": ref.container_id, "stopped_at": datetime.now(timezone.utc).isoformat()}
-            ok = stopped and _record_dispatch_inactive(
-                db, cfg.dispatch, row["id"], ref, pending, proof
-            )
-        state = "inactive" if ok else "unknown"
+            ok = False
         complete = complete and ok
         db.execute(text("UPDATE runtime_executors SET state=:state, updated_at=now() WHERE id=:id"),
-                   {"state": state, "id": row["id"]})
-    db.commit()
+                   {"state": "inactive" if ok else "unknown", "id": row["id"]})
+        db.commit()
     return complete
-
 
 def _active_run(db: Session, run_id: UUID, generation: int):
     row = db.execute(text("SELECT * FROM runs WHERE id=:run FOR UPDATE"), {"run": run_id}).mappings().one_or_none()
@@ -1104,14 +1178,144 @@ def _active_run(db: Session, run_id: UUID, generation: int):
     return row
 
 
+def reserve_compute_executor(db: Session, request, *, engine_id: str) -> tuple[ExecutorRef, bool]:
+    """Persist one compute launch intent and never replace an existing identity."""
+    if request.kind != "compute" or not engine_id or len(engine_id) > 200:
+        raise RuntimeError("invalid compute launch intent")
+    run = db.execute(
+        text("SELECT state, generation FROM runs WHERE id=:run FOR UPDATE"),
+        {"run": request.run_id},
+    ).mappings().one_or_none()
+    operation = db.execute(text("""
+        SELECT kind, generation, payload_hash, state, result
+        FROM operations WHERE run_id=:run AND operation_id=:operation FOR UPDATE
+    """), {"run": request.run_id, "operation": request.operation_id}).mappings().one_or_none()
+    if (
+        run is None or run["state"] != "running" or run["generation"] != request.generation
+        or operation is None or operation["kind"] != "compute"
+        or operation["generation"] != request.generation or operation["state"] != "reserved"
+        or operation["payload_hash"].strip() != broker._fingerprint(request)
+    ):
+        raise DomainError("revision_conflict", 409)
+    try:
+        stored_request = operation["result"]["request"]
+    except (KeyError, TypeError):
+        raise DomainError("storage_unavailable", 503) from None
+    if stored_request != request.model_dump(mode="json"):
+        raise DomainError("storage_unavailable", 503)
+
+    row = db.execute(text("""
+        SELECT * FROM runtime_executors
+        WHERE run_id=:run AND kind='compute' AND compute_operation_id=:operation
+        FOR UPDATE
+    """), {"run": request.run_id, "operation": request.operation_id}).mappings().one_or_none()
+    if row is not None:
+        if row["generation"] != request.generation or row["engine_id"] not in (None, engine_id):
+            raise DomainError("revision_conflict", 409)
+        db.rollback()
+        return _executor_ref(row), False
+
+    executor_id, incarnation = uuid4(), uuid4()
+    proof = json.dumps({"source": "compute-launch-intent", "engine_id": engine_id}, sort_keys=True)
+    db.execute(text("""
+        INSERT INTO runtime_executors
+            (id, run_id, generation, kind, operation_id, compute_operation_id,
+             process_incarnation, engine_id, container_id, state, proof)
+        VALUES (:id, :run, :generation, 'compute', NULL, :operation,
+                :incarnation, :engine, NULL, 'starting', CAST(:proof AS jsonb))
+    """), {
+        "id": executor_id, "run": request.run_id, "generation": request.generation,
+        "operation": request.operation_id, "incarnation": incarnation,
+        "engine": engine_id, "proof": proof,
+    })
+    db.commit()
+    return ExecutorRef(
+        executor_id, request.run_id, request.generation, "compute", request.operation_id,
+        incarnation, engine_id, None,
+    ), True
+
+
+def bind_compute_executor(db: Session, ref: ExecutorRef) -> ExecutorRef:
+    if ref.kind != "compute" or ref.operation_id is None or ref.container_id is None:
+        raise RuntimeError("invalid bound compute identity")
+    _bind_executor(db, ref)
+    return ref
+
+
+def start_compute_executor(db: Session, ref: ExecutorRef, request, start) -> None:
+    """Serialize the external start with stop/recovery and revalidate its journal first."""
+    if ref.kind != "compute" or ref.operation_id is None or ref.container_id is None:
+        raise RuntimeError("invalid compute identity")
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext('scientist.supervisor.claim'))"))
+    _active_run(db, ref.run_id, ref.generation)
+    operation = db.execute(text("""
+        SELECT kind, generation, state, payload_hash FROM operations
+        WHERE run_id=:run AND operation_id=:operation FOR UPDATE
+    """), {"run": ref.run_id, "operation": ref.operation_id}).mappings().one_or_none()
+    if (
+        operation is None or operation["kind"] != "compute"
+        or operation["generation"] != ref.generation or operation["state"] != "reserved"
+        or operation["payload_hash"].strip() != broker._fingerprint(request)
+        or request.run_id != ref.run_id or request.operation_id != ref.operation_id
+    ):
+        db.rollback()
+        raise DomainError("revision_conflict", 409)
+    changed = db.execute(text("""
+        UPDATE runtime_executors SET state='active', updated_at=now()
+        WHERE id=:id AND run_id=:run AND generation=:generation AND kind='compute'
+          AND compute_operation_id=:operation AND process_incarnation=:incarnation
+          AND engine_id=:engine AND container_id=:container AND state='starting'
+    """), {
+        "id": ref.executor_id, "run": ref.run_id, "generation": ref.generation,
+        "operation": ref.operation_id, "incarnation": ref.process_incarnation,
+        "engine": ref.engine_id, "container": ref.container_id,
+    }).rowcount
+    if changed != 1:
+        db.rollback()
+        raise RuntimeError("compute identity changed before start")
+    try:
+        start()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
+def mark_compute_executor_inactive(db: Session, ref: ExecutorRef) -> None:
+    if ref.kind != "compute" or ref.operation_id is None or ref.container_id is None:
+        raise RuntimeError("invalid compute identity")
+    proof = {
+        "source": "owned-engine-exact-container",
+        "engine_id": ref.engine_id,
+        "container_id": ref.container_id,
+        "stopped_at": datetime.now(timezone.utc).isoformat(),
+    }
+    changed = db.execute(text("""
+        UPDATE runtime_executors SET state='inactive', proof=CAST(:proof AS jsonb), updated_at=now()
+        WHERE id=:id AND run_id=:run AND generation=:generation AND kind='compute'
+          AND compute_operation_id=:operation AND container_id=:container
+          AND engine_id=:engine AND process_incarnation=:incarnation
+          AND state IN ('starting','active','unknown')
+    """), {
+        "proof": json.dumps(proof, sort_keys=True), "id": ref.executor_id,
+        "run": ref.run_id, "generation": ref.generation, "operation": ref.operation_id,
+        "container": ref.container_id, "engine": ref.engine_id,
+        "incarnation": ref.process_incarnation,
+    }).rowcount
+    if changed != 1:
+        raise RuntimeError("compute stop identity changed")
+    db.commit()
+
+
 def _bind_executor(db: Session, ref: ExecutorRef) -> None:
     if (not re.fullmatch(r"[a-f0-9]{64}", ref.container_id)
             or not ref.engine_id or len(ref.engine_id) > 200):
         raise RuntimeError("engine returned invalid physical identity")
-    changed = db.execute(text("""
+    operation_column = "compute_operation_id" if ref.kind == "compute" else "operation_id"
+    changed = db.execute(text(f"""
         UPDATE runtime_executors SET container_id=:container, engine_id=:engine, updated_at=now()
         WHERE id=:id AND run_id=:run AND generation=:generation AND kind=:kind
-          AND operation_id IS NOT DISTINCT FROM :operation_id
+          AND {operation_column} IS NOT DISTINCT FROM :operation_id
           AND process_incarnation=:incarnation AND state='starting' AND container_id IS NULL
           AND (engine_id IS NULL OR engine_id=:engine)
     """), {"container": ref.container_id, "engine": ref.engine_id, "id": ref.executor_id,
@@ -1123,12 +1327,13 @@ def _bind_executor(db: Session, ref: ExecutorRef) -> None:
 
 
 def _matches_executor(row, ref: ExecutorRef) -> bool:
+    stored_operation_id = row["compute_operation_id"] if row["kind"] == "compute" else row["operation_id"]
     return (
         ref.executor_id == row["id"]
         and ref.run_id == row["run_id"]
         and ref.generation == row["generation"]
         and ref.kind == row["kind"]
-        and ref.operation_id == row["operation_id"]
+        and ref.operation_id == (str(stored_operation_id) if stored_operation_id is not None else None)
         and ref.process_incarnation == row["process_incarnation"]
         and ref.engine_id == row["engine_id"]
         and ref.container_id == row["container_id"]
@@ -1195,11 +1400,12 @@ def _bind_recovered_worker(db: Session, row, ref: ExecutorRef) -> bool:
 
 def _requalify_unknown_executor(db: Session, row, ref: ExecutorRef) -> bool:
     """Allow one exact rediscovery to retry first physical binding after an unknown probe."""
+    operation_column = "compute_operation_id" if ref.kind == "compute" else "operation_id"
     changed = db.execute(
-        text("""
+        text(f"""
             UPDATE runtime_executors SET state='starting', updated_at=now()
             WHERE id=:id AND run_id=:run AND generation=:generation AND kind=:kind
-              AND operation_id IS NOT DISTINCT FROM :operation_id
+          AND {operation_column} IS NOT DISTINCT FROM :operation_id
               AND process_incarnation=:incarnation AND state='unknown'
               AND (container_id IS NULL OR container_id=:container)
               AND (engine_id IS NULL OR engine_id=:engine)
@@ -1231,10 +1437,11 @@ def _bind_engine(db: Session, executor_id: UUID, engine_id: str) -> None:
 
 
 def _executor_ref(row) -> ExecutorRef:
-    if not row["container_id"] or not row["engine_id"]:
+    if not row["engine_id"] or (row["kind"] != "compute" and not row["container_id"]):
         raise RuntimeError("executor physical identity is unknown")
+    operation_id = row["compute_operation_id"] if row["kind"] == "compute" else row["operation_id"]
     return ExecutorRef(row["id"], row["run_id"], row["generation"], row["kind"],
-                       row["operation_id"], row["process_incarnation"],
+                       str(operation_id) if operation_id is not None else None, row["process_incarnation"],
                        row["engine_id"], row["container_id"])
 
 

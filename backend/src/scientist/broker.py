@@ -72,6 +72,8 @@ _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_TIMEOUT_SECONDS = 20
 _MAX_HTTP_TOTAL_SECONDS = 20.0
+_COMPUTE_WAIT_SECONDS = 60.0
+_COMPUTE_POLL_SECONDS = 0.1
 _LLM_CONTROLS = {
     "temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "seed",
     "parallel_tool_calls", "logprobs", "top_logprobs", "tools", "tool_choice",
@@ -264,6 +266,8 @@ def _continue_owner_retry(db: Session, run, original, request: OperationRequest)
 def _finish_reserved_operation(
     db: Session, request: OperationRequest, revision: int, target: DispatchTarget
 ) -> OperationResult:
+    if request.kind == "compute":
+        return _wait_for_compute_result(db, request, revision)
     db_token = _active_session.set(db)
     try:
         data, usage_tokens = _dispatch(request, target)
@@ -301,6 +305,32 @@ def _finish_reserved_operation(
         db, request, revision, usage_tokens=usage_tokens, result_ref=result_ref,
         peer_task_terminal=peer_terminal,
     )
+
+
+def _wait_for_compute_result(
+    db: Session, request: OperationRequest, revision: int,
+) -> OperationResult:
+    """Observe the host-owned compute journal; this path never launches or uploads."""
+    deadline = time.monotonic() + _COMPUTE_WAIT_SECONDS
+    while True:
+        row = db.execute(
+            text("SELECT * FROM operations WHERE run_id=:run AND operation_id=:operation"),
+            {"run": request.run_id, "operation": request.operation_id},
+        ).one_or_none()
+        if row is None or row.payload_hash.strip() != _fingerprint(request):
+            raise DomainError("storage_unavailable", 503)
+        if row.state == "committed":
+            return _operation_result(row)
+        pending = row.result or {}
+        if row.state == "unknown":
+            if pending.get("usage_known") and pending.get("ref"):
+                return _finalize_staged_success(db, request.run_id, request.operation_id)
+            return _operation_result(row)
+        if row.state != "reserved":
+            return _operation_result(row)
+        if time.monotonic() >= deadline:
+            return _record_unknown(db, request, revision, usage_tokens=None, result_ref=None)
+        time.sleep(_COMPUTE_POLL_SECONDS)
 
 
 def record_verified_completion(
@@ -699,7 +729,8 @@ def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: Oper
         if approved is None or query != approved or recipient not in plan.data_recipients:
             raise DomainError("forbidden", 403)
         _approved_recipient(plan, recipient)
-        return DispatchTarget("search", recipient, tuple(plan.data_recipients))
+        from scientist.scholarly_retrieval import build_crossref_url
+        return DispatchTarget("search", build_crossref_url(approved), tuple(plan.data_recipients))
     if request.kind == "compute":
         _reject_fields(payload, {"grant_id", "grant"})
         if set(payload) != {"grant_id", "grant"} or not isinstance(plan.scientific, ScientificBindingV2):
@@ -963,6 +994,17 @@ def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[b
         if len(data) > _MAX_RESPONSE_BYTES or time.monotonic() > deadline or getattr(response, "length", None):
             raise DomainError("provider_unavailable", 502)  # oversize, late, or Content-Length bytes still outstanding
         if target.kind in {"search", "package"}:
+            if target.kind == "search" and isinstance(request.payload.get("query"), dict):
+                try:
+                    from scientist.scholarly_retrieval import parse_crossref_response
+                    query = CrossrefQueryV1.model_validate(request.payload["query"])
+                    parsed = parse_crossref_response(query, data)
+                    data = json.dumps(
+                        parsed, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"), allow_nan=False,
+                    ).encode("utf-8")
+                except (TypeError, ValueError, UnicodeError) as exc:
+                    raise DomainError("provider_unavailable", 502) from exc
             return data, 0  # raw bytes: public APIs return lists, XML or text, not an OperationResult object
         payload = json.loads(data)
         usage = payload.get("usage_tokens", payload.get("usage", {}).get("total_tokens"))

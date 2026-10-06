@@ -166,7 +166,10 @@ def _build_effects_app(identity: DispatchIdentity, pins: RuntimePins):
         capture=checkpoints.capture,
         result_reader=read_result,
         scientific_validator=lambda db, run, binding: scientific_authority.validate_runtime_binding(
-            db, run, binding, expected_image_digest=pins.image_digest),
+            db, run, binding,
+            expected_image_digest=pins.image_digest,
+            trusted_runtime_pins=pins,
+        ),
     )
     app = create_private_app(controller)
 

@@ -37,7 +37,7 @@ def test_resource_plan_is_explicit_revision_bound_and_cannot_skip_preparation(cl
     # Synthetic instructions isolate the HTTP orchestration; physical readiness is not fabricated.
     monkeypatch.setattr(supervisor, '_config', SimpleNamespace(image_digest='sha256:' + 'a' * 64))
     monkeypatch.setattr(settings, 'provider_endpoint', lambda provider: 'https://research.example')
-    monkeypatch.setattr(scientific_authority, 'validate_instruction', lambda *args: None)
+    monkeypatch.setattr(scientific_authority, 'validate_instruction', lambda *args, **kwargs: None)
     monkeypatch.setattr(scientific_authority, 'resource_binding',
                         lambda digest: binding(input_snapshot_digest=digest))
     project = new_project(client)

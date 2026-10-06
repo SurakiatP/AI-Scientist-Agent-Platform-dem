@@ -22,7 +22,7 @@ def test_saved_scientific_plan_cannot_approve_without_accepted_current_environme
                       timeout_ms=profile.timeout_ms, max_result_bytes=profile.max_result_bytes)
     monkeypatch.setattr(supervisor, '_config', SimpleNamespace(image_digest=science.image_digest))
     # Declared synthetic instruction identity isolates the actual database/evidence admission guard.
-    monkeypatch.setattr(authority, 'validate_instruction', lambda binding, expected_image_digest: None)
+    monkeypatch.setattr(authority, 'validate_instruction', lambda binding, expected_image_digest, **kwargs: None)
     plan = plan.model_copy(update={'scientific': science, 'allowed_ops': ['llm'], 'token_limit': 10000,
                                    'elapsed_limit_ms': 60000, 'data_recipients': ['https://research.example']})
     run = domain.revise_plan(db, owner, run.run_id, run.revision, plan)
@@ -42,7 +42,43 @@ def test_plan_revision_rejects_changed_instruction_authority_before_persisting(d
     monkeypatch.setattr(supervisor, '_config', SimpleNamespace(image_digest=science.image_digest))
     def reject(*args):
         raise DomainError('scientific_binding_unavailable', 409)
-    monkeypatch.setattr(authority, 'validate_instruction', reject)
+    monkeypatch.setattr(authority, 'validate_instruction', lambda *args, **kwargs: reject(*args))
     with pytest.raises(DomainError, match='scientific_binding_unavailable'):
         domain.revise_plan(db, owner, run.run_id, run.revision, plan.model_copy(update={'scientific': science}))
     assert domain.get_run(db, owner, run.run_id).revision == 1
+
+
+def test_runtime_validation_uses_dispatch_identity_pins_without_supervisor_config(monkeypatch):
+    from scientist import scientific_authority as authority, instruction_loader
+    from scientist.contracts import RUNTIME_COMMIT, RuntimePins, ScientificBindingV2
+
+    trusted = RuntimePins(
+        runtime_commit=RUNTIME_COMMIT,
+        image_digest='sha256:' + 'b' * 64,
+        skills_digest='c' * 64,
+        environment_digest='d' * 64,
+    )
+    binding_value = ScientificBindingV2(
+        binding_version=2,
+        catalog_commit='154988403bb5a18e9d3c0ce4e6d5e2e4b184a298',
+        registry_sha256='a' * 64,
+        capability_ids=['paper-lookup'],
+        instruction_fingerprint='b' * 64,
+        agent_runtime_pins=trusted,
+        input_snapshot_digest='a' * 64,
+    )
+    observed = {}
+    monkeypatch.setattr(supervisor, '_config', None)
+    monkeypatch.setattr(
+        instruction_loader,
+        'validate_scientific_binding',
+        lambda *args, **kwargs: observed.update(kwargs),
+    )
+
+    authority.validate_instruction(
+        binding_value,
+        expected_image_digest=trusted.image_digest,
+        trusted_runtime_pins=trusted,
+    )
+
+    assert observed['expected_runtime_pins'] == trusted

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Thread
 from hashlib import sha256
@@ -1540,10 +1541,11 @@ def test_scientific_scope_requires_exact_approved_crossref_and_compute_bindings(
     db, _, run_id, _, _ = broker_fixture
     plan = broker._load_plan(db, run_id, broker._load_run(db, run_id).revision)
     project_id = broker._load_run_project(db, run_id)
-    crossref_url = "https://api.crossref.org/works"
     query = CrossrefQueryV1(
         source_id="crossref", version=1, access_mode="public_read", query="fixture query", doi=None, limit=5,
     )
+    from scientist.scholarly_retrieval import build_crossref_url
+    crossref_url = build_crossref_url(query)
     input_ref = ObjectRef(
         project_id=project_id, key="inputs/fixture.csv", sha256="b" * 64,
         size=32, content_type="text/csv",
@@ -1568,7 +1570,8 @@ def test_scientific_scope_requires_exact_approved_crossref_and_compute_bindings(
         csv_describe_grants={"grant-1": grant},
     )
     plan = plan.model_copy(update={
-        "scientific": binding, "allowed_ops": ["search", "compute"], "data_recipients": [crossref_url],
+        "scientific": binding, "allowed_ops": ["search", "compute"],
+        "data_recipients": ["https://api.crossref.org/works"],
     })
 
     search = request(run_id, "approved-crossref", reserve_tokens=0).model_copy(update={
@@ -1594,6 +1597,62 @@ def test_scientific_scope_requires_exact_approved_crossref_and_compute_bindings(
     unknown = request(run_id, "unknown-kind").model_copy(update={"kind": "mystery"})
     with pytest.raises(DomainError, match="forbidden"):
         broker._validate_scope(db, project_id, plan, unknown)
+
+
+def test_crossref_transport_parses_approved_response_after_one_get(monkeypatch):
+    from scientist.contracts import CrossrefQueryV1
+    from scientist.scholarly_retrieval import build_crossref_url
+
+    query = CrossrefQueryV1(
+        source_id="crossref", version=1, access_mode="public_read",
+        query="fixture query", doi=None, limit=5,
+    )
+    payload = (
+        b'{"status":"ok","message-type":"work-list","message":{"items":'
+        b'[{"DOI":"10.1234/example","title":["A paper"],"author":[],'
+        b'"issued":{"date-parts":[[2024]]},"URL":"https://doi.org/10.1234/example"}]}}'
+    )
+    calls = []
+
+    class Response:
+        status = 200
+        length = None
+
+        def getheader(self, name):
+            return None
+
+        def read(self, _limit):
+            return payload
+
+    class Connection:
+        def __init__(self, host, ip, port, timeout):
+            self._deadline = monotonic() + timeout
+            self._deadline_sock = None
+
+        def request(self, method, path, **_kwargs):
+            calls.append((method, path))
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(broker, "_PinnedHTTPSConnection", Connection)
+    request_value = OperationRequest(
+        run_id=uuid4(), generation=1, operation_id="crossref-once",
+        kind="search", payload={"request_id": "request-1", "query": query.model_dump(mode="json")},
+        reserve_tokens=0,
+    )
+    result, usage = broker.http_transport(
+        request_value,
+        broker.DispatchTarget("search", build_crossref_url(query), ("https://api.crossref.org/works",)),
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "GET"
+    assert json.loads(result)["records"][0]["doi"] == "10.1234/example"
+    assert usage == 0
 
 
 def test_verified_completion_resolves_timeout_decision_and_resumes(broker_fixture):

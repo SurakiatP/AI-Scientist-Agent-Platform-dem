@@ -6,6 +6,10 @@ Logs carry only {event, stage, run_id, error_type}; secrets and exception messag
 from __future__ import annotations
 
 import argparse
+import base64
+from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
+from io import BytesIO
 import json
 import logging
 import os
@@ -13,10 +17,12 @@ import re
 import signal
 import stat
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import shutil
 from secrets import token_urlsafe
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -30,7 +36,9 @@ from sqlalchemy.pool import NullPool
 from scientist import broker, objects, peer_reconciliation_supervisor, settings, supervisor, profile_preparation, scientific_authority
 from scientist import db as database
 from scientist.app import create_app
-from scientist.contracts import PlanSpec
+from scientist.contracts import (
+    ComputeProfilePin, CsvDescribeGrantV1, OperationRequest, PlanSpec, ScientificBindingV2,
+)
 from scientist.dispatch_runtime import (
     _SECRET_NAMES,
     DispatchServiceConfig,
@@ -41,14 +49,24 @@ from scientist.dispatch_runtime import (
 )
 from scientist.domain import _event
 from scientist.private_worker_api import RuntimePins, WorkerController
-from scientist.runtime_contracts import RUNTIME_COMMIT, BootstrapMetadata, RuntimeContextV1
+from scientist.runtime_contracts import (
+    MAX_COMPUTE_ENVELOPE_BYTES, MAX_COMPUTE_OUTPUT_BYTES, ComputeLaunchSpec, ComputeOutputEntryV2,
+    ComputeResultEnvelopeV2, RUNTIME_COMMIT, BootstrapMetadata, RuntimeContextV1,
+    canonical_bytes, compute_input_manifest_sha256, operation_fingerprint,
+)
 from scientist.supervisor import DockerWorkerEngine, WorkerBootstrap
 from scientist.web_assets import checked_web_root, create_web_router
 
 _MAX_CONFIG_BYTES = 64 * 1024
 _START_FAILURES = 3
 _BROKER_PORT = 8123  # fixed by DispatchServiceConfig
+_MAX_COMPUTE_STAGE_BYTES = 512 * 1024
 _IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:+-]*@(sha256:[a-f0-9]{64})")
+_compute_engine = None
+_compute_image_digest: str | None = None
+_compute_recipe_directory: Path | None = None
+_compute_recipe_manifest: str | None = None
+_compute_state_dir: Path | None = None
 # Prompt guidance, not control: permissions, budget and unknown outcomes are enforced in the backend (ADR-015).
 SYSTEM_PROMPT = (
     "You are a careful research assistant. Answer the owner's approved question using only evidence "
@@ -99,6 +117,7 @@ class HostConfig(BaseModel):
     listen_port: int = Field(strict=True, ge=1024, le=65535)
     expected_engine_id: str = Field(min_length=1, max_length=200)
     worker_image: str
+    compute_image: str | None = None
     dispatch_image: str
     service_network: str
     egress_network: str | None = None
@@ -158,6 +177,13 @@ class HostConfig(BaseModel):
     @classmethod
     def _bucket(cls, value: str) -> str:
         return _validate_bucket(value)
+
+    @field_validator("compute_image")
+    @classmethod
+    def _compute_image(cls, value: str | None) -> str | None:
+        if value is not None and not _IMAGE.fullmatch(value):
+            raise ValueError("compute image must be immutable")
+        return value
 
     @field_validator("secrets_dir", "state_dir")
     @classmethod
@@ -238,7 +264,53 @@ def _secret(cfg: HostConfig, name: str) -> bytes:
     return value
 
 
+def _stage_compute_recipe(state_dir: Path) -> tuple[Path, str]:
+    from scientist.compute_runtime import recipe_manifest_sha256
+
+    source_root = Path(__file__).resolve().parents[3]
+    sources = {
+        "csv_describe.py": source_root / "runtime" / "compute_entrypoint.py",
+        "cpu_recipes.py": source_root / "backend" / "src" / "scientist" / "cpu_recipes.py",
+        "scientific_render.py": source_root / "backend" / "src" / "scientist" / "scientific_render.py",
+    }
+    root = state_dir / "compute-recipes"
+    root.mkdir(mode=0o700, exist_ok=True)
+    try:
+        _private_dir(root)
+    except ValueError as exc:
+        raise HostError("compute_recipe_root") from exc
+    scratch = Path(tempfile.mkdtemp(prefix=".recipe-", dir=root))
+    try:
+        for name, source in sources.items():
+            if not source.is_file() or source.is_symlink():
+                raise HostError("compute_recipe_unavailable")
+            destination = scratch / name
+            shutil.copyfile(source, destination)
+            destination.chmod(0o444)
+        scratch.chmod(0o555)
+        digest = recipe_manifest_sha256(scratch)
+        destination = root / digest
+        if destination.exists():
+            if recipe_manifest_sha256(destination) != digest:
+                raise HostError("compute_recipe_identity")
+            scratch.chmod(0o700)
+            shutil.rmtree(scratch)
+            return destination, digest
+        os.replace(scratch, destination)
+        return destination, digest
+    except BaseException:
+        try:
+            scratch.chmod(0o700)
+            for item in scratch.iterdir():
+                item.chmod(0o600)
+            shutil.rmtree(scratch)
+        except OSError:
+            pass
+        raise
+
+
 def compose(cfg: HostConfig, *, engine=None, s3=None):
+    global _compute_engine, _compute_image_digest, _compute_recipe_directory, _compute_recipe_manifest, _compute_state_dir
     """Verify every prerequisite, then install the trusted runtime. Mutates globals only after all checks pass."""
     import boto3
     from botocore.config import Config
@@ -259,6 +331,27 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
     except Exception:
         raise HostError("dependency_unavailable") from None
     pin = _IMAGE.fullmatch(cfg.worker_image).group(1)
+    compute_pin = _IMAGE.fullmatch(cfg.compute_image).group(1) if cfg.compute_image else None
+    _compute_engine = None
+    _compute_image_digest = None
+    _compute_recipe_directory = None
+    _compute_recipe_manifest = None
+    _compute_state_dir = cfg.state_dir
+    if compute_pin is not None:
+        try:
+            _compute_engine = DockerWorkerEngine(context=engine.context)
+            if _compute_engine.engine_id() != cfg.expected_engine_id:
+                raise HostError("compute_engine_identity")
+            _compute_engine._verified_image_id(cfg.compute_image, compute_pin)
+            _compute_recipe_directory, _compute_recipe_manifest = _stage_compute_recipe(cfg.state_dir)
+            _compute_image_digest = compute_pin
+            scientific_authority.configure_compute_profile(compute_pin, _compute_recipe_manifest)
+        except HostError:
+            raise
+        except Exception as exc:
+            raise HostError("compute_environment_unavailable") from exc
+    else:
+        scientific_authority.configure_compute_profile(None, None)
     template = json.dumps({
         "schema_version": 1, "runtime_commit": RUNTIME_COMMIT, "image_digest": pin,
         "skills_digest": cfg.skills_digest, "environment_digest": cfg.environment_digest,
@@ -295,18 +388,26 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
     scientific_authority.configure_bundle(cfg.scientific_bundle_dir)
     from scientist.profile_evidence import accepted_image_builder
     from scientist.profile_preparation import BuildFailure
-    accepted = accepted_image_builder(cfg.state_dir / 'profiles', key=capability_key, expected_image_digest=pin)
+    expected_images = {"prof.worker-base@py3.14.7": pin}
+    receipt_dirs = {"prof.worker-base@py3.14.7": cfg.state_dir / "profiles"}
+    if compute_pin is not None:
+        expected_images["prof.csv-stdlib@py3.14.7"] = compute_pin
+        receipt_dirs["prof.csv-stdlib@py3.14.7"] = cfg.state_dir / "compute-profiles"
+    accepted = accepted_image_builder(receipt_dirs, key=capability_key, expected_image_digests=expected_images)
     def prepare_profile(profile, job_id):
         # Recheck physical availability in the same owned engine before reusing accepted evidence.
         try:
-            if engine.engine_id() != cfg.expected_engine_id:
+            profile_engine = _compute_engine if profile.profile_id == "prof.csv-stdlib@py3.14.7" else engine
+            profile_image = cfg.compute_image if profile.profile_id == "prof.csv-stdlib@py3.14.7" else cfg.worker_image
+            expected = expected_images[profile.profile_id]
+            if profile_engine is None or profile_engine.engine_id() != cfg.expected_engine_id:
                 raise BuildFailure('environment_unavailable')
-            engine._verified_image_id(cfg.worker_image, pin)
+            profile_engine._verified_image_id(profile_image, expected)
         except Exception as exc:
             raise BuildFailure('environment_unavailable') from exc
         return accepted(profile, job_id)
     profile_preparation.configure_builder(
-        prepare_profile, expected_image_digest=pin, evidence_key=capability_key
+        prepare_profile, expected_image_digests=expected_images, evidence_key=capability_key
     )
     os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(cfg.secrets_dir / "master_key")
     global _destinations
@@ -317,7 +418,8 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
         broker_port=_BROKER_PORT, runtime_commit=RUNTIME_COMMIT, skills_digest=cfg.skills_digest,
         environment_digest=cfg.environment_digest, bootstrap_factory=bootstrap,
         capability_factory=lambda db, run, generation: broker.issue_capability(db, run, generation, 300),
-        dispatch=dispatch, engine=engine)
+        dispatch=dispatch, engine=engine, compute_engine=_compute_engine,
+        compute_image_digest=_compute_image_digest)
     return engine
 
 
@@ -336,14 +438,21 @@ def bootstrap(db, run_id: UUID, generation: int) -> WorkerBootstrap:
         raise RuntimeError("provider destination is not configured")
     cfg = supervisor._require_config()
     pins = {"image_digest": cfg.image_digest, "skills_digest": cfg.skills_digest, "environment_digest": cfg.environment_digest}
+    trusted_runtime_pins = RuntimePins(runtime_commit=cfg.runtime_commit, **pins)
     if plan.scientific is not None:
-        scientific_authority.validate_runtime_binding(db, run_id, plan.scientific, expected_image_digest=cfg.image_digest)
+        scientific_authority.validate_runtime_binding(
+            db, run_id, plan.scientific,
+            expected_image_digest=cfg.image_digest,
+            trusted_runtime_pins=trusted_runtime_pins,
+        )
     if row["prior"]:
         controller = WorkerController(pins=RuntimePins(runtime_commit=cfg.runtime_commit, **pins),
                                      provider_destinations={plan.provider_id: endpoint},
-                                     scientific_validator=lambda database, run, binding:
-                                         scientific_authority.validate_runtime_binding(database, run, binding,
-                                             expected_image_digest=cfg.image_digest))
+        scientific_validator=lambda database, run, binding:
+        scientific_authority.validate_runtime_binding(
+            database, run, binding,
+            expected_image_digest=cfg.image_digest,
+            trusted_runtime_pins=trusted_runtime_pins))
         return supervisor.continuation_bootstrap(db, run_id, generation, controller)
     stamp = time.time()
     context = RuntimeContextV1.model_validate({
@@ -361,17 +470,527 @@ def bootstrap(db, run_id: UUID, generation: int) -> WorkerBootstrap:
                            metadata=BootstrapMetadata(schema_version=1, checkpoint_revision=0))
 
 
+# --- host-owned CSV compute ------------------------------------------------------------------
+
+def _compute_authority(db, request: OperationRequest):
+    """Load and revalidate the current approved binding from PostgreSQL."""
+    row = db.execute(text("""
+        SELECT r.project_id, r.revision, r.generation, r.state,
+               s.digest AS snapshot_digest, p.plan,
+               o.state AS operation_state, o.generation AS operation_generation,
+               o.payload_hash, o.result AS operation_result
+        FROM runs r
+        JOIN input_snapshots s ON s.run_id=r.id AND s.project_id=r.project_id
+        JOIN plan_revisions p ON p.run_id=r.id AND p.revision=r.revision
+        JOIN operations o ON o.run_id=r.id AND o.operation_id=:operation
+        WHERE r.id=:run
+    """), {"run": request.run_id, "operation": request.operation_id}).mappings().one_or_none()
+    if row is None or (
+        row["state"] != "running" or row["generation"] != request.generation
+        or row["operation_state"] != "reserved"
+        or row["operation_generation"] != request.generation
+        or row["payload_hash"].strip() != broker._fingerprint(request)
+    ):
+        raise RuntimeError("compute authorization is no longer current")
+    try:
+        persisted_request = row["operation_result"]["request"]
+    except (KeyError, TypeError):
+        raise RuntimeError("compute request journal is invalid") from None
+    if persisted_request != request.model_dump(mode="json"):
+        raise RuntimeError("compute request differs from journal")
+
+    plan = PlanSpec.model_validate(row["plan"])
+    binding = plan.scientific
+    if not isinstance(binding, ScientificBindingV2):
+        raise RuntimeError("compute request has no approved V2 binding")
+    grant_id = request.payload.get("grant_id")
+    grant = binding.csv_describe_grants.get(grant_id) if isinstance(grant_id, str) else None
+    profile_pin, approved_recipe_manifest = scientific_authority.trusted_compute_profile()
+    if (
+        not isinstance(grant, CsvDescribeGrantV1)
+        or request.payload != {"grant_id": grant_id, "grant": grant.model_dump(mode="json")}
+        or grant.profile_id != profile_pin.profile_id
+        or grant.profile_version != profile_pin.version
+        or grant.image_digest != profile_pin.image_digest
+        or grant.recipe_manifest_sha256 != approved_recipe_manifest
+        or grant.recipe_manifest_sha256 != _compute_recipe_manifest
+    ):
+        raise RuntimeError("compute request differs from approved grant")
+
+    cfg = supervisor._require_config()
+    pins = scientific_authority._current_runtime_pins()
+    scientific_authority.validate_runtime_binding(
+        db, request.run_id, binding,
+        expected_image_digest=cfg.image_digest,
+        trusted_runtime_pins=pins,
+    )
+    return row, binding, grant_id, grant
+
+
+def _mark_compute_executor_unknown(db, ref) -> None:
+    db.execute(text("""
+        UPDATE runtime_executors SET state='unknown', updated_at=now()
+        WHERE id=:id AND run_id=:run AND generation=:generation AND kind='compute'
+          AND compute_operation_id=:operation AND process_incarnation=:incarnation
+          AND (container_id IS NULL OR container_id=:container)
+          AND state IN ('starting','active','unknown')
+    """), {
+        "id": ref.executor_id, "run": ref.run_id, "generation": ref.generation,
+        "operation": ref.operation_id, "incarnation": ref.process_incarnation,
+        "container": ref.container_id,
+    })
+    db.commit()
+
+
+def _write_private_file(path: Path, data: bytes) -> None:
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _stage_compute_outputs(request, project_id, binding, grant_id, grant, output_bytes):
+    """Commit bounded verified guest bytes before the first object-store write."""
+    from scientist.contracts import ObjectRef
+    from scientist import compute_runtime
+
+    expected_names = tuple(compute_runtime._OUTPUT_TYPES)
+    if set(output_bytes) != set(expected_names):
+        raise RuntimeError("compute result file set differs from the approved recipe")
+    total = sum(len(output_bytes[name]) for name in expected_names)
+    if total > MAX_COMPUTE_OUTPUT_BYTES:
+        raise RuntimeError("compute output exceeds approved byte limit")
+    entries = []
+    for index, name in enumerate(expected_names):
+        content_type = compute_runtime._OUTPUT_TYPES[name]
+        data = output_bytes[name]
+        digest = hashlib.sha256(data).hexdigest()
+        output_ref = ObjectRef(
+            project_id=project_id, key=f"{project_id}/{digest}", sha256=digest,
+            size=len(data), content_type="application/octet-stream",
+        )
+        entries.append(ComputeOutputEntryV2(
+            index=index, name=name, content_type=content_type, object_ref=output_ref,
+            data_base64=base64.b64encode(data).decode("ascii"),
+        ))
+    envelope = ComputeResultEnvelopeV2(
+        schema_version=2,
+        binding_sha256=hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest(),
+        grant_id=grant_id,
+        operation_id=request.operation_id,
+        operation_fingerprint=operation_fingerprint(request),
+        recipe_id=grant.recipe_id,
+        recipe_version=grant.recipe_version,
+        recipe_manifest_sha256=grant.recipe_manifest_sha256,
+        profile_id=grant.profile_id,
+        profile_version=grant.profile_version,
+        image_digest=grant.image_digest,
+        input_manifest_sha256=compute_input_manifest_sha256(grant),
+        input_ref=grant.input_ref,
+        input_sha256=grant.input_sha256,
+        outputs=entries,
+    )
+    envelope_bytes = canonical_bytes(envelope.model_dump(mode="json"))
+    stage = {
+        "schema_version": 1,
+        "operation_id": request.operation_id,
+        "operation_fingerprint": operation_fingerprint(request),
+        "binding_sha256": envelope.binding_sha256,
+        "output_total_bytes": total,
+        "envelope_sha256": hashlib.sha256(envelope_bytes).hexdigest(),
+        "envelope_base64": base64.b64encode(envelope_bytes).decode("ascii"),
+    }
+    if len(canonical_bytes(stage)) > _MAX_COMPUTE_STAGE_BYTES:
+        raise RuntimeError("durable compute stage exceeds its bounded journal limit")
+    with database.session() as db:
+        row = db.execute(text("""
+            SELECT id, result FROM operations
+            WHERE run_id=:run AND operation_id=:operation AND state='reserved' FOR UPDATE
+        """), {"run": request.run_id, "operation": request.operation_id}).mappings().one_or_none()
+        if row is None:
+            raise RuntimeError("compute operation is no longer reserved")
+        pending = dict(row["result"] or {})
+        existing = pending.get("compute_stage")
+        if existing is not None and existing != stage:
+            raise RuntimeError("compute operation already has different staged output")
+        pending["compute_stage"] = stage
+        db.execute(text("""
+            UPDATE operations SET result=CAST(:result AS jsonb)
+            WHERE id=:id AND state='reserved'
+        """), {"result": json.dumps(pending, separators=(",", ":")), "id": row["id"]})
+        db.commit()
+    return pending
+
+
+def _resume_compute_stage(request, project_id, binding, grant_id, grant, operation_result) -> bool:
+    """Idempotently store/read back staged bytes, stop exact guest, then publish."""
+    from scientist.contracts import ObjectRef
+    from scientist import compute_runtime
+
+    stage = operation_result.get("compute_stage") if isinstance(operation_result, dict) else None
+    if not isinstance(stage, dict):
+        return False
+    if len(canonical_bytes(stage)) > _MAX_COMPUTE_STAGE_BYTES:
+        raise RuntimeError("durable compute stage exceeds its bounded journal limit")
+    raw = base64.b64decode(stage.get("envelope_base64", ""), validate=True)
+    if (
+        stage.get("schema_version") != 1
+        or stage.get("operation_id") != request.operation_id
+        or stage.get("operation_fingerprint") != operation_fingerprint(request)
+        or len(raw) > MAX_COMPUTE_ENVELOPE_BYTES
+        or hashlib.sha256(raw).hexdigest() != stage.get("envelope_sha256")
+    ):
+        raise RuntimeError("staged compute bytes have invalid journal identity")
+    envelope = ComputeResultEnvelopeV2.model_validate_json(raw)
+    binding_sha = hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest()
+    if (
+        raw != canonical_bytes(envelope.model_dump(mode="json"))
+        or stage.get("binding_sha256") != binding_sha
+        or envelope.binding_sha256 != binding_sha
+        or any(entry.object_ref.project_id != project_id for entry in envelope.outputs)
+        or envelope.grant_id != grant_id
+        or envelope.operation_id != request.operation_id
+        or envelope.operation_fingerprint != operation_fingerprint(request)
+        or envelope.recipe_manifest_sha256 != grant.recipe_manifest_sha256
+        or envelope.profile_id != grant.profile_id
+        or envelope.profile_version != grant.profile_version
+        or envelope.image_digest != grant.image_digest
+        or envelope.input_manifest_sha256 != compute_input_manifest_sha256(grant)
+        or envelope.input_ref != grant.input_ref
+        or envelope.input_sha256 != grant.input_sha256
+    ):
+        raise RuntimeError("staged compute envelope differs from current authority")
+    total = sum(entry.object_ref.size for entry in envelope.outputs)
+    if total != stage.get("output_total_bytes") or total > MAX_COMPUTE_OUTPUT_BYTES:
+        raise RuntimeError("staged compute output limit differs from its journal")
+
+    for entry in envelope.outputs:
+        data = base64.b64decode(entry.data_base64, validate=True)
+        if (
+            len(data) != entry.object_ref.size
+            or hashlib.sha256(data).hexdigest() != entry.object_ref.sha256.lower()
+        ):
+            raise RuntimeError("staged compute output failed hash verification")
+        with database.session() as db:
+            stored_ref = objects.put(db, project_id, BytesIO(data), "application/octet-stream")
+            if stored_ref != entry.object_ref:
+                raise RuntimeError("compute output object identity changed")
+            db.commit()
+        with objects.open_verified(entry.object_ref) as stream:
+            if stream.read(MAX_COMPUTE_OUTPUT_BYTES + 1) != data:
+                raise RuntimeError("compute output object readback differs")
+
+    envelope_digest = hashlib.sha256(raw).hexdigest()
+    envelope_ref = ObjectRef(
+        project_id=project_id, key=f"{project_id}/{envelope_digest}",
+        sha256=envelope_digest, size=len(raw), content_type="application/octet-stream",
+    )
+    with database.session() as db:
+        stored_ref = objects.put(db, project_id, BytesIO(raw), "application/octet-stream")
+        if stored_ref != envelope_ref:
+            raise RuntimeError("compute envelope object identity changed")
+        db.commit()
+    with objects.open_verified(envelope_ref) as stream:
+        if stream.read(2 * 1024 * 1024 + 1) != raw:
+            raise RuntimeError("compute envelope object readback differs")
+
+    with database.session() as db:
+        journal = db.execute(text("""
+            SELECT id, result FROM operations
+            WHERE run_id=:run AND operation_id=:operation AND state='reserved' FOR UPDATE
+        """), {"run": request.run_id, "operation": request.operation_id}).mappings().one_or_none()
+        if journal is None:
+            raise RuntimeError("compute operation is no longer reserved")
+        pending = dict(journal["result"] or {})
+        pending["compute_envelope_ref"] = envelope_ref.model_dump(mode="json")
+        db.execute(text("""
+            UPDATE operations SET result=CAST(:result AS jsonb)
+            WHERE id=:id AND state='reserved'
+        """), {"result": json.dumps(pending, separators=(",", ":")), "id": journal["id"]})
+        db.commit()
+
+    with database.session() as db:
+        row = db.execute(text("""
+            SELECT id, generation, process_incarnation, engine_id, container_id, state, proof
+            FROM runtime_executors
+            WHERE run_id=:run AND kind='compute' AND compute_operation_id=:operation
+            ORDER BY created_at DESC LIMIT 1 FOR UPDATE
+        """), {"run": request.run_id, "operation": request.operation_id}).mappings().one_or_none()
+        if row is None or row["container_id"] is None or row["engine_id"] is None:
+            return False
+        proof = row["proof"] or {}
+        stopped = (
+            row["state"] == "inactive"
+            and proof.get("source") == "owned-engine-exact-container"
+            and proof.get("engine_id") == row["engine_id"]
+            and proof.get("container_id") == row["container_id"]
+        )
+        ref = supervisor.ExecutorRef(
+            executor_id=row["id"], run_id=request.run_id, generation=row["generation"],
+            kind="compute", operation_id=request.operation_id,
+            process_incarnation=row["process_incarnation"], engine_id=row["engine_id"],
+            container_id=row["container_id"],
+        )
+    if not stopped:
+        found = compute_runtime.find_compute(
+            _compute_engine, ref, expected_image_digest=_compute_image_digest
+        )
+        if found is None:
+            return False
+        compute_runtime.stop_compute(
+            _compute_engine, found, expected_image_digest=_compute_image_digest
+        )
+        with database.session() as db:
+            supervisor.mark_compute_executor_inactive(db, found)
+            db.commit()
+    with database.session() as db:
+        row, _binding, _grant_id, _grant = _compute_authority(db, request)
+        broker.record_verified_completion(
+            db, request, row["revision"], usage_tokens=0, result_ref=envelope_ref
+        )
+    return True
+
+
+def _run_compute_operation(request: OperationRequest) -> None:
+    """Execute one approved grant and journal a verified canonical envelope."""
+    from scientist import compute_runtime
+
+    if (
+        request.kind != "compute" or _compute_engine is None
+        or _compute_image_digest is None or _compute_recipe_directory is None
+        or _compute_recipe_manifest is None or _compute_state_dir is None
+    ):
+        raise RuntimeError("compute environment unavailable")
+
+    # Approval, generation, grant, and payload are reloaded from trusted storage.
+    with database.session() as db:
+        row, binding, grant_id, grant = _compute_authority(db, request)
+        project_id = row["project_id"]
+        binding_sha = hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest()
+        input_manifest_sha = compute_input_manifest_sha256(grant)
+        fingerprint = operation_fingerprint(request)
+        operation_result = row["operation_result"]
+
+    if _resume_compute_stage(request, project_id, binding, grant_id, grant, operation_result):
+        return
+
+    staging_root = _compute_state_dir / "compute-jobs"
+    staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _private_dir(staging_root)
+    with tempfile.TemporaryDirectory(prefix="job-", dir=staging_root) as temp_name:
+        scratch = Path(temp_name)
+        scratch.chmod(0o700)
+        input_dir, output_dir = scratch / "inputs", scratch / "outputs"
+        input_dir.mkdir(mode=0o700)
+        output_dir.mkdir(mode=0o700)
+        with objects.open_verified(grant.input_ref) as stream:
+            csv_bytes = stream.read(grant.max_input_bytes + 1)
+        if len(csv_bytes) != grant.input_ref.size or hashlib.sha256(csv_bytes).hexdigest() != grant.input_sha256:
+            raise RuntimeError("approved compute input integrity mismatch")
+        _write_private_file(input_dir / "data.csv", csv_bytes)
+        _write_private_file(input_dir / "params.json", canonical_bytes({"numeric_columns": grant.numeric_columns}))
+        spec = ComputeLaunchSpec(
+            profile_id=grant.profile_id, profile_version=grant.profile_version,
+            image_digest=grant.image_digest,
+            recipe_manifest_sha256=grant.recipe_manifest_sha256,
+            recipe_directory=_compute_recipe_directory,
+            input_directory=input_dir, output_directory=output_dir,
+        )
+
+        with database.session() as db:
+            _compute_authority(db, request)
+            ref, is_new = supervisor.reserve_compute_executor(
+                db, request, engine_id=_compute_engine.engine_id()
+            )
+            if is_new:
+                # Persist the attempt before Docker create. A retry can find by
+                # labels, but cannot issue a second create for this operation.
+                db.execute(text("""
+                    UPDATE runtime_executors SET proof=CAST(:proof AS jsonb), updated_at=now()
+                    WHERE id=:id AND run_id=:run AND generation=:generation
+                      AND kind='compute' AND compute_operation_id=:operation AND state='starting'
+                """), {
+                    "proof": json.dumps({"source": "compute-create-attempted", "engine_id": ref.engine_id}),
+                    "id": ref.executor_id, "run": ref.run_id, "generation": ref.generation,
+                    "operation": ref.operation_id,
+                })
+                db.commit()
+
+        if is_new:
+            try:
+                ref = compute_runtime.create_compute(_compute_engine, ref, spec)
+                with database.session() as db:
+                    supervisor.bind_compute_executor(db, ref)
+                    db.commit()
+            except Exception:
+                with database.session() as db:
+                    _mark_compute_executor_unknown(db, ref)
+                return
+        else:
+            try:
+                recovered = compute_runtime.find_compute(
+                    _compute_engine, ref, expected_image_digest=_compute_image_digest
+                )
+            except Exception:
+                with database.session() as db:
+                    _mark_compute_executor_unknown(db, ref)
+                return
+            if recovered is None:
+                with database.session() as db:
+                    _mark_compute_executor_unknown(db, ref)
+                return
+            ref = recovered
+            if ref.container_id is not None:
+                with database.session() as db:
+                    stored = db.execute(text("""
+                        SELECT * FROM runtime_executors
+                        WHERE id=:id AND run_id=:run AND generation=:generation
+                          AND kind='compute' AND compute_operation_id=:operation FOR UPDATE
+                    """), {
+                        "id": ref.executor_id, "run": ref.run_id,
+                        "generation": ref.generation, "operation": ref.operation_id,
+                    }).mappings().one_or_none()
+                    if stored is None:
+                        raise RuntimeError("compute launch intent disappeared")
+                    if (stored["process_incarnation"] != ref.process_incarnation
+                            or stored["engine_id"] != ref.engine_id):
+                        raise RuntimeError("compute launch identity changed")
+                    if stored["state"] == "unknown" and not supervisor._requalify_unknown_executor(
+                        db, stored, ref
+                    ):
+                        raise RuntimeError("compute launch intent could not be requalified")
+                    if stored["state"] == "unknown" and stored["container_id"] is not None:
+                        # Bound unknown intents need the requalification committed even
+                        # when no CID bind follows; otherwise the next start CAS sees unknown.
+                        db.commit()
+                    if stored["container_id"] is None:
+                        if stored["state"] not in {"starting", "unknown"}:
+                            raise RuntimeError("compute launch intent is not bindable")
+                        supervisor.bind_compute_executor(db, ref)
+                        db.commit()
+                    elif stored["container_id"] != ref.container_id:
+                        raise RuntimeError("compute launch resolved to a different container")
+
+        try:
+            _labels, state = compute_runtime._verify_container(
+                _compute_engine, ref, expected_image_digest=_compute_image_digest
+            )
+            if state.get("Status") == "created" and state.get("Running") is not True:
+                with database.session() as db:
+                    _compute_authority(db, request)
+                    supervisor.start_compute_executor(
+                        db, ref, request,
+                        lambda: compute_runtime.start_compute(
+                            _compute_engine, ref, expected_image_digest=_compute_image_digest
+                        ),
+                    )
+
+            exit_code = None
+            deadline = time.monotonic() + 32
+            while time.monotonic() < deadline:
+                exit_code = compute_runtime.poll_compute(
+                    _compute_engine, ref, expected_image_digest=_compute_image_digest
+                )
+                if exit_code is not None:
+                    break
+                time.sleep(0.2)
+            if exit_code != 0:
+                raise RuntimeError("compute did not produce verified outputs")
+            output_bytes = compute_runtime.read_compute_outputs(
+                _compute_engine, ref, expected_image_digest=_compute_image_digest
+            )
+            staged_result = _stage_compute_outputs(
+                request, project_id, binding, grant_id, grant, output_bytes
+            )
+            if not _resume_compute_stage(
+                request, project_id, binding, grant_id, grant, staged_result
+            ):
+                return
+        except Exception as exc:
+            with database.session() as db:
+                journal = db.execute(text("""
+                    SELECT result FROM operations
+                    WHERE run_id=:run AND operation_id=:operation AND state='reserved'
+                """), {"run": request.run_id, "operation": request.operation_id}).mappings().one_or_none()
+                if journal is not None and isinstance(journal["result"], dict) and journal["result"].get("compute_stage"):
+                    # Verified bytes are durable. Retry content-addressed writes without changing the outcome.
+                    return
+                try:
+                    compute_runtime.stop_compute(
+                        _compute_engine, ref, expected_image_digest=_compute_image_digest
+                    )
+                    supervisor.mark_compute_executor_inactive(db, ref)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    _mark_compute_executor_unknown(db, ref)
+            with database.session() as db:
+                _mark_compute_executor_unknown(db, ref)
+                try:
+                    row, _binding, _grant_id, _grant = _compute_authority(db, request)
+                except Exception:
+                    return
+                broker._record_unknown(db, request, row["revision"], usage_tokens=None, result_ref=None)
+
+
 # --- supervision loop ------------------------------------------------------------------------
 
 class Host:
     """Serial supervision: reap dead runs, claim approved runs, start them. Never touches waiting/terminal runs."""
 
     def __init__(self, engine, max_active: int = 3, poll_seconds: float = 2.0, lock=None, on_lost=None):
+        self._compute_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scientist-compute")
+        self._compute_futures: dict[tuple[UUID, str], Future] = {}
         self.engine, self.max_active, self.poll_seconds = engine, max_active, poll_seconds
         self.lock, self.on_lost, self.lost = lock, on_lost, False
         # ponytail: start-failure counter is in-memory; bounded at 3 generations per run per host start;
         # make durable via worker-launch-not-attempted executors if restarts become frequent.
         self.failures: dict[UUID, int] = {}
+
+    def _run_compute_operation(self, request: OperationRequest) -> None:
+        _run_compute_operation(request)
+
+    def _compute_tick(self) -> None:
+        for key, future in tuple(self._compute_futures.items()):
+            if future.done():
+                try:
+                    future.result()
+                except Exception as exc:
+                    _log("host.error", "compute", key[0], type(exc).__name__)
+                self._compute_futures.pop(key, None)
+        if _compute_engine is None or _compute_image_digest is None:
+            return
+        try:
+            with database.session() as db:
+                rows = db.execute(text("""
+                    SELECT o.run_id, o.operation_id, o.generation, o.result
+                    FROM operations o JOIN runs r ON r.id=o.run_id
+                    WHERE o.kind='compute' AND o.state='reserved'
+                      AND r.state='running' AND r.generation=o.generation
+                    ORDER BY o.created_at, o.operation_id
+                """)).mappings().all()
+            for row in rows:
+                key = (row["run_id"], row["operation_id"])
+                if key in self._compute_futures:
+                    continue
+                try:
+                    request = OperationRequest.model_validate(row["result"]["request"])
+                    if request.run_id != key[0] or request.operation_id != key[1] or request.generation != row["generation"]:
+                        raise ValueError("compute journal identity changed")
+                except (KeyError, TypeError, ValueError) as exc:
+                    _log("host.error", "compute_request", key[0], type(exc).__name__)
+                    continue
+                self._compute_futures[key] = self._compute_pool.submit(self._run_compute_operation, request)
+        except Exception as exc:
+            _log("host.error", "compute_poll", None, type(exc).__name__)
+
+    def close(self) -> None:
+        self._compute_pool.shutdown(wait=True, cancel_futures=True)
 
     def _recover(self, run_id: UUID, stage: str, expect: tuple[str, int]) -> None:
         """Recover only if the run is still in the state and generation the caller observed (checked under the claim lock)."""
@@ -391,11 +1010,38 @@ class Host:
             _log("host.error", stage, run_id, type(exc).__name__)
 
     def startup_recover(self) -> None:
+        self._reconcile_startup_compute()
         with database.session() as db:
             runs = db.execute(text("SELECT id, state, generation FROM runs WHERE state IN ('running','recovering','stopping') ORDER BY id")).all()
         for run in runs:
             self._recover(run.id, "startup_recover", (run.state, run.generation))
         self._peer_reconciliation_tick(startup=True)
+
+    def _reconcile_startup_compute(self) -> None:
+        """Read live tmpfs output before ordinary recovery stops its guest."""
+        try:
+            with database.session() as db:
+                rows = db.execute(text("""
+                    SELECT DISTINCT o.run_id, o.operation_id, o.generation, o.result
+                    FROM operations o
+                    JOIN runs r ON r.id=o.run_id AND r.generation=o.generation
+                    JOIN runtime_executors e ON e.run_id=o.run_id
+                      AND e.generation=o.generation AND e.kind='compute'
+                      AND e.compute_operation_id=o.operation_id
+                    WHERE o.kind='compute' AND o.state='reserved' AND r.state='running'
+                    ORDER BY o.run_id, o.operation_id
+                """)).mappings().all()
+            for row in rows:
+                try:
+                    request = OperationRequest.model_validate(row["result"]["request"])
+                    if (request.run_id, request.operation_id, request.generation) == (
+                        row["run_id"], row["operation_id"], row["generation"]
+                    ):
+                        self._run_compute_operation(request)
+                except Exception as exc:
+                    _log("host.error", "compute_startup_recovery", row["run_id"], type(exc).__name__)
+        except Exception as exc:
+            _log("host.error", "compute_startup_recovery", None, type(exc).__name__)
 
     def _peer_reconciliation_tick(self, *, startup: bool = False) -> None:
         try:
@@ -494,7 +1140,7 @@ class Host:
     def tick(self) -> None:
         if self.lost or not self._lock_alive():
             return  # never act without the singleton lock
-        for step in (self.reap, self.prepare_environments, self.claim_and_start):
+        for step in (self._compute_tick, self.reap, self.prepare_environments, self.claim_and_start):
             try:
                 step()
             except Exception as exc:
@@ -604,6 +1250,8 @@ def main(argv: list[str] | None = None) -> int:
         stop.set()
         if thread is not None:
             thread.join(120)  # workers keep running; the next startup fences or continues them
+        if loop is not None:
+            loop.close()
         if lock is not None:
             lock.close()
         for number, handler in previous.items():

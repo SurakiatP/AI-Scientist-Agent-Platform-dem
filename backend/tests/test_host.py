@@ -18,7 +18,7 @@ from sqlalchemy.pool import NullPool
 from scientist import broker, checkpoints, db as database, host, objects, settings, supervisor
 from scientist import profile_preparation, scientific_authority
 from scientist.app import create_app
-from scientist.contracts import PlanSpec, Principal
+from scientist.contracts import OperationRequest, PlanSpec, Principal
 from scientist.db import create_project, create_session, migrate, session
 from scientist.dispatch_runtime import _SECRET_NAMES, _parse_template
 from scientist.domain import approve_run, revise_plan, submit_run
@@ -172,6 +172,43 @@ def _make_running(run_id, container, *, expired=False):
 
 
 # 1
+def test_compute_tick_schedules_only_current_reserved_compute_operations(monkeypatch, iso):
+    run_id = _approved_run()
+    operation_id = uuid4().hex
+    request = OperationRequest(
+        run_id=run_id,
+        generation=1,
+        operation_id=operation_id,
+        kind="compute",
+        payload={"grant_id": "g", "grant": {}},
+        reserve_tokens=0,
+    )
+    with database.session() as db:
+        db.execute(text("UPDATE runs SET state='running', generation=1 WHERE id=:run"), {"run": run_id})
+        db.execute(text("""
+            INSERT INTO operations (id, run_id, operation_id, generation, kind, payload_hash, state,
+                                    reserve_tokens, usage_tokens, result)
+            VALUES (:id, :run, :operation, 1, 'compute', :hash, 'reserved', 0, 0,
+                    CAST(:result AS jsonb))
+        """), {
+            "id": uuid4(), "run": run_id, "operation": operation_id,
+            "hash": "a" * 64,
+            "result": json.dumps({"request": request.model_dump(mode="json")}),
+        })
+        db.commit()
+    monkeypatch.setattr(host, "_compute_engine", object())
+    monkeypatch.setattr(host, "_compute_image_digest", "sha256:" + "d" * 64)
+    scheduled = []
+    runner = host.Host(FakeEngine())
+    monkeypatch.setattr(runner, "_run_compute_operation", lambda value: scheduled.append(value.operation_id), raising=False)
+
+    runner._compute_tick()
+    runner._compute_futures[(run_id, operation_id)].result(timeout=2)
+
+    assert scheduled == [operation_id]
+    runner.close()
+
+
 def test_config_rejects_unsafe_values(tmp_path):
     good = _config_dict(tmp_path)
     assert host.load_config(_write(tmp_path, good)).listen_port == 18080
@@ -216,7 +253,10 @@ def test_config_rejects_unsafe_values(tmp_path):
 # 2
 def test_compose_configures_runtime(tmp_path):
     cfg, s3, engine = _compose(tmp_path)
-    assert profile_preparation._expected_image_digest == WORKER_DIGEST
+    assert profile_preparation._expected_image_digest is None
+    assert profile_preparation._expected_image_digests == {
+        "prof.worker-base@py3.14.7": WORKER_DIGEST,
+    }
     assert supervisor._config is not None and supervisor._config.engine is engine
     assert supervisor._config.image == f"registry.local/worker@{WORKER_DIGEST}"
     assert broker._dispatch_inactivity_proof is not None

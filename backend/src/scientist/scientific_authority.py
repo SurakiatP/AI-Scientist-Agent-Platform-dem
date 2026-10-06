@@ -1,5 +1,6 @@
 """Compose immutable instruction authority with current host preparation evidence."""
 import json
+import re
 from pathlib import Path
 from uuid import UUID
 
@@ -7,10 +8,12 @@ from sqlalchemy import text
 
 from scientist import profile_preparation, supervisor
 from scientist.auth import DomainError
-from scientist.contracts import Principal, RuntimePins, ScientificBinding, ScientificBindingV2, RUNTIME_COMMIT
+from scientist.contracts import ComputeProfilePin, Principal, RuntimePins, ScientificBinding, ScientificBindingV2, RUNTIME_COMMIT
 
 ROOT = Path(__file__).resolve().parents[3]
 _bundle_root = ROOT
+_compute_profile_pin: ComputeProfilePin | None = None
+_compute_recipe_manifest: str | None = None
 
 
 def configure_bundle(root: Path | None) -> None:
@@ -19,13 +22,45 @@ def configure_bundle(root: Path | None) -> None:
     _bundle_root = Path(root) if root is not None else ROOT
 
 
+def configure_compute_profile(image_digest: str | None, recipe_manifest_sha256: str | None) -> None:
+    """Install host-configured compute pins; caller values never come from a plan."""
+    global _compute_profile_pin, _compute_recipe_manifest
+    if image_digest is None and recipe_manifest_sha256 is None:
+        _compute_profile_pin = None
+        _compute_recipe_manifest = None
+        return
+    try:
+        _compute_profile_pin = ComputeProfilePin(
+            profile_id="prof.csv-stdlib@py3.14.7",
+            version="1",
+            image_digest=image_digest,
+        )
+    except (TypeError, ValueError) as exc:
+        raise DomainError("scientific_environment_unavailable", 409) from exc
+    if not isinstance(recipe_manifest_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", recipe_manifest_sha256):
+        _compute_profile_pin = None
+        _compute_recipe_manifest = None
+        raise DomainError("scientific_environment_unavailable", 409)
+    _compute_recipe_manifest = recipe_manifest_sha256
+
+
+def trusted_compute_profile() -> tuple[ComputeProfilePin, str]:
+    if _compute_profile_pin is None or _compute_recipe_manifest is None:
+        raise DomainError("scientific_environment_unavailable", 409)
+    return _compute_profile_pin, _compute_recipe_manifest
+
+
 def current_image_digest() -> str:
     if supervisor._config is None:
         raise DomainError('scientific_environment_unavailable', 409)
     return supervisor._config.image_digest
 
 
-def _current_runtime_pins() -> RuntimePins:
+def _current_runtime_pins(trusted_runtime_pins: RuntimePins | None = None) -> RuntimePins:
+    if trusted_runtime_pins is not None:
+        if not isinstance(trusted_runtime_pins, RuntimePins):
+            raise DomainError("scientific_environment_unavailable", 409)
+        return trusted_runtime_pins
     if supervisor._config is None:
         raise DomainError("scientific_environment_unavailable", 409)
     config = supervisor._config
@@ -40,7 +75,12 @@ def _current_runtime_pins() -> RuntimePins:
         raise DomainError("scientific_environment_unavailable", 409) from exc
 
 
-def validate_instruction(binding: ScientificBinding | ScientificBindingV2, expected_image_digest: str):
+def validate_instruction(
+    binding: ScientificBinding | ScientificBindingV2,
+    expected_image_digest: str,
+    *,
+    trusted_runtime_pins: RuntimePins | None = None,
+):
     from scientist.instruction_loader import load_instruction_pins, validate_scientific_binding
     registry = ROOT / 'docs/skills/capability-registry.json'
     if not registry.is_file():
@@ -53,7 +93,9 @@ def validate_instruction(binding: ScientificBinding | ScientificBindingV2, expec
             pinned_hashes=load_instruction_pins(ROOT / "runtime/skills-manifest.json"),
             expected_image_digest=expected_image_digest,
             expected_runtime_pins=(
-                _current_runtime_pins() if isinstance(binding, ScientificBindingV2) else None
+                _current_runtime_pins(trusted_runtime_pins)
+                if isinstance(binding, ScientificBindingV2)
+                else None
             ),
         )
     except (OSError, ValueError, TypeError) as exc:
@@ -139,9 +181,14 @@ def validate_plan_binding(
     *,
     require_ready: bool = True,
     expected_image_digest: str | None = None,
+    trusted_runtime_pins: RuntimePins | None = None,
     run_id: UUID | None = None,
 ) -> None:
-    validate_instruction(binding, expected_image_digest or current_image_digest())
+    validate_instruction(
+        binding,
+        expected_image_digest or current_image_digest(),
+        trusted_runtime_pins=trusted_runtime_pins,
+    )
     _validate_csv_snapshot_membership(db, project_id, binding, run_id=run_id)
     profile_preparation.validate_binding_for_run(db, project_id, binding, owner=owner, require_ready=require_ready)
 
@@ -152,6 +199,7 @@ def validate_runtime_binding(
     binding: ScientificBinding | ScientificBindingV2,
     *,
     expected_image_digest: str,
+    trusted_runtime_pins: RuntimePins | None = None,
 ) -> None:
     # Authority comes from the current approved database revision, never the worker-supplied owner.
     row = db.execute(text('''SELECT r.project_id,a.owner_identity FROM runs r JOIN approvals a
@@ -165,6 +213,7 @@ def validate_runtime_binding(
         row.project_id,
         binding,
         expected_image_digest=expected_image_digest,
+        trusted_runtime_pins=trusted_runtime_pins,
         run_id=run_id,
     )
 

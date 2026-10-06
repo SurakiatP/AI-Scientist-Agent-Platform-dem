@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,12 +14,99 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from scientist import checkpoints, objects
-from scientist.contracts import PlanSpec, Principal
+from scientist.contracts import OperationRequest, PlanSpec, Principal
 from scientist.db import create_project, create_session, engine, migrate, session
 from scientist.domain import approve_run, revise_plan, submit_run
-from scientist.runtime_contracts import RuntimeContextV1, RUNTIME_COMMIT
+from scientist.runtime_contracts import RuntimeContextV1, RUNTIME_COMMIT, operation_fingerprint
 from scientist import supervisor
 from scientist.supervisor import ExecutorRef
+
+
+def test_compute_executor_ref_uses_the_durable_compute_operation_column():
+    run_id, executor_id, process_id, operation_id = (uuid4() for _ in range(4))
+    row = {
+        "id": executor_id,
+        "run_id": run_id,
+        "generation": 4,
+        "kind": "compute",
+        "operation_id": None,
+        "compute_operation_id": operation_id,
+        "process_incarnation": process_id,
+        "engine_id": "owned-engine-1",
+        "container_id": "a" * 64,
+    }
+
+    executor = supervisor._executor_ref(row)
+
+    assert executor.operation_id == str(operation_id)
+
+
+def test_compute_executor_launch_intent_is_durable_and_unique(db, project_session, monkeypatch):
+    run, _plan = _approved_run(db, project_session)
+    run_id = run.run_id
+    operation_id = str(uuid4())
+    request = OperationRequest(
+        run_id=run_id,
+        generation=1,
+        operation_id=operation_id,
+        kind="compute",
+        payload={"grant_id": "g", "grant": {}},
+        reserve_tokens=0,
+    )
+    db.execute(text("UPDATE runs SET state='running', generation=1 WHERE id=:run"), {"run": run_id})
+    db.execute(text("""
+        INSERT INTO operations (id, run_id, operation_id, generation, kind, payload_hash, state,
+                                reserve_tokens, usage_tokens, result)
+        VALUES (:id, :run, :operation, 1, 'compute', :fingerprint, 'reserved', 0, 0,
+                CAST(:result AS jsonb))
+    """), {
+        "id": uuid4(), "run": run_id, "operation": operation_id,
+        "fingerprint": operation_fingerprint(request),
+        "result": json.dumps({"request": request.model_dump(mode="json")}),
+    })
+    db.commit()
+
+    first, first_new = supervisor.reserve_compute_executor(db, request, engine_id="owned-engine-1")
+    second, second_new = supervisor.reserve_compute_executor(db, request, engine_id="owned-engine-1")
+
+    assert first_new is True
+    assert second_new is False
+    assert first.executor_id == second.executor_id
+    assert first.operation_id == operation_id
+    assert first.container_id is None
+    bound = supervisor.bind_compute_executor(db, __import__("dataclasses").replace(first, container_id="b" * 64))
+    assert bound.container_id == "b" * 64
+    started = []
+    supervisor.start_compute_executor(db, bound, request, lambda: started.append(True))
+    assert started == [True]
+    assert db.execute(text("""
+        SELECT container_id, state FROM runtime_executors
+        WHERE run_id=:run AND kind='compute' AND compute_operation_id=:operation
+    """), {"run": run_id, "operation": operation_id}).one() == ("b" * 64, "active")
+    assert db.execute(text("""
+        SELECT count(*) FROM runtime_executors
+        WHERE run_id=:run AND kind='compute' AND compute_operation_id=:operation
+    """), {"run": run_id, "operation": operation_id}).scalar_one() == 1
+    stopped = []
+    cfg = SimpleNamespace(
+        engine=SimpleNamespace(),
+        dispatch=SimpleNamespace(stop=lambda _db, ref, _grace: stopped.append(ref) or False),
+        compute_engine=object(),
+        compute_image_digest="sha256:" + "d" * 64,
+    )
+    monkeypatch.setattr(supervisor, "_require_config", lambda: cfg)
+    import scientist.compute_runtime as compute_runtime
+    monkeypatch.setattr(
+        compute_runtime,
+        "stop_compute",
+        lambda engine, ref, *, expected_image_digest: stopped.append(ref),
+    )
+    assert supervisor._fence_generation(db, run_id, 1, 0)
+    assert stopped[-1].kind == "compute"
+    assert db.execute(text("""
+        SELECT state FROM runtime_executors
+        WHERE run_id=:run AND kind='compute' AND compute_operation_id=:operation
+    """), {"run": run_id, "operation": operation_id}).scalar_one() == "inactive"
 
 
 class _MemoryS3:
