@@ -34,7 +34,7 @@ from scientist.runtime_adapter import (
 from scientist.auth import DomainError
 from scientist.private_worker_api import parse_boundary
 from scientist.runtime_contracts import operation_fingerprint
-from scientist.runtime_contracts import PendingAssistant, RuntimeContextV1
+from scientist.runtime_contracts import AppliedToolId, PendingAssistant, RuntimeContextV1
 from test_runtime_contracts import context_data
 
 _ENTRYPOINT_PATH = Path(__file__).resolve().parents[2] / "runtime" / "entrypoint.py"
@@ -79,6 +79,31 @@ def _checkpoint_ack(payload: dict) -> dict:
         "checkpoint_revision": manifest["revision"],
         "manifest": manifest,
     }
+
+
+def _pinned_hermes_tool_call(
+    call_id: str,
+    name: str,
+    arguments: str,
+    *,
+    provider_data: dict[str, Any] | None = None,
+) -> Any:
+    """Load the exact pinned Hermes ToolCall used by the live transport."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / ".local/vendor/hermes/agent/transports/types.py"
+    )
+    spec = importlib.util.spec_from_file_location("agent.transports.types", source)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.ToolCall(
+        id=call_id,
+        name=name,
+        arguments=arguments,
+        provider_data=provider_data,
+    )
 
 
 def _chat_completion(content: str) -> bytes:
@@ -1263,10 +1288,48 @@ def test_native_tool_round_checkpoints_applied_id_before_execution(
     assert _pinned_hermes_attempt_count(agent._api_max_retries) == 1
     request_client = agent._create_openai_client({}, reason="request_scope", shared=False)
     assert isinstance(request_client.kwargs["http_client"]._transport, BrokerChatCompletionsTransport)
-    call = FakeNativeToolCall("normalized_call_1", "todo_list", "{}")
+    call = _pinned_hermes_tool_call("normalized_call_1", "todo_list", "{}")
     assistant = SimpleNamespace(tool_calls=[call])
     conversation = [dict(message) for message in live_history]
     conversation[-1]["timestamp"] = 1791030200.5
+
+    applied_pending = adapter.context.pending_assistant.model_copy(
+        update={
+            "applied_tool_ids": [
+                AppliedToolId(raw_id="raw_call_1", applied_id="normalized_call_1")
+            ]
+        }
+    )
+    invalid_calls = [
+        _pinned_hermes_tool_call("normalized_call_1", "terminal", "{}"),
+        _pinned_hermes_tool_call("other_call", "todo_list", "{}"),
+        _pinned_hermes_tool_call("normalized_call_1", "todo_list", '{"todos":[]}'),
+        _pinned_hermes_tool_call(
+            "normalized_call_1", "todo_list", "{}", provider_data={"surprise": "x"}
+        ),
+        _pinned_hermes_tool_call(
+            "normalized_call_1", "todo_list", "{}", provider_data={"call_id": "other_call"}
+        ),
+    ]
+    unexpected_attribute = _pinned_hermes_tool_call(
+        "normalized_call_1", "todo_list", "{}"
+    )
+    unexpected_attribute.unreviewed = "x"
+    invalid_calls.append(unexpected_attribute)
+    for invalid_call in invalid_calls:
+        adapter.context = adapter.context.model_copy(
+            update={"pending_assistant": applied_pending}
+        )
+        with pytest.raises(RuntimeAdapterError):
+            agent._execute_tool_calls(
+                SimpleNamespace(tool_calls=[invalid_call]),
+                conversation,
+                str(context_data["run_id"]),
+            )
+        assert events == []
+        assert agent.native_dispatches == []
+
+    adapter.context = adapter.context.model_copy(update={"pending_assistant": applied_pending})
     agent._execute_tool_calls(assistant, conversation, str(context_data["run_id"]))
     assert len(events) == 2
     before = events[0]["context"]
@@ -1280,6 +1343,10 @@ def test_native_tool_round_checkpoints_applied_id_before_execution(
     assert committed["pending_assistant"] is None
     assert committed["messages"][-1]["tool_call_id"] == "raw_call_1"
     assert committed["messages"][-2]["tool_calls"][0]["id"] == "raw_call_1"
+    assert committed["messages"][-2]["tool_calls"][0]["function"] == {
+        "name": "todo_list",
+        "arguments": "{}",
+    }
     assert {item["message_index"]: item["timestamp"] for item in committed["native_message_metadata"]} == {
         0: 1791030000.25,
         1: 1791030200.5,

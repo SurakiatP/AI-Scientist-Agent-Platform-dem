@@ -106,6 +106,56 @@ def _model_mapping(value: Any) -> dict[str, Any]:
     raise RuntimeAdapterError("invalid runtime context")
 
 
+def _native_tool_call_mapping(value: Any) -> dict[str, Any]:
+    """Project the pinned Hermes transport ToolCall onto Chat Completions wire shape.
+
+    Hermes' normalized ToolCall is a dataclass whose ``function`` property points
+    back to itself. Keep this conversion scoped to that exact native type; runtime
+    contexts still require Pydantic models or dictionaries.
+    """
+    if type(value).__module__ != "agent.transports.types" or type(value).__name__ != "ToolCall":
+        return _model_mapping(value)
+
+    try:
+        attributes = vars(value)
+    except TypeError as exc:
+        raise RuntimeAdapterError("invalid native tool call") from exc
+    expected = {"id", "name", "arguments", "provider_data"}
+    if not expected.issubset(attributes) or set(attributes) - expected - {"args_repaired"}:
+        raise RuntimeAdapterError("invalid native tool call")
+    if "args_repaired" in attributes and not isinstance(attributes["args_repaired"], bool):
+        raise RuntimeAdapterError("invalid native tool call metadata")
+
+    call_id = attributes["id"]
+    name = attributes["name"]
+    arguments = attributes["arguments"]
+    if (
+        not isinstance(call_id, str)
+        or not call_id
+        or call_id.strip() != call_id
+        or "|" in call_id
+        or not isinstance(name, str)
+        or not name
+        or not isinstance(arguments, str)
+    ):
+        raise RuntimeAdapterError("invalid native tool call")
+
+    provider_data = attributes["provider_data"]
+    if provider_data is not None:
+        if not isinstance(provider_data, dict) or set(provider_data) - {"call_id", "response_item_id"}:
+            raise RuntimeAdapterError("unsupported native tool call metadata")
+        # Chat Completions calls in this profile pair by id. Hermes uses these
+        # aliases for other protocols, where its dispatch pairing differs.
+        if any(value is not None for value in provider_data.values()):
+            raise RuntimeAdapterError("unsupported native tool call metadata")
+
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
 def _validate_native_tool_arguments(name: str, arguments: Any, binding: ScientificBinding | None) -> None:
     if not isinstance(arguments, dict):
         raise RuntimeAdapterError("native tool arguments must be an object")
@@ -128,7 +178,7 @@ def _validate_native_todo_call(agent: Any, call: Any) -> tuple[str, dict[str, An
     Deferred Tool Search calls are therefore unwrapped and checked here, then the
     scientific handlers repeat authority validation after middleware transforms.
     """
-    value = _model_mapping(call)
+    value = _native_tool_call_mapping(call)
     function = value.get("function")
     if not isinstance(function, dict):
         raise RuntimeAdapterError("native tool call has no function")
@@ -994,7 +1044,7 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
                 raise RuntimeAdapterError("native dispatcher has no saved assistant batch")
             saved_calls = adapter.context.messages[pending.message_index].tool_calls or []
             saved_call = next(
-                (call for call in saved_calls if _model_mapping(call).get("id") == raw_call_id), None
+                (call for call in saved_calls if _native_tool_call_mapping(call).get("id") == raw_call_id), None
             )
             if saved_call is None:
                 raise RuntimeAdapterError("native dispatcher identity is not in the saved assistant batch")
@@ -1107,8 +1157,8 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
             for saved_call, call in zip(suffix_calls, current_calls, strict=True):
                 if call.id not in {item.applied_id for item in suffix}:
                     raise RuntimeAdapterError("normalized tool identity is not checkpointed")
-                saved = _model_mapping(saved_call)
-                live = _model_mapping(call)
+                saved = _native_tool_call_mapping(saved_call)
+                live = _native_tool_call_mapping(call)
                 saved_function = saved.get("function") or {}
                 live_function = live.get("function") or {}
                 if (
