@@ -13,7 +13,9 @@ from typing import Mapping
 
 CATALOG_COMMIT = "154988403bb5a18e9d3c0ce4e6d5e2e4b184a298"
 EXPECTED_SKILL_COUNT = 177
-REVIEWED_CAPABILITY_ALLOWLIST = frozenset({"get-available-resources"})
+REVIEWED_CAPABILITY_ALLOWLIST = frozenset({
+    "get-available-resources", "paper-lookup", "exploratory-data-analysis",
+})
 _ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 

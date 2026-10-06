@@ -6,7 +6,275 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 from scientist.contracts import PlanSpec, OperationRequest
+from scientist import contracts
 from scientist.runtime_contracts import RuntimeContextV1, BoundaryRequest, BootstrapMetadata, operation_fingerprint
+from scientist import runtime_contracts as runtime
+
+def test_compute_envelope_is_closed_ordered_and_byte_verified():
+    model = getattr(runtime, "ComputeResultEnvelopeV2", None)
+    assert model is not None
+    names = ["summary.json", "summary.csv", "chart.svg", "report.md"]
+    content_types = ["application/json", "text/csv", "image/svg+xml", "text/markdown"]
+    project_id = str(uuid4())
+    entries = []
+    for index, (name, content_type) in enumerate(zip(names, content_types)):
+        data = f"output-{index}".encode()
+        output_sha = sha256(data).hexdigest()
+        entries.append({
+            "index": index, "name": name, "content_type": content_type,
+            "object_ref": {"project_id": project_id, "key": f"{project_id}/{output_sha}",
+                           "sha256": output_sha, "size": len(data),
+                           "content_type": "application/octet-stream"},
+            "data_base64": base64.b64encode(data).decode("ascii"),
+        })
+    payload = {
+        "schema_version": 2, "binding_sha256": "a" * 64, "grant_id": "grant-1",
+        "operation_id": "operation-1", "operation_fingerprint": "9" * 64,
+        "input_manifest_sha256": "8" * 64,
+        "recipe_id": "csv.describe.v1", "recipe_version": "1",
+        "recipe_manifest_sha256": "b" * 64, "profile_id": "prof.csv-stdlib@py3.14.7",
+        "profile_version": "1", "image_digest": "sha256:" + "c" * 64,
+        "input_ref": {"project_id": project_id, "key": f"{project_id}/{'d' * 64}", "sha256": "d" * 64,
+                      "size": 20, "content_type": "application/octet-stream"},
+        "input_sha256": "d" * 64,
+        "outputs": entries,
+    }
+    assert model.model_validate(payload).model_dump(mode="json")["outputs"][3]["name"] == "report.md"
+    for change in (
+        {"outputs": entries[:2] + entries[3:4] + entries[2:3]},
+        {"outputs": [dict(entries[0], data_base64="not base64"), *entries[1:]]},
+        {"outputs": [dict(entries[0], object_ref={**entries[0]["object_ref"], "sha256": "e" * 64}), *entries[1:]]},
+        {"untrusted": "extra"},
+    ):
+        with pytest.raises(ValidationError):
+            model.model_validate({**payload, **change})
+
+
+def test_input_manifest_hash_uses_canonical_ref_and_parameter_bytes():
+    grant = contracts.CsvDescribeGrantV1(
+        recipe_id="csv.describe.v1", recipe_version="1", recipe_manifest_sha256="f" * 64,
+        profile_id="prof.csv-stdlib@py3.14.7", profile_version="1", image_digest="sha256:" + "a" * 64,
+        input_ref={"project_id": str(uuid4()), "key": "project/hash", "sha256": "b" * 64,
+                    "size": 20, "content_type": "application/octet-stream"},
+        input_sha256="b" * 64, numeric_columns=["x"],
+    )
+    params = canonical({"numeric_columns": ["x"]})
+    expected = {
+        "schema_version": 1,
+        "data.csv": {"ref": grant.input_ref.model_dump(mode="json")},
+        "params.json": {"sha256": sha256(params).hexdigest(), "size": len(params)},
+    }
+    assert runtime.compute_input_manifest(grant) == expected
+    assert runtime.compute_input_manifest_sha256(grant) == sha256(canonical(expected)).hexdigest()
+
+def test_compute_launch_spec_requires_canonical_trusted_paths():
+    model = getattr(runtime, "ComputeLaunchSpec", None)
+    assert model is not None
+    valid = {
+        "profile_id": "prof.csv-stdlib@py3.14.7", "profile_version": "1",
+        "image_digest": "sha256:" + "a" * 64, "recipe_manifest_sha256": "b" * 64,
+        "recipe_directory": "/trusted/recipe", "input_directory": "/trusted/input",
+        "output_directory": "/trusted/output",
+    }
+    assert model.model_validate(valid).recipe_directory.is_absolute()
+    for field in ("recipe_directory", "input_directory", "output_directory"):
+        with pytest.raises(ValidationError):
+            model.model_validate({**valid, field: "relative/path"})
+
+def test_scientific_result_receipt_v2_requires_four_fixed_outputs():
+    model = getattr(runtime, "ScientificResultReceiptV2", None)
+    assert model is not None
+    names = ["summary.json", "summary.csv", "chart.svg", "report.md"]
+    content_types = ["application/json", "text/csv", "image/svg+xml", "text/markdown"]
+    project_id = str(uuid4())
+    outputs = [
+        {
+            "index": index,
+            "name": name,
+            "content_type": content_types[index],
+            "path": f"outputs/{name}",
+            "sha256": chr(97 + index) * 64,
+            "size": 10,
+            "object_ref": {
+                "project_id": project_id,
+                "key": f"{project_id}/{chr(97 + index) * 64}",
+                "sha256": chr(97 + index) * 64,
+                "size": 10,
+                "content_type": "application/octet-stream",
+            },
+        }
+        for index, name in enumerate(names)
+    ]
+    receipt = {
+        "receipt_version": 2,
+        "tool_call_id": "call-1", "grant_id": "grant-1", "binding_sha256": "e" * 64,
+        "operation_id": "operation-1", "effective_operation_id": "operation-1",
+        "operation_fingerprint": "9" * 64,
+        "input_manifest_sha256": "8" * 64,
+        "recipe_manifest_sha256": "f" * 64, "profile_id": "prof.csv-stdlib@py3.14.7",
+        "profile_version": "1", "image_digest": "sha256:" + "a" * 64,
+        "input_sha256": "b" * 64, "outputs": outputs,
+    }
+    assert len(model.model_validate(receipt).outputs) == 4
+    with pytest.raises(ValidationError):
+        model.model_validate({**receipt, "outputs": outputs[:3]})
+    with pytest.raises(ValidationError):
+        model.model_validate({**receipt, "outputs": outputs[:2] + [dict(outputs[2], path="outputs/../escape"), outputs[3]]})
+
+def test_v2_context_receipt_binds_approved_grant_and_checkpoint_bytes(context_data):
+    names = ["summary.json", "summary.csv", "chart.svg", "report.md"]
+    content_types = ["application/json", "text/csv", "image/svg+xml", "text/markdown"]
+    outputs = []
+    manifest = []
+    for index, (name, content_type) in enumerate(zip(names, content_types)):
+        data = f"output-{index}".encode()
+        digest = sha256(data).hexdigest()
+        project_id = context_data["project_id"]
+        outputs.append({
+            "index": index,
+            "name": name,
+            "content_type": content_type,
+            "path": f"outputs/{name}",
+            "sha256": digest,
+            "size": len(data),
+            "object_ref": {
+                "project_id": project_id,
+                "key": f"{project_id}/{digest}",
+                "sha256": digest,
+                "size": len(data),
+                "content_type": "application/octet-stream",
+            },
+        })
+        manifest.append({"path": f"outputs/{name}", "sha256": digest, "size": len(data)})
+    pin = contracts.RuntimePins(
+        image_digest=context_data["image_digest"],
+        skills_digest=context_data["skills_digest"],
+        environment_digest=context_data["environment_digest"],
+    )
+    grant = contracts.CsvDescribeGrantV1(
+        recipe_id="csv.describe.v1", recipe_version="1", recipe_manifest_sha256="f" * 64,
+        profile_id="prof.csv-stdlib@py3.14.7", profile_version="1", image_digest="sha256:" + "a" * 64,
+        input_ref={"project_id": project_id, "key": f"{project_id}/{'b' * 64}", "sha256": "b" * 64,
+                    "size": 20, "content_type": "application/octet-stream"},
+        input_sha256="b" * 64, numeric_columns=["x"],
+    )
+    binding = contracts.ScientificBindingV2(
+        binding_version=2, catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="a" * 64, capability_ids=["exploratory-data-analysis"],
+        instruction_fingerprint="e" * 64, agent_runtime_pins=pin,
+        input_snapshot_digest="a" * 64,
+        required_compute_profiles=[contracts.ComputeProfilePin(
+            profile_id=grant.profile_id, version=grant.profile_version, image_digest=grant.image_digest
+        )],
+        csv_describe_grants={"grant-1": grant},
+    )
+    plan = contracts.PlanSpec.model_validate(context_data["plan"]).model_copy(update={
+        "allowed_ops": ["llm", "search", "compute"], "scientific": binding,
+    })
+    context_data["plan"] = plan.model_dump(mode="json")
+    context_data["plan_digest"] = sha256(canonical(plan.model_dump(mode="json"))).hexdigest()
+    request = OperationRequest(
+        run_id=context_data["run_id"], generation=1, operation_id="operation-1", kind="compute",
+        payload={"grant_id": "grant-1", "grant": grant.model_dump(mode="json")}, reserve_tokens=0,
+    )
+    fingerprint = operation_fingerprint(request)
+    context_data["operation_mappings"] = [{
+        "operation_id": request.operation_id, "turn_id": context_data["turn_id"],
+        "purpose": "tool", "model_sequence": None, "tool_call_id": "call-1",
+        "request": request.model_dump(mode="json"), "payload_hash": fingerprint,
+    }]
+    context_data["messages"] = [
+        {"role": "user", "content": "Summarize measurements"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call-1", "type": "function", "function": {
+                "name": "scientific_csv_describe", "arguments": '{"grant_id":"grant-1"}'
+            }
+        }]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "Committed result"},
+    ]
+    context_data["current_turn_user_index"] = 0
+    context_data["scientific_results_v2"] = [{
+        "receipt_version": 2, "tool_call_id": "call-1", "grant_id": "grant-1",
+        "binding_sha256": sha256(canonical(binding.model_dump(mode="json"))).hexdigest(),
+        "operation_id": "operation-1", "effective_operation_id": "operation-1",
+        "operation_fingerprint": fingerprint,
+        "input_manifest_sha256": runtime.compute_input_manifest_sha256(grant),
+        "recipe_manifest_sha256": grant.recipe_manifest_sha256,
+        "profile_id": grant.profile_id, "profile_version": grant.profile_version,
+        "image_digest": grant.image_digest, "input_sha256": grant.input_sha256,
+        "outputs": outputs,
+    }]
+    context_data["workspace_manifest"] = manifest
+
+    parsed = RuntimeContextV1.model_validate(context_data)
+
+    assert parsed.scientific_results_v2[0].outputs[3].path == "outputs/report.md"
+
+    query = contracts.CrossrefQueryV1(
+        source_id="crossref", version=1, access_mode="public_read",
+        query="measurement evidence", doi=None, limit=3,
+    )
+    continued_binding = contracts.ScientificBindingV2.model_validate({
+        **binding.model_dump(mode="json"),
+        "capability_ids": ["exploratory-data-analysis", "paper-lookup"],
+        "approved_crossref_queries": {"request-1": query.model_dump(mode="json")},
+    })
+    continued_plan = contracts.PlanSpec.model_validate({
+        **context_data["plan"], "scientific": continued_binding.model_dump(mode="json"),
+    })
+    continued = deepcopy(context_data)
+    continued["plan"] = continued_plan.model_dump(mode="json")
+    continued["plan_digest"] = sha256(canonical(continued["plan"])).hexdigest()
+    continued["scientific_results_v2"][0]["binding_sha256"] = sha256(
+        canonical(continued_binding.model_dump(mode="json"))
+    ).hexdigest()
+    continued["messages"] += [
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call-2", "type": "function", "function": {
+                "name": "search_papers", "arguments": '{"request_id":"request-1"}',
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "call-2", "content": "Search result"},
+    ]
+    search_request = OperationRequest(
+        run_id=continued["run_id"], generation=1, operation_id="search-operation",
+        kind="search", payload={
+            "request_id": "request-1", "query": query.model_dump(mode="json"),
+        }, reserve_tokens=0,
+    )
+    continued["operation_mappings"] = [{
+        "operation_id": search_request.operation_id, "turn_id": continued["turn_id"],
+        "purpose": "tool", "model_sequence": None, "tool_call_id": "call-2",
+        "request": search_request.model_dump(mode="json"),
+        "payload_hash": operation_fingerprint(search_request),
+    }]
+    continued_context = RuntimeContextV1.model_validate(continued)
+    assert len(continued_context.scientific_results_v2) == 1
+
+    forged = deepcopy(context_data)
+    forged["scientific_results_v2"][0]["operation_fingerprint"] = "9" * 64
+    with pytest.raises(ValidationError):
+        RuntimeContextV1.model_validate(forged)
+    forged = deepcopy(context_data)
+    forged["scientific_results_v2"][0]["operation_id"] = "forged-operation"
+    with pytest.raises(ValidationError):
+        RuntimeContextV1.model_validate(forged)
+    forged = deepcopy(context_data)
+    forged["scientific_results_v2"][0]["input_manifest_sha256"] = "9" * 64
+    with pytest.raises(ValidationError):
+        RuntimeContextV1.model_validate(forged)
+    forged = deepcopy(context_data)
+    forged["scientific_results_v2"][0]["outputs"][0]["object_ref"]["key"] = "outputs/summary.json"
+    with pytest.raises(ValidationError):
+        RuntimeContextV1.model_validate(forged)
+    forged = deepcopy(context_data)
+    forged["operation_mappings"][0]["request"]["reserve_tokens"] = 1
+    forged_request = OperationRequest.model_validate(forged["operation_mappings"][0]["request"])
+    forged_fingerprint = operation_fingerprint(forged_request)
+    forged["operation_mappings"][0]["payload_hash"] = forged_fingerprint
+    forged["scientific_results_v2"][0]["operation_fingerprint"] = forged_fingerprint
+    with pytest.raises(ValidationError):
+        RuntimeContextV1.model_validate(forged)
 
 def canonical(value):
     return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()

@@ -17,6 +17,95 @@ from scientist.db import create_project, create_session, session
 from test_scientific_contracts import binding
 
 
+def instruction_binding_v2(**changes):
+    from scientist.contracts import ScientificBindingV2, RuntimePins
+    original = binding()
+    return ScientificBindingV2(**{
+        "binding_version": 2,
+        "catalog_commit": original.catalog_commit,
+        "registry_sha256": original.registry_sha256,
+        "capability_ids": ["paper-lookup"],
+        "instruction_fingerprint": original.instruction_fingerprint,
+        "input_snapshot_digest": "d" * 64,
+        "agent_runtime_pins": RuntimePins(
+            image_digest="sha256:" + "a" * 64,
+            skills_digest="d" * 64,
+            environment_digest="e" * 64,
+        ),
+        **changes,
+    })
+
+
+def test_v2_instruction_only_still_requires_accepted_agent_environment(db, owner):
+    project = new_project(db)
+    approved = instruction_binding_v2()
+    prep.validate_binding_for_run(db, project, approved, owner=owner, require_ready=False)
+    with pytest.raises(DomainError, match="scientific_environment_not_ready"):
+        prep.validate_binding_for_run(db, project, approved, owner=owner)
+    prep.configure_builder(proof, evidence_key=b"k" * 32,
+                           expected_image_digest=approved.agent_runtime_pins.image_digest)
+    job = prep.request_preparation(db, owner, project, submission())
+    db.commit()
+    assert prep.process_next_job(db) == job.id
+    prep.validate_binding_for_run(db, project, approved, owner=owner)
+    forged = approved.model_copy(update={"agent_runtime_pins": approved.agent_runtime_pins.model_copy(
+        update={"image_digest": "sha256:" + "f" * 64})})
+    with pytest.raises(DomainError, match="scientific_environment_not_ready"):
+        prep.validate_binding_for_run(db, project, forged, owner=owner)
+
+
+def test_v2_agent_acceptance_does_not_authorize_compute_profile(db, owner):
+    from scientist.contracts import ComputeProfilePin, CsvDescribeGrantV1
+    from test_scientific_contracts import csv_grant
+    project = new_project(db)
+    grant = CsvDescribeGrantV1(**csv_grant())
+    approved = instruction_binding_v2(
+        capability_ids=["exploratory-data-analysis"],
+        csv_describe_grants={"grant-1": grant},
+        required_compute_profiles=[ComputeProfilePin(profile_id=grant.profile_id,
+            version=grant.profile_version, image_digest=grant.image_digest)],
+    )
+    prep.configure_builder(proof, evidence_key=b"k" * 32,
+                           expected_image_digest=approved.agent_runtime_pins.image_digest)
+    job = prep.request_preparation(db, owner, project, submission())
+    db.commit()
+    prep.process_next_job(db)
+    assert prep.get_job(db, owner, project, job.id).state == "ready"
+    with pytest.raises(DomainError, match="scientific_environment_not_ready"):
+        prep.validate_binding_for_run(db, project, approved, owner=owner)
+
+
+@pytest.mark.parametrize("compute", [False, True])
+def test_v2_readiness_reports_only_required_environment_lanes(db, owner, monkeypatch, compute):
+    from types import SimpleNamespace
+    project = new_project(db)
+    approved = instruction_binding_v2()
+    if compute:
+        from scientist.contracts import ComputeProfilePin, CsvDescribeGrantV1
+        from test_scientific_contracts import csv_grant
+        grant = CsvDescribeGrantV1(**csv_grant())
+        approved = instruction_binding_v2(capability_ids=["exploratory-data-analysis"],
+            csv_describe_grants={"grant-1": grant}, required_compute_profiles=[
+                ComputeProfilePin(profile_id=grant.profile_id, version=grant.profile_version,
+                                  image_digest=grant.image_digest)])
+    prep.configure_builder(proof, evidence_key=b"k" * 32,
+                           expected_image_digest=approved.agent_runtime_pins.image_digest)
+    prep.request_preparation(db, owner, project, submission())
+    db.commit()
+    prep.process_next_job(db)
+    provider, run_id = uuid4(), uuid4()
+    monkeypatch.setattr(prep.domain, "get_run", lambda *_: SimpleNamespace(project_id=project))
+    monkeypatch.setattr(prep.domain, "get_plan", lambda *_: SimpleNamespace(
+        plan=SimpleNamespace(provider_id=provider, model="fixture", scientific=approved),
+        revision=1, plan_digest="a" * 64))
+    monkeypatch.setattr(prep.secretstore, "list_connections", lambda *_: [])
+    readiness = prep.get_readiness(db, owner, run_id)
+    expected = [("model_connection", "missing"), (prep.PROFILE_ID, "ready")]
+    if compute:
+        expected.append(("prof.csv-stdlib@py3.14.7", "blocked"))
+    assert [(r.id, r.state) for r in readiness.requirements] == expected
+
+
 @pytest.fixture(autouse=True)
 def reset_builder():
     prep.configure_builder(None)

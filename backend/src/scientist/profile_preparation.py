@@ -18,7 +18,7 @@ from scientist import domain, secrets as secretstore
 from scientist.auth import DomainError
 from scientist.contracts import (PreparationJobView, PreparationSubmit, Principal,
                                 ResearchProfileView, ResearchRequirementView,
-                                ResearchSetupView, RunReadinessView, ScientificBinding)
+                                ResearchSetupView, RunReadinessView, ScientificBinding, ScientificBindingV2)
 
 ROOT = Path(__file__).resolve().parents[3]
 PROFILE_ID = "prof.worker-base@py3.14.7"
@@ -327,11 +327,11 @@ def _latest(db: Session, owner: Principal, profile: Profile):
          "digest": profile.manifest_sha256}).one_or_none()
 
 
-def _state(row) -> tuple[str, str | None]:
+def _state(row, *, expected_image_digest: str | None = None) -> tuple[str, str | None]:
     if row is None:
         return "missing", "environment_not_prepared"
     if row.state == "ready":
-        return ("ready", None) if _verified(row) is not None else ("blocked", "build_evidence_unavailable")
+        return ("ready", None) if _verified(row, expected_image_digest=expected_image_digest) is not None else ("blocked", "build_evidence_unavailable")
     if row.state in {"queued", "building", "checking"}:
         return "preparing", None
     return ("blocked" if row.state == "unknown" else row.state), row.error_code
@@ -358,10 +358,28 @@ def get_setup(db: Session, owner: Principal, project_id: UUID) -> ResearchSetupV
         connections=secretstore.list_connections(db, owner)[:100], preparations=[_job_view(row, project_id) for row in rows])
 
 
-def validate_binding_for_run(db: Session, project_id: UUID, binding: ScientificBinding, *,
+def validate_binding_for_run(db: Session, project_id: UUID, binding: ScientificBinding | ScientificBindingV2, *,
                              owner: Principal, require_ready: bool = True) -> None:
     """Profile proof complements R1's pinned instruction validation; it never grants tools."""
     _owner_project(db, owner, project_id)
+    if isinstance(binding, ScientificBindingV2):
+        binding = ScientificBindingV2.model_validate(binding.model_dump(mode="json"))
+        if not require_ready:
+            return
+        identities = [(PROFILE_ID, "1", binding.agent_runtime_pins.image_digest)]
+        identities.extend((pin.profile_id, pin.version, pin.image_digest)
+                          for pin in binding.required_compute_profiles)
+        for profile_id, version, image_digest in identities:
+            try:
+                profile = _profile(profile_id, version)
+            except DomainError as exc:
+                raise DomainError("scientific_environment_not_ready", 409) from exc
+            row = _latest(db, owner, profile)
+            proof = (_verified(row, expected_image_digest=image_digest)
+                     if row is not None and row.state == "ready" else None)
+            if proof is None:
+                raise DomainError("scientific_environment_not_ready", 409)
+        return
     binding = ScientificBinding.model_validate(binding.model_dump(mode="json"))
     profile = _profile(binding.profile_id, binding.profile_version)
     if (binding.capability_ids != ["get-available-resources"] or binding.parameters or binding.tool_version != "1"
@@ -389,17 +407,30 @@ def get_readiness(db: Session, owner: Principal, run_id: UUID) -> RunReadinessVi
         reason=None if configured else "connection_not_configured")]
     binding = plan.plan.scientific
     if binding is not None:
-        profile = _profile(binding.profile_id, binding.profile_version)
-        state, reason = _state(_latest(db, owner, profile))
-        if state == "ready":
+        if isinstance(binding, ScientificBindingV2):
+            identities = [(PROFILE_ID, "1", binding.agent_runtime_pins.image_digest)]
+            identities.extend((pin.profile_id, pin.version, pin.image_digest)
+                              for pin in binding.required_compute_profiles)
+        else:
+            identities = [(binding.profile_id, binding.profile_version, binding.image_digest)]
+        for profile_id, version, image_digest in identities:
             try:
-                validate_binding_for_run(db, run.project_id, binding, owner=owner)
+                profile = _profile(profile_id, version)
             except DomainError:
-                state, reason = "blocked", "scientific_binding_unavailable"
-        requirements.append(ResearchRequirementView(id=profile.profile_id, label=profile.label,
-            purpose=profile.purpose, state=state, reason=reason,
-            action="none" if state in {"ready", "preparing"} else
-                   "request_approval" if state == "blocked" else "prepare_environment"))
+                requirements.append(ResearchRequirementView(id=profile_id,
+                    label="CSV analysis environment", purpose="Prepare the approved CSV analysis environment.",
+                    state="blocked", reason="profile_not_configured", action="request_approval"))
+                continue
+            state, reason = _state(_latest(db, owner, profile), expected_image_digest=image_digest)
+            if state == "ready" and not isinstance(binding, ScientificBindingV2):
+                try:
+                    validate_binding_for_run(db, run.project_id, binding, owner=owner)
+                except DomainError:
+                    state, reason = "blocked", "scientific_binding_unavailable"
+            requirements.append(ResearchRequirementView(id=profile.profile_id, label=profile.label,
+                purpose=profile.purpose, state=state, reason=reason,
+                action="none" if state in {"ready", "preparing"} else
+                       "request_approval" if state == "blocked" else "prepare_environment"))
     states = {requirement.state for requirement in requirements}
     state = next((status for status in ("blocked", "failed", "missing", "preparing") if status in states), "ready")
     return RunReadinessView(run_id=run_id, revision=plan.revision, plan_digest=plan.plan_digest,

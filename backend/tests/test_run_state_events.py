@@ -95,5 +95,6 @@ def test_record_unknown_skips_event_when_already_waiting_input(broker_fixture):
     revision = db.execute(text("SELECT revision FROM runs WHERE id=:r"), {"r": run_id}).scalar_one()
     broker._record_unknown(db, request(run_id), revision, usage_tokens=None, result_ref=None)
     assert states(db, run_id) == before
+    assert db.execute(text("SELECT waiting_reason FROM runs WHERE id=:r"), {"r": run_id}).scalar_one() == 'budget_exhausted'
     assert db.execute(text("SELECT count(*) FROM owner_decisions WHERE run_id=:r AND operation_id='operation-1' AND state='pending'"),
                       {"r": run_id}).scalar_one() == 1

@@ -20,6 +20,110 @@ from scientist.resource_recipe import (
 
 ROOT = Path(__file__).resolve().parents[2]
 
+def test_only_reviewed_scientific_slice_instructions_are_selectable():
+    registry = load_registry(ROOT / "docs/skills/capability-registry.json")
+    selection = registry.select(["paper-lookup", "exploratory-data-analysis"])
+    assert selection.capability_ids == ("paper-lookup", "exploratory-data-analysis")
+    assert all(not capability.statuses.enabled for capability in selection.capabilities)
+    with pytest.raises(RegistryError):
+        registry.select(["literature-review"])
+
+
+def test_v2_instruction_authority_keeps_catalog_profiles_separate_from_runtime_pins(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from scientist import instruction_loader
+    from scientist.contracts import RuntimePins, ScientificBindingV2
+
+    pins = RuntimePins(
+        runtime_commit="bd0affe5e5f723579df8902852f5d0c47795f355",
+        image_digest="sha256:" + "a" * 64,
+        skills_digest="b" * 64,
+        environment_digest="c" * 64,
+    )
+    selection = SimpleNamespace(
+        capability_ids=("paper-lookup", "exploratory-data-analysis"),
+        profile_ids=("prof.remote-client@py3.13", "prof.cpu-sci@py3.13"),
+    )
+    registry = SimpleNamespace(
+        catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="d" * 64,
+        select=lambda _ids: selection,
+    )
+    monkeypatch.setattr(instruction_loader, "load_registry", lambda _path: registry)
+    monkeypatch.setattr(
+        instruction_loader,
+        "load_instruction_bundle",
+        lambda *_args, **_kwargs: SimpleNamespace(instruction_fingerprint="e" * 64),
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text("{}")
+    binding = ScientificBindingV2(
+        binding_version=2,
+        catalog_commit=registry.catalog_commit,
+        registry_sha256=registry.registry_sha256,
+        capability_ids=list(selection.capability_ids),
+        instruction_fingerprint="e" * 64,
+        agent_runtime_pins=pins,
+        input_snapshot_digest="f" * 64,
+    )
+
+    result = instruction_loader.validate_scientific_binding(
+        binding,
+        registry_path=registry_path,
+        bundle_root=tmp_path,
+        pinned_hashes={},
+        expected_image_digest=pins.image_digest,
+        expected_runtime_pins=pins,
+    )
+
+    assert result.instruction_fingerprint == binding.instruction_fingerprint
+
+
+def test_v2_instruction_authority_rejects_runtime_pin_drift(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from scientist import instruction_loader
+    from scientist.contracts import RuntimePins, ScientificBindingV2
+
+    pins = RuntimePins(
+        runtime_commit="bd0affe5e5f723579df8902852f5d0c47795f355",
+        image_digest="sha256:" + "a" * 64,
+        skills_digest="b" * 64,
+        environment_digest="c" * 64,
+    )
+    registry = SimpleNamespace(
+        catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="d" * 64,
+        select=lambda _ids: SimpleNamespace(
+            capability_ids=("paper-lookup",), profile_ids=("prof.remote-client@py3.13",)
+        ),
+    )
+    monkeypatch.setattr(instruction_loader, "load_registry", lambda _path: registry)
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text("{}")
+    binding = ScientificBindingV2(
+        binding_version=2,
+        catalog_commit=registry.catalog_commit,
+        registry_sha256=registry.registry_sha256,
+        capability_ids=["paper-lookup"],
+        instruction_fingerprint="e" * 64,
+        agent_runtime_pins=pins,
+        input_snapshot_digest="f" * 64,
+    )
+
+    with pytest.raises(InstructionLoadError, match="runtime pins"):
+        instruction_loader.validate_scientific_binding(
+            binding,
+            registry_path=registry_path,
+            bundle_root=tmp_path,
+            pinned_hashes={},
+            expected_image_digest=pins.image_digest,
+            expected_runtime_pins=pins.model_copy(update={"skills_digest": "9" * 64}),
+        )
+
 
 def _selection_for_text(text):
     registry = load_registry(ROOT / "docs/skills/capability-registry.json")
@@ -38,9 +142,15 @@ def test_registry_loads_all_pinned_records_but_selection_uses_explicit_allowlist
         "get-available-resources",
     )
     assert registry.select(["get-available-resources"]).profile_ids == ("prof.worker-base@py3.14.7",)
+    assert registry.select(["paper-lookup", "exploratory-data-analysis"]).capability_ids == (
+        "paper-lookup",
+        "exploratory-data-analysis",
+    )
     with pytest.raises(RegistryError, match="allowlist"):
-        registry.select(["paper-lookup"])
-    assert REVIEWED_CAPABILITY_ALLOWLIST == frozenset({"get-available-resources"})
+        registry.select(["literature-review"])
+    assert REVIEWED_CAPABILITY_ALLOWLIST == frozenset(
+        {"get-available-resources", "paper-lookup", "exploratory-data-analysis"}
+    )
 
 
 def test_runtime_bundle_count_does_not_mark_catalog_skills_enabled():

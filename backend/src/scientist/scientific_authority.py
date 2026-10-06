@@ -1,4 +1,5 @@
 """Compose immutable instruction authority with current host preparation evidence."""
+import json
 from pathlib import Path
 from uuid import UUID
 
@@ -6,7 +7,7 @@ from sqlalchemy import text
 
 from scientist import profile_preparation, supervisor
 from scientist.auth import DomainError
-from scientist.contracts import Principal, ScientificBinding
+from scientist.contracts import Principal, RuntimePins, ScientificBinding, ScientificBindingV2, RUNTIME_COMMIT
 
 ROOT = Path(__file__).resolve().parents[3]
 _bundle_root = ROOT
@@ -24,35 +25,148 @@ def current_image_digest() -> str:
     return supervisor._config.image_digest
 
 
-def validate_instruction(binding: ScientificBinding, expected_image_digest: str):
+def _current_runtime_pins() -> RuntimePins:
+    if supervisor._config is None:
+        raise DomainError("scientific_environment_unavailable", 409)
+    config = supervisor._config
+    try:
+        return RuntimePins(
+            runtime_commit=RUNTIME_COMMIT,
+            image_digest=config.image_digest,
+            skills_digest=config.skills_digest,
+            environment_digest=config.environment_digest,
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise DomainError("scientific_environment_unavailable", 409) from exc
+
+
+def validate_instruction(binding: ScientificBinding | ScientificBindingV2, expected_image_digest: str):
     from scientist.instruction_loader import load_instruction_pins, validate_scientific_binding
     registry = ROOT / 'docs/skills/capability-registry.json'
     if not registry.is_file():
         registry = ROOT / 'runtime/capability-registry.json'
     try:
-        return validate_scientific_binding(binding, registry_path=registry,
+        return validate_scientific_binding(
+            binding,
+            registry_path=registry,
             bundle_root=_bundle_root,
-            pinned_hashes=load_instruction_pins(ROOT / 'runtime/skills-manifest.json'),
-            expected_image_digest=expected_image_digest)
+            pinned_hashes=load_instruction_pins(ROOT / "runtime/skills-manifest.json"),
+            expected_image_digest=expected_image_digest,
+            expected_runtime_pins=(
+                _current_runtime_pins() if isinstance(binding, ScientificBindingV2) else None
+            ),
+        )
     except (OSError, ValueError, TypeError) as exc:
         raise DomainError('scientific_binding_unavailable', 409) from exc
 
 
-def validate_plan_binding(db, owner: Principal, project_id: UUID, binding: ScientificBinding,
-                          *, require_ready: bool = True, expected_image_digest: str | None = None) -> None:
+def _validate_csv_snapshot_membership(
+    db,
+    project_id: UUID,
+    binding: ScientificBinding | ScientificBindingV2,
+    *,
+    run_id: UUID | None = None,
+) -> None:
+    if not isinstance(binding, ScientificBindingV2) or not binding.csv_describe_grants:
+        return
+    query = """
+        SELECT manifest
+        FROM input_snapshots
+        WHERE project_id = :project AND digest = :digest
+    """
+    params: dict[str, object] = {
+        "project": project_id,
+        "digest": binding.input_snapshot_digest.lower(),
+    }
+    if run_id is not None:
+        query += " AND run_id = :run"
+        params["run"] = run_id
+    rows = db.execute(text(query), params).mappings().all()
+    if not rows:
+        raise DomainError("scientific_input_unavailable", 409)
+
+    grants = tuple(binding.csv_describe_grants.values())
+    for row in rows:
+        manifest = row.get("manifest")
+        if isinstance(manifest, str):
+            try:
+                manifest = json.loads(manifest)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+            continue
+        files = manifest["files"]
+        if all(_grant_matches_snapshot_file(db, project_id, grant, files) for grant in grants):
+            return
+    raise DomainError("scientific_input_unavailable", 409)
+
+
+def _grant_matches_snapshot_file(db, project_id: UUID, grant, files: list[object]) -> bool:
+    ref = grant.input_ref
+    if (ref.project_id != project_id or ref.content_type != "application/octet-stream"
+            or ref.key != f"{project_id}/{ref.sha256.lower()}"):
+        return False
+    captured = next((
+        item for item in files
+        if isinstance(item, dict)
+        and item.get("object_key") == ref.key
+        and isinstance(item.get("sha256"), str)
+        and item["sha256"].strip().lower() == ref.sha256.lower()
+        and item.get("size") == ref.size
+        and item.get("content_type") == "text/csv"
+        and ("state" not in item or item.get("state") == "ready")
+    ), None)
+    if captured is None:
+        return False
+    stored = db.execute(text("""
+        SELECT project_id, sha256, size, content_type
+        FROM stored_objects WHERE key = :key
+    """), {"key": ref.key}).one_or_none()
+    return bool(
+        stored is not None
+        and stored.project_id == project_id
+        and stored.sha256.strip().lower() == ref.sha256.lower()
+        and stored.size == ref.size
+        and stored.content_type == "application/octet-stream"
+    )
+
+
+def validate_plan_binding(
+    db,
+    owner: Principal,
+    project_id: UUID,
+    binding: ScientificBinding | ScientificBindingV2,
+    *,
+    require_ready: bool = True,
+    expected_image_digest: str | None = None,
+    run_id: UUID | None = None,
+) -> None:
     validate_instruction(binding, expected_image_digest or current_image_digest())
+    _validate_csv_snapshot_membership(db, project_id, binding, run_id=run_id)
     profile_preparation.validate_binding_for_run(db, project_id, binding, owner=owner, require_ready=require_ready)
 
 
-def validate_runtime_binding(db, run_id: UUID, binding: ScientificBinding, *, expected_image_digest: str) -> None:
+def validate_runtime_binding(
+    db,
+    run_id: UUID,
+    binding: ScientificBinding | ScientificBindingV2,
+    *,
+    expected_image_digest: str,
+) -> None:
     # Authority comes from the current approved database revision, never the worker-supplied owner.
     row = db.execute(text('''SELECT r.project_id,a.owner_identity FROM runs r JOIN approvals a
         ON a.run_id=r.id AND a.revision=r.revision AND a.plan_digest=r.plan_digest
         WHERE r.id=:run'''), {'run': run_id}).one_or_none()
     if row is None:
         raise DomainError('forbidden', 403)
-    validate_plan_binding(db, Principal(identity=row.owner_identity, kind='owner'), row.project_id,
-                          binding, expected_image_digest=expected_image_digest)
+    validate_plan_binding(
+        db,
+        Principal(identity=row.owner_identity, kind="owner"),
+        row.project_id,
+        binding,
+        expected_image_digest=expected_image_digest,
+        run_id=run_id,
+    )
 
 
 def resource_binding(input_snapshot_digest: str) -> ScientificBinding:

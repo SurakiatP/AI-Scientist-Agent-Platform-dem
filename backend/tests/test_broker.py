@@ -1501,3 +1501,173 @@ def test_unsupported_transport_usage_preserves_result_and_reservation(broker_fix
     db.commit()
     broker.execute(db, capability, request)
     assert transport.calls == 1
+
+
+def test_host_commit_wins_when_transport_reports_late_timeout(broker_fixture, monkeypatch):
+    db, _, run_id, _, _ = broker_fixture
+    operation = request(run_id, "host-committed-before-timeout")
+    result_bytes = b"verified host result"
+    result_ref = ObjectRef(
+        project_id=broker._load_run_project(db, run_id),
+        key="test/verified-host-result",
+        sha256=sha256(result_bytes).hexdigest(),
+        size=len(result_bytes),
+        content_type="application/octet-stream",
+    )
+
+    def host_commits_then_times_out(_request, _target):
+        broker.record_verified_completion(
+            db, _request, 2, usage_tokens=3, result_ref=result_ref
+        )
+        raise TimeoutError("late transport timeout")
+
+    monkeypatch.setattr(broker, "_dispatch", host_commits_then_times_out)
+    result = broker.execute(db, broker.issue_capability(db, run_id, 1, 300), operation)
+
+    assert result.state == "committed"
+    assert result.result == result_ref
+    assert result.usage_tokens == 3
+    assert db.execute(text("SELECT usage_tokens, reserved_tokens FROM runs WHERE id = :run"), {"run": run_id}).one() == (3, 0)
+    assert db.execute(text("SELECT COUNT(*) FROM events WHERE run_id = :run AND kind = 'usage.updated'"), {"run": run_id}).scalar_one() == 1
+    assert db.execute(text("SELECT COUNT(*) FROM owner_decisions WHERE run_id = :run AND operation_id = :operation"), {"run": run_id, "operation": operation.operation_id}).scalar_one() == 0
+
+
+def test_scientific_scope_requires_exact_approved_crossref_and_compute_bindings(broker_fixture):
+    from scientist.contracts import (
+        ComputeProfilePin, CrossrefQueryV1, CsvDescribeGrantV1, RuntimePins, ScientificBindingV2,
+    )
+
+    db, _, run_id, _, _ = broker_fixture
+    plan = broker._load_plan(db, run_id, broker._load_run(db, run_id).revision)
+    project_id = broker._load_run_project(db, run_id)
+    crossref_url = "https://api.crossref.org/works"
+    query = CrossrefQueryV1(
+        source_id="crossref", version=1, access_mode="public_read", query="fixture query", doi=None, limit=5,
+    )
+    input_ref = ObjectRef(
+        project_id=project_id, key="inputs/fixture.csv", sha256="b" * 64,
+        size=32, content_type="text/csv",
+    )
+    grant = CsvDescribeGrantV1(
+        recipe_id="csv.describe.v1", recipe_version="1", recipe_manifest_sha256="f" * 64,
+        profile_id="prof.csv-stdlib@py3.14.7", profile_version="1", image_digest="sha256:" + "a" * 64,
+        input_ref=input_ref, input_sha256="b" * 64, numeric_columns=["x"],
+    )
+    binding = ScientificBindingV2(
+        binding_version=2, catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="a" * 64, capability_ids=["paper-lookup", "exploratory-data-analysis"],
+        instruction_fingerprint="b" * 64,
+        agent_runtime_pins=RuntimePins(
+            image_digest="sha256:" + "c" * 64, skills_digest="d" * 64, environment_digest="e" * 64,
+        ),
+        input_snapshot_digest=plan.input_snapshot_digest,
+        approved_crossref_queries={"request-1": query},
+        required_compute_profiles=[ComputeProfilePin(
+            profile_id=grant.profile_id, version=grant.profile_version, image_digest=grant.image_digest,
+        )],
+        csv_describe_grants={"grant-1": grant},
+    )
+    plan = plan.model_copy(update={
+        "scientific": binding, "allowed_ops": ["search", "compute"], "data_recipients": [crossref_url],
+    })
+
+    search = request(run_id, "approved-crossref", reserve_tokens=0).model_copy(update={
+        "kind": "search", "payload": {"request_id": "request-1", "query": query.model_dump(mode="json")},
+    })
+    assert broker._validate_scope(db, project_id, plan, search).url == crossref_url
+    forged_search = search.model_copy(update={"payload": {"request_id": "request-1", "query": {**query.model_dump(mode="json"), "doi": "10.1234/forged"}}})
+    with pytest.raises(DomainError, match="forbidden"):
+        broker._validate_scope(db, project_id, plan, forged_search)
+
+    compute = request(run_id, "approved-compute", reserve_tokens=0).model_copy(update={
+        "kind": "compute", "payload": {"grant_id": "grant-1", "grant": grant.model_dump(mode="json")},
+    })
+    assert broker._validate_scope(db, project_id, plan, compute).kind == "compute"
+    for approved_request in (search, compute):
+        with pytest.raises(DomainError, match="forbidden"):
+            broker._validate_scope(db, project_id, plan,
+                                   approved_request.model_copy(update={"reserve_tokens": 1}))
+    forged_compute = compute.model_copy(update={"payload": {"grant_id": "grant-1", "grant": {**grant.model_dump(mode="json"), "numeric_columns": ["y"]}}})
+    with pytest.raises(DomainError, match="forbidden"):
+        broker._validate_scope(db, project_id, plan, forged_compute)
+
+    unknown = request(run_id, "unknown-kind").model_copy(update={"kind": "mystery"})
+    with pytest.raises(DomainError, match="forbidden"):
+        broker._validate_scope(db, project_id, plan, unknown)
+
+
+def test_verified_completion_resolves_timeout_decision_and_resumes(broker_fixture):
+    db, _, run_id, transport, _ = broker_fixture
+    operation = request(run_id, "timeout-before-known-completion")
+    transport.lose_response = True
+    assert broker.execute(db, broker.issue_capability(db, run_id, 1, 300), operation).state == "unknown"
+    ref = ObjectRef(project_id=broker._load_run_project(db, run_id), key="test/known-late-result",
+                    sha256=sha256(b"known result").hexdigest(), size=12,
+                    content_type="application/octet-stream")
+    result = broker.record_verified_completion(db, operation, 2, usage_tokens=3, result_ref=ref)
+    assert result.state == "committed"
+    assert db.execute(text("SELECT usage_tokens,reserved_tokens,state,waiting_reason FROM runs WHERE id=:r"),
+                      {"r": run_id}).one() == (3, 0, "running", None)
+    assert db.execute(text("SELECT count(*) FROM owner_decisions WHERE run_id=:r AND state='pending'"),
+                      {"r": run_id}).scalar_one() == 0
+    assert db.execute(text("SELECT count(*) FROM events WHERE run_id=:r AND kind='usage.updated'"),
+                      {"r": run_id}).scalar_one() == 1
+
+
+def test_unknown_result_reference_cannot_be_replaced(broker_fixture):
+    db, _, run_id, transport, _ = broker_fixture
+    operation = request(run_id, "preserve-original-result-reference")
+    transport.usage_tokens = None
+    assert broker.execute(db, broker.issue_capability(db, run_id, 1, 300), operation).state == "unknown"
+    original = db.execute(text("SELECT result FROM operations WHERE run_id=:r AND operation_id=:o"),
+                          {"r": run_id, "o": operation.operation_id}).scalar_one()["ref"]
+    forged = ObjectRef(project_id=broker._load_run_project(db, run_id), key="test/replacement",
+                       sha256=sha256(b"different result").hexdigest(), size=16,
+                       content_type="application/octet-stream")
+    with pytest.raises(DomainError, match="idempotency_conflict"):
+        broker.record_verified_completion(db, operation, 2, usage_tokens=3, result_ref=forged)
+    db.rollback()
+    assert db.execute(text("SELECT result FROM operations WHERE run_id=:r AND operation_id=:o"),
+                      {"r": run_id, "o": operation.operation_id}).scalar_one()["ref"] == original
+    assert db.execute(text("SELECT usage_tokens,reserved_tokens FROM runs WHERE id=:r"),
+                      {"r": run_id}).one() == (0, 5)
+    known = broker.record_verified_completion(db, operation, 2, usage_tokens=3,
+                                             result_ref=ObjectRef.model_validate(original))
+    assert known.state == "committed" and known.result == ObjectRef.model_validate(original)
+
+
+@pytest.mark.parametrize("state,reason,cancel", [
+    ("canceled", None, True), ("stopping", None, True),
+    ("waiting_input", "budget_exhausted", False),
+])
+def test_known_completion_preserves_terminal_or_budget_wait(broker_fixture, state, reason, cancel):
+    db, _, run_id, transport, _ = broker_fixture
+    operation = request(run_id, "completion-after-owner-state-change")
+    transport.lose_response = True
+    broker.execute(db, broker.issue_capability(db, run_id, 1, 300), operation)
+    db.execute(text("UPDATE runs SET state=:s,waiting_reason=:reason,cancel_requested=:cancel WHERE id=:r"),
+               {"r": run_id, "s": state, "reason": reason, "cancel": cancel})
+    db.commit()
+    ref = ObjectRef(project_id=broker._load_run_project(db, run_id), key="test/late-known",
+                    sha256=sha256(b"known").hexdigest(), size=5, content_type="application/octet-stream")
+    assert broker.record_verified_completion(db, operation, 2, usage_tokens=3, result_ref=ref).state == "committed"
+    assert db.execute(text("SELECT state,waiting_reason FROM runs WHERE id=:r"),
+                      {"r": run_id}).one() == (state, reason)
+
+
+def test_known_completion_keeps_waiting_for_another_unknown_operation(broker_fixture):
+    db, _, run_id, transport, _ = broker_fixture
+    first, second = request(run_id, "first-unknown"), request(run_id, "second-unknown")
+    capability = broker.issue_capability(db, run_id, 1, 300)
+    transport.lose_response = True
+    assert broker.execute(db, capability, first).state == "unknown"
+    db.execute(text("UPDATE runs SET state='running',waiting_reason=NULL WHERE id=:r"), {"r": run_id})
+    db.commit()
+    assert broker.execute(db, capability, second).state == "unknown"
+    ref = ObjectRef(project_id=broker._load_run_project(db, run_id), key="test/known",
+                    sha256=sha256(b"known").hexdigest(), size=5, content_type="application/octet-stream")
+    broker.record_verified_completion(db, first, 2, usage_tokens=3, result_ref=ref)
+    assert db.execute(text("SELECT state,waiting_reason,reserved_tokens FROM runs WHERE id=:r"),
+                      {"r": run_id}).one() == ("waiting_input", "unknown_outcome", 5)
+    assert db.execute(text("SELECT operation_id FROM owner_decisions WHERE run_id=:r AND state='pending'"),
+                      {"r": run_id}).scalar_one() == second.operation_id

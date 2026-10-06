@@ -69,7 +69,14 @@ def run_readiness(request: Request, run_id: UUID):
             from scientist.contracts import ResearchRequirementView
             run = domain.get_run(db, principal, run_id)
             try:
-                validate_plan_binding(db, principal, run.project_id, plan.plan.scientific, require_ready=False)
+                validate_plan_binding(
+                    db,
+                    principal,
+                    run.project_id,
+                    plan.plan.scientific,
+                    require_ready=False,
+                    run_id=run_id,
+                )
             except DomainError:
                 view = view.model_copy(update={'state': 'blocked', 'requirements': [*view.requirements,
                     ResearchRequirementView(id='approved_research_context', label='Current research plan',

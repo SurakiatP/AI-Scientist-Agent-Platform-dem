@@ -1,6 +1,8 @@
 """Validated shared API and persistence contracts; run as a module to publish TS/JSON."""
 
 import json
+import re
+import unicodedata
 from hashlib import sha256
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +16,33 @@ class Contract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+RUNTIME_COMMIT = "bd0affe5e5f723579df8902852f5d0c47795f355"
+
+
+class RuntimePins(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    runtime_commit: str = RUNTIME_COMMIT
+    image_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    skills_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    environment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 ShortText = Annotated[str, Field(min_length=1, max_length=200)]
+
+
+def _has_control(value: str) -> bool:
+    return any(unicodedata.category(char) == "Cc" for char in value)
+
+
+def normalize_doi(value: object) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    raw = str(value)
+    if _has_control(raw):
+        return None
+    doi = raw.strip().lower()
+    doi = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:)", "", doi)
+    return doi.strip() or None
 
 
 def canonical_peer_parameters_bytes(parameters: dict[str, Any]) -> bytes:
@@ -124,6 +152,95 @@ class ScientificBinding(Contract):
         return self
 
 
+class CrossrefQueryV1(Contract):
+    source_id: Literal["crossref"]
+    version: Literal[1]
+    access_mode: Literal["public_read"]
+    query: StrictStr | None
+    doi: StrictStr | None
+    limit: Annotated[StrictInt, Field(ge=1, le=20)]
+
+    @model_validator(mode="after")
+    def exactly_one_bounded_request(self):
+        if (self.query is None) == (self.doi is None):
+            raise ValueError("exactly one Crossref query or DOI is required")
+        if self.query is not None:
+            if not self.query.strip() or len(self.query) > 512 or _has_control(self.query):
+                raise ValueError("Crossref query is empty, oversized, or contains controls")
+        else:
+            normalized = normalize_doi(self.doi)
+            if (normalized is None or len(normalized) > 255 or _has_control(normalized)
+                    or not re.fullmatch(r"10\.[0-9]{4,9}/[^\s<>\"']+", normalized)):
+                raise ValueError("invalid Crossref DOI")
+            object.__setattr__(self, "doi", normalized)
+        return self
+
+
+_APPROVED_ID = Annotated[StrictStr, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
+
+
+class CsvDescribeGrantV1(Contract):
+    recipe_id: Literal["csv.describe.v1"]
+    recipe_version: Literal["1"]
+    recipe_manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    profile_id: Literal["prof.csv-stdlib@py3.14.7"]
+    profile_version: Literal["1"]
+    image_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    input_ref: ObjectRef
+    input_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    numeric_columns: list[Annotated[StrictStr, Field(min_length=1, max_length=128)]] = Field(min_length=1, max_length=8)
+    max_input_bytes: Literal[1_048_576] = 1_048_576
+    max_output_bytes: Literal[262_144] = 262_144
+    timeout_ms: Literal[30_000] = 30_000
+    memory_limit_bytes: Literal[1_073_741_824] = 1_073_741_824
+    workspace_limit_bytes: Literal[67_108_864] = 67_108_864
+
+    @model_validator(mode="after")
+    def input_and_columns_are_bound(self):
+        if self.input_sha256 != self.input_ref.sha256.lower() or self.input_ref.size > self.max_input_bytes:
+            raise ValueError("CSV grant input identity or size is invalid")
+        if (len(set(self.numeric_columns)) != len(self.numeric_columns)
+                or any(not name.strip() or _has_control(name) for name in self.numeric_columns)):
+            raise ValueError("CSV grant numeric columns must be unique bounded names")
+        return self
+
+
+class ComputeProfilePin(Contract):
+    profile_id: Literal["prof.csv-stdlib@py3.14.7"]
+    version: Literal["1"]
+    image_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class ScientificBindingV2(Contract):
+    binding_version: Literal[2]
+    catalog_commit: Literal["154988403bb5a18e9d3c0ce4e6d5e2e4b184a298"]
+    registry_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    capability_ids: list[Annotated[StrictStr, Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]] = Field(min_length=1, max_length=177)
+    instruction_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    agent_runtime_pins: RuntimePins
+    input_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    approved_crossref_queries: dict[_APPROVED_ID, CrossrefQueryV1] = Field(default_factory=dict, max_length=20)
+    required_compute_profiles: list[ComputeProfilePin] = Field(default_factory=list, max_length=8)
+    csv_describe_grants: dict[_APPROVED_ID, CsvDescribeGrantV1] = Field(default_factory=dict, max_length=20)
+
+    @model_validator(mode="after")
+    def grants_match_selected_authority(self):
+        if len(set(self.capability_ids)) != len(self.capability_ids):
+            raise ValueError("scientific capabilities must be unique")
+        if self.agent_runtime_pins.runtime_commit != RUNTIME_COMMIT:
+            raise ValueError("unreviewed agent runtime commit")
+        if self.approved_crossref_queries and "paper-lookup" not in self.capability_ids:
+            raise ValueError("Crossref requests require the paper-lookup capability")
+        if self.csv_describe_grants and "exploratory-data-analysis" not in self.capability_ids:
+            raise ValueError("CSV grants require the exploratory-data-analysis capability")
+        grants = {(grant.profile_id, grant.profile_version, grant.image_digest)
+                  for grant in self.csv_describe_grants.values()}
+        profiles = [(pin.profile_id, pin.version, pin.image_digest) for pin in self.required_compute_profiles]
+        if len(profiles) != len(set(profiles)) or set(profiles) != grants:
+            raise ValueError("compute profiles must exactly match approved CSV grants")
+        return self
+
+
 class PlanSpec(Contract):
     input_snapshot_digest: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
     provider_id: UUID
@@ -133,7 +250,7 @@ class PlanSpec(Contract):
     data_recipients: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(max_length=100)
     packages: list[PackageSpec] = Field(max_length=200)
     peer_releases: list[PeerReleaseSpec] = Field(default_factory=list, max_length=20, exclude_if=lambda value: not value)
-    scientific: ScientificBinding | None = Field(default=None, exclude_if=lambda value: value is None)
+    scientific: ScientificBinding | ScientificBindingV2 | None = Field(default=None, exclude_if=lambda value: value is None)
     token_limit: int = Field(ge=0)
     elapsed_limit_ms: int = Field(ge=0)
 
@@ -188,7 +305,7 @@ class OperationRequest(Contract):
     run_id: UUID
     generation: int = Field(ge=0)
     operation_id: str = Field(min_length=1, max_length=200)
-    kind: Literal["llm", "search", "package", "peer"]
+    kind: Literal["llm", "search", "package", "peer", "compute"]
     payload: dict[str, Any]
     reserve_tokens: int = Field(ge=0)
 
@@ -442,7 +559,7 @@ class DecisionSubmit(Contract):
         return self
 
 
-MODELS = (ScientificBinding, ResearchRequirementView, ResearchProfileView, PreparationSubmit, PreparationJobView, ResearchSetupView, RunReadinessView, Principal, APIError, ObjectRef, PackageSpec, PeerDataRef, PeerReleaseSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
+MODELS = (RuntimePins, ScientificBinding, ScientificBindingV2, CrossrefQueryV1, CsvDescribeGrantV1, ComputeProfilePin, ResearchRequirementView, ResearchProfileView, PreparationSubmit, PreparationJobView, ResearchSetupView, RunReadinessView, Principal, APIError, ObjectRef, PackageSpec, PeerDataRef, PeerReleaseSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
 
 
 def _ts_type(schema: dict[str, Any]) -> str:
@@ -459,7 +576,14 @@ def _ts_type(schema: dict[str, Any]) -> str:
     if schema.get("type") == "array":
         return f"{_ts_type(schema['items'])}[]"
     if schema.get("type") == "object":
-        return "Record<string, unknown>"
+        additional = schema.get("additionalProperties")
+        patterns = schema.get("patternProperties")
+        if isinstance(patterns, dict) and patterns:
+            value_types = sorted({_ts_type(value) for value in patterns.values()})
+            value_type = " | ".join(value_types)
+        else:
+            value_type = _ts_type(additional) if isinstance(additional, dict) else "unknown"
+        return f"Record<string, {value_type}>"
     return {"string": "string", "integer": "number", "number": "number", "boolean": "boolean"}.get(schema.get("type"), "unknown")
 
 

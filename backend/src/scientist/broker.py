@@ -24,7 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scientist.auth import DomainError
-from scientist.contracts import ObjectRef, OperationRequest, OperationResult, PeerReleaseSpec, PlanSpec, Principal, RunView, canonical_peer_parameters_bytes
+from scientist.contracts import (CsvDescribeGrantV1, CrossrefQueryV1, ObjectRef, OperationRequest, OperationResult, PeerReleaseSpec, PlanSpec, Principal, RunView, ScientificBindingV2, canonical_peer_parameters_bytes)
 from scientist.domain import _event, _run_view
 from scientist import limits
 from scientist.model_payload import ModelPayloadError, build_chat_completion_body, llm_input_reserve
@@ -271,7 +271,10 @@ def _finish_reserved_operation(
         return _record_unknown(db, request, revision, usage_tokens=None, result_ref=None)
     finally:
         _active_session.reset(db_token)
-    if len(data) > _MAX_RESPONSE_BYTES or (usage_tokens is not None and (isinstance(usage_tokens, bool) or not isinstance(usage_tokens, int) or usage_tokens < 0)):
+    if len(data) > _MAX_RESPONSE_BYTES or (
+        usage_tokens is not None
+        and (isinstance(usage_tokens, bool) or not isinstance(usage_tokens, int) or usage_tokens < 0)
+    ):
         return _record_unknown(db, request, revision, usage_tokens=None, result_ref=None)
     if target.expected_sha256 is not None and hashlib.sha256(data).hexdigest() != target.expected_sha256:
         return _record_unknown(db, request, revision, usage_tokens=usage_tokens, result_ref=None)
@@ -280,45 +283,108 @@ def _finish_reserved_operation(
     except Exception:
         db.rollback()
         return _record_unknown(db, request, revision, usage_tokens=usage_tokens, result_ref=None)
-
-    if usage_tokens is None:
-        terminal = None
-        if target.kind == "peer":
+    peer_terminal = None
+    if target.kind == "peer":
+        try:
             task_state = json.loads(data).get("status", {}).get("state")
-            terminal = task_state in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"}
-        return _record_unknown(db, request, revision, usage_tokens=None, result_ref=result_ref, peer_task_terminal=terminal)
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            return _record_unknown(db, request, revision, usage_tokens=None, result_ref=result_ref)
+        peer_terminal = task_state is None or task_state in {
+            "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"
+        }
+    if usage_tokens is None or peer_terminal is False:
+        return _record_unknown(
+            db, request, revision, usage_tokens=None, result_ref=result_ref,
+            peer_task_terminal=peer_terminal,
+        )
+    return record_verified_completion(
+        db, request, revision, usage_tokens=usage_tokens, result_ref=result_ref,
+        peer_task_terminal=peer_terminal,
+    )
 
-    # Commit actual provider usage and a recoverable result reference before the final
-    # committed transition. A failed final commit therefore leaves a truthful unknown.
-    _load_run(db, request.run_id, lock=True)
-    staged_result = json.dumps({"request": request.model_dump(mode="json"), "usage_known": True,
-                                "usage_tokens": usage_tokens,
-                                "ref": result_ref.model_dump(mode="json")}, separators=(",", ":"))
-    staged = db.execute(text("""
-        UPDATE operations SET state = 'unknown', usage_tokens = :usage, result = CAST(:result AS jsonb)
-        WHERE run_id = :run AND operation_id = :operation AND state = 'reserved'
-    """), {"usage": usage_tokens, "result": staged_result, "run": request.run_id, "operation": request.operation_id})
-    if staged.rowcount != 1:
-        db.rollback()
-        raise DomainError("revision_conflict", 409)
-    db.execute(text("""
-        UPDATE runs SET reserved_tokens = reserved_tokens - :reserve,
-                        usage_tokens = usage_tokens + :usage
-        WHERE id = :run
-    """), {"reserve": request.reserve_tokens, "usage": usage_tokens, "run": request.run_id})
-    _emit_usage_event(db, request.run_id, revision)
-    run = _load_run(db, request.run_id)
+
+def record_verified_completion(
+    db: Session,
+    request: OperationRequest,
+    revision: int,
+    *,
+    usage_tokens: int,
+    result_ref: ObjectRef,
+    peer_task_terminal: bool | None = None,
+) -> OperationResult:
+    """Stage and finalize verified evidence with run→operation locks and one-time accounting."""
+    if isinstance(usage_tokens, bool) or not isinstance(usage_tokens, int) or usage_tokens < 0:
+        raise DomainError("provider_unavailable", 502)
+    run = _load_run(db, request.run_id, lock=True)
+    operation = db.execute(
+        text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :operation FOR UPDATE"),
+        {"run": request.run_id, "operation": request.operation_id},
+    ).one_or_none()
+    if operation is None:
+        raise DomainError("not_found", 404)
+    if operation.payload_hash.strip() != _fingerprint(request):
+        raise DomainError("idempotency_conflict", 409)
+    if operation.state == "committed":
+        return _operation_result(operation)
+    pending = dict(operation.result or {})
+    if operation.state == "unknown":
+        if pending.get("ref") is not None and ObjectRef.model_validate(pending["ref"]) != result_ref:
+            raise DomainError("idempotency_conflict", 409)
+        if pending.get("usage_known") and pending.get("ref"):
+            return _finalize_staged_success(db, request.run_id, request.operation_id)
+        if pending.get("usage_known") and operation.usage_tokens != usage_tokens:
+            raise DomainError("revision_conflict", 409)
+        if run.reserved_tokens < operation.reserve_tokens and not pending.get("usage_known"):
+            raise DomainError("revision_conflict", 409)
+        pending["ref"] = result_ref.model_dump(mode="json")
+        pending["usage_tokens"] = usage_tokens
+        if peer_task_terminal is not None:
+            pending["peer_task_terminal"] = peer_task_terminal
+        if not pending.get("usage_known"):
+            pending["usage_known"] = True
+            db.execute(
+                text("UPDATE runs SET reserved_tokens = reserved_tokens - :reserve, usage_tokens = usage_tokens + :usage WHERE id = :run"),
+                {"reserve": operation.reserve_tokens, "usage": usage_tokens, "run": request.run_id},
+            )
+            db.execute(text("UPDATE operations SET usage_tokens = :usage WHERE id = :id"), {"usage": usage_tokens, "id": operation.id})
+            _emit_usage_event(db, request.run_id, revision)
+    elif operation.state == "reserved":
+        pending = {
+            "request": request.model_dump(mode="json"),
+            "ref": result_ref.model_dump(mode="json"),
+            "usage_known": True,
+            "usage_tokens": usage_tokens,
+        }
+        if peer_task_terminal is not None:
+            pending["peer_task_terminal"] = peer_task_terminal
+        db.execute(
+            text("UPDATE operations SET state = 'unknown', usage_tokens = :usage, result = CAST(:result AS jsonb) WHERE id = :id AND state = 'reserved'"),
+            {"usage": usage_tokens, "result": json.dumps(pending, separators=(",", ":")), "id": operation.id},
+        )
+        db.execute(
+            text("UPDATE runs SET reserved_tokens = reserved_tokens - :reserve, usage_tokens = usage_tokens + :usage WHERE id = :run"),
+            {"reserve": operation.reserve_tokens, "usage": usage_tokens, "run": request.run_id},
+        )
+        _emit_usage_event(db, request.run_id, revision)
+    else:
+        return _operation_result(operation)
+    db.execute(
+        text("UPDATE operations SET result = CAST(:result AS jsonb) WHERE id = :id AND state = 'unknown'"),
+        {"result": json.dumps(pending, separators=(",", ":")), "id": operation.id},
+    )
+    current = _load_run(db, request.run_id)
     if (
-        run.usage_tokens + run.reserved_tokens >= run.token_limit
-        or limits.effective_elapsed_ms(db, request.run_id) >= run.elapsed_limit_ms
+        current.usage_tokens + current.reserved_tokens >= current.token_limit
+        or limits.effective_elapsed_ms(db, request.run_id) >= current.elapsed_limit_ms
     ):
         limits.mark_budget_wait(db, request.run_id, revision, _event)
     db.commit()
+    if peer_task_terminal is False:
+        return OperationResult(operation_id=request.operation_id, state="unknown", result=result_ref, usage_tokens=None)
     return _finalize_staged_success(db, request.run_id, request.operation_id)
 
-
 def _finalize_staged_success(db: Session, run_id: UUID, operation_id: str) -> OperationResult:
-    _load_run(db, run_id, lock=True)
+    run = _load_run(db, run_id, lock=True)
     operation = db.execute(
         text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :operation FOR UPDATE"),
         {"run": run_id, "operation": operation_id},
@@ -332,48 +398,98 @@ def _finalize_staged_success(db: Session, run_id: UUID, operation_id: str) -> Op
         raise DomainError("revision_conflict", 409)
     result_ref = ObjectRef.model_validate(staged["ref"])
     staged["usage_tokens"] = operation.usage_tokens
-    db.execute(text("""
+    committed = db.execute(text("""
         UPDATE operations SET state = 'committed', result = CAST(:result AS jsonb)
         WHERE id = :id AND state = 'unknown'
     """), {"result": json.dumps(staged, separators=(",", ":")), "id": operation.id})
+    if committed.rowcount != 1:
+        db.rollback()
+        current = db.execute(
+            text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :operation"),
+            {"run": run_id, "operation": operation_id},
+        ).one()
+        if current.state == "committed":
+            return _operation_result(current)
+        raise DomainError("revision_conflict", 409)
+    db.execute(text("""
+        UPDATE owner_decisions SET state='resolved', resolved_at=now(),
+            resolution=CAST(:resolution AS jsonb)
+        WHERE run_id=:run AND operation_id=:operation
+          AND reason='unknown_outcome' AND state='pending'
+    """), {"run": run_id, "operation": operation_id,
+            "resolution": json.dumps({"source": "verified_completion", "operation_id": operation_id})})
+    resumed = db.execute(text("""
+        UPDATE runs SET state=CASE WHEN lease_expires_at>now() THEN 'running' ELSE 'queued' END,
+            waiting_reason=NULL
+        WHERE id=:run AND state='waiting_input' AND waiting_reason='unknown_outcome'
+          AND NOT cancel_requested
+          AND NOT EXISTS (SELECT 1 FROM operations WHERE run_id=:run AND state IN ('reserved','unknown'))
+        RETURNING state
+    """), {"run": run_id}).scalar_one_or_none()
+    if resumed is not None:
+        _event(db, run_id, run.revision, "run.state", {"state": resumed})
     db.commit()
-    return OperationResult(operation_id=operation_id, state="committed", result=result_ref,
-                           usage_tokens=operation.usage_tokens)
+    return OperationResult(operation_id=operation_id, state="committed", result=result_ref, usage_tokens=operation.usage_tokens)
 
-
-def _record_unknown(db: Session, request: OperationRequest, revision: int, *, usage_tokens: int | None,
-                    result_ref: ObjectRef | None, peer_task_terminal: bool | None = None) -> OperationResult:
+def _record_unknown(
+    db: Session,
+    request: OperationRequest,
+    revision: int,
+    *,
+    usage_tokens: int | None,
+    result_ref: ObjectRef | None,
+    peer_task_terminal: bool | None = None,
+) -> OperationResult:
     prior = _load_run(db, request.run_id, lock=True)
+    operation = db.execute(
+        text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :operation FOR UPDATE"),
+        {"run": request.run_id, "operation": request.operation_id},
+    ).one_or_none()
+    if operation is None:
+        raise DomainError("not_found", 404)
+    if operation.payload_hash.strip() != _fingerprint(request):
+        raise DomainError("idempotency_conflict", 409)
+    if operation.state == "committed":
+        return _operation_result(operation)
+    if operation.state != "reserved":
+        pending = operation.result or {}
+        if operation.state == "unknown" and pending.get("usage_known") and pending.get("ref"):
+            return _finalize_staged_success(db, request.run_id, request.operation_id)
+        return _operation_result(operation)
     result = {"request": request.model_dump(mode="json"), "usage_known": usage_tokens is not None}
     if result_ref is not None:
         result["ref"] = result_ref.model_dump(mode="json")
-        if peer_task_terminal is not None:
-            result["peer_task_terminal"] = peer_task_terminal
-    db.execute(text("""
+    if peer_task_terminal is not None:
+        result["peer_task_terminal"] = peer_task_terminal
+    changed = db.execute(text("""
         UPDATE operations SET state = 'unknown', usage_tokens = COALESCE(:usage, usage_tokens),
             result = CAST(:result AS jsonb)
-        WHERE run_id = :run AND operation_id = :operation
-    """), {"usage": usage_tokens, "result": json.dumps(result, separators=(",", ":")),
-           "run": request.run_id, "operation": request.operation_id})
+        WHERE id = :id AND state = 'reserved'
+    """), {"usage": usage_tokens, "result": json.dumps(result, separators=(",", ":")), "id": operation.id})
+    if changed.rowcount != 1:
+        db.rollback()
+        return _operation_result(db.execute(
+            text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :operation"),
+            {"run": request.run_id, "operation": request.operation_id},
+        ).one())
     if usage_tokens is not None:
         db.execute(text("""
             UPDATE runs SET reserved_tokens = reserved_tokens - :reserve, usage_tokens = usage_tokens + :usage
             WHERE id = :run
-        """), {"reserve": request.reserve_tokens, "usage": usage_tokens, "run": request.run_id})
+        """), {"reserve": operation.reserve_tokens, "usage": usage_tokens, "run": request.run_id})
         _emit_usage_event(db, request.run_id, revision)
-    # A concurrent stop/cancel/terminal transition wins; the reservation stays held either way.
     waiting = db.execute(text("""
-        UPDATE runs SET state = 'waiting_input', waiting_reason = 'unknown_outcome'
-        WHERE id = :run AND state NOT IN ('completed', 'failed', 'canceled', 'rejected')
-          AND NOT cancel_requested
-    """), {"run": request.run_id}).rowcount
-    if waiting == 1:
-        if prior.state != "waiting_input":
+        UPDATE runs SET waiting_reason = CASE WHEN state = 'waiting_input'
+            THEN waiting_reason ELSE 'unknown_outcome' END, state = 'waiting_input'
+        WHERE id = :run AND state NOT IN ('completed', 'failed', 'canceled', 'rejected', 'stopping')
+            AND NOT cancel_requested
+    """), {"run": request.run_id}).rowcount == 1
+    if waiting:
+        if prior.state != 'waiting_input':
             _event(db, request.run_id, revision, "run.state", {"state": "waiting_input"})
         _issue_unknown_decision(db, request.run_id, revision, request.operation_id)
     db.commit()
-    return OperationResult(operation_id=request.operation_id, state="unknown", result=None, usage_tokens=usage_tokens)
-
+    return OperationResult(operation_id=request.operation_id, state="unknown", result=result_ref, usage_tokens=usage_tokens)
 
 def _issue_unknown_decision(db: Session, run_id: UUID, revision: int, operation_id: str) -> None:
     """Bind a decision_id to the operation and emit decision.required in the caller's transaction."""
@@ -564,7 +680,39 @@ def configure_result_verifier(verifier: ResultVerifier | None) -> None:
 def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: OperationRequest) -> DispatchTarget:
     if request.kind not in plan.allowed_ops:
         raise DomainError("forbidden", 403)
+    if request.kind not in {"llm", "search", "package", "peer", "compute"}:
+        raise DomainError("forbidden", 403)
+    if (request.kind == "compute" or (request.kind == "search" and isinstance(plan.scientific, ScientificBindingV2))) and request.reserve_tokens != 0:
+        raise DomainError("forbidden", 403)
     payload = request.payload
+    if request.kind == "search" and isinstance(plan.scientific, ScientificBindingV2):
+        _reject_fields(payload, {"request_id", "query"})
+        if set(payload) != {"request_id", "query"}:
+            raise DomainError("forbidden", 400)
+        request_id = payload.get("request_id")
+        approved = plan.scientific.approved_crossref_queries.get(request_id) if isinstance(request_id, str) else None
+        try:
+            query = CrossrefQueryV1.model_validate(payload["query"])
+        except (TypeError, ValueError) as exc:
+            raise DomainError("forbidden", 400) from exc
+        recipient = "https://api.crossref.org/works"
+        if approved is None or query != approved or recipient not in plan.data_recipients:
+            raise DomainError("forbidden", 403)
+        _approved_recipient(plan, recipient)
+        return DispatchTarget("search", recipient, tuple(plan.data_recipients))
+    if request.kind == "compute":
+        _reject_fields(payload, {"grant_id", "grant"})
+        if set(payload) != {"grant_id", "grant"} or not isinstance(plan.scientific, ScientificBindingV2):
+            raise DomainError("forbidden", 400)
+        grant_id = payload.get("grant_id")
+        approved_grant = plan.scientific.csv_describe_grants.get(grant_id) if isinstance(grant_id, str) else None
+        try:
+            grant = CsvDescribeGrantV1.model_validate(payload["grant"])
+        except (TypeError, ValueError) as exc:
+            raise DomainError("forbidden", 400) from exc
+        if approved_grant is None or grant != approved_grant:
+            raise DomainError("forbidden", 403)
+        return DispatchTarget("compute", "", ())
     if request.kind == "llm":
         _reject_fields(payload, {"provider_id", "model", "recipient", "credential_id", "max_output_tokens", "prompt", "messages", "timeout_seconds", *_LLM_CONTROLS})
         if not {"provider_id", "model", "recipient", "credential_id", "max_output_tokens"} <= set(payload):

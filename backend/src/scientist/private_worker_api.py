@@ -19,7 +19,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from scientist import broker, broker_api, limits, objects
 from scientist.auth import DomainError
-from scientist.contracts import ArtifactView, CheckpointManifest, ObjectRef, ScientificBinding
+from scientist.contracts import ArtifactView, CheckpointManifest, ObjectRef, RuntimePins, ScientificBinding
 from scientist.db import session
 from scientist.runtime_contracts import (
     BoundaryAck, BoundaryRequest, MAX_BOUNDARY_BYTES, RUNTIME_COMMIT,
@@ -30,14 +30,6 @@ _MAX_RESULT_BYTES = 2 * 1024 * 1024
 MAX_EFFECT_BYTES = 2 * 1024 * 1024
 Capture = Callable[[Session, UUID, int, bytes, Path], CheckpointManifest]
 ResultReader = Callable[[ObjectRef], bytes]
-
-
-class RuntimePins(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    runtime_commit: str = RUNTIME_COMMIT
-    image_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
-    skills_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
-    environment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 def _reject_duplicate_keys(pairs):

@@ -19,7 +19,7 @@ from scientist.capability_registry import (
     REVIEWED_CAPABILITY_ALLOWLIST,
     load_registry,
 )
-from scientist.contracts import ScientificBinding
+from scientist.contracts import RuntimePins, ScientificBinding, ScientificBindingV2
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -138,19 +138,27 @@ def load_instruction_pins(manifest_path: str | Path) -> Mapping[str, str]:
 
 
 def validate_scientific_binding(
-    binding: ScientificBinding,
+    binding: ScientificBinding | ScientificBindingV2,
     *,
     registry_path: str | Path,
     bundle_root: str | Path,
     pinned_hashes: Mapping[str, str],
     expected_image_digest: str,
+    expected_runtime_pins: RuntimePins | None = None,
 ) -> InstructionBundle:
     """Re-resolve scientific authority using only supervisor-pinned inputs."""
-    if not isinstance(binding, ScientificBinding):
+    if not isinstance(binding, (ScientificBinding, ScientificBindingV2)):
         raise InstructionLoadError("scientific binding is invalid")
     if not isinstance(expected_image_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_image_digest):
         raise InstructionLoadError("trusted image digest is invalid")
-    if binding.image_digest != expected_image_digest:
+    if isinstance(binding, ScientificBindingV2):
+        if (
+            not isinstance(expected_runtime_pins, RuntimePins)
+            or binding.agent_runtime_pins != expected_runtime_pins
+            or binding.agent_runtime_pins.image_digest != expected_image_digest
+        ):
+            raise InstructionLoadError("scientific agent runtime pins differ from trusted runtime pins")
+    elif binding.image_digest != expected_image_digest:
         raise InstructionLoadError("scientific binding image differs from trusted image")
     registry_file = Path(registry_path)
     try:
@@ -168,7 +176,9 @@ def validate_scientific_binding(
         selection = registry.select(binding.capability_ids)
     except (RegistryError, TypeError) as exc:
         raise InstructionLoadError("scientific capability selection is invalid") from exc
-    if list(selection.capability_ids) != binding.capability_ids or selection.profile_ids != (binding.profile_id,):
+    if list(selection.capability_ids) != binding.capability_ids:
+        raise InstructionLoadError("scientific binding capability selection differs")
+    if isinstance(binding, ScientificBinding) and selection.profile_ids != (binding.profile_id,):
         raise InstructionLoadError("scientific binding capability profile differs")
     bundle = load_instruction_bundle(
         selection,

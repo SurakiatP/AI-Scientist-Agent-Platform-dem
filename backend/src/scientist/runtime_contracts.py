@@ -12,15 +12,23 @@ import hashlib
 import json
 import math
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
-from scientist.contracts import CheckpointManifest, OperationRequest, PlanSpec
+from scientist.contracts import (
+    CheckpointManifest,
+    CsvDescribeGrantV1,
+    ObjectRef,
+    OperationRequest,
+    PlanSpec,
+    ScientificBindingV2,
+    RUNTIME_COMMIT,
+)
 from scientist.model_payload import ChatMessage, validate_messages
 
-RUNTIME_COMMIT = "bd0affe5e5f723579df8902852f5d0c47795f355"
 MAX_CONTEXT_BYTES = 1024 * 1024
 MAX_WORKSPACE_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -35,6 +43,23 @@ Identifier = Annotated[StrictStr, Field(min_length=1, max_length=200)]
 
 def canonical_bytes(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def compute_input_manifest(grant: CsvDescribeGrantV1) -> dict[str, Any]:
+    params = {"numeric_columns": grant.numeric_columns}
+    params_bytes = canonical_bytes(params)
+    return {
+        "schema_version": 1,
+        "data.csv": {"ref": grant.input_ref.model_dump(mode="json")},
+        "params.json": {
+            "sha256": hashlib.sha256(params_bytes).hexdigest(),
+            "size": len(params_bytes),
+        },
+    }
+
+
+def compute_input_manifest_sha256(grant: CsvDescribeGrantV1) -> str:
+    return hashlib.sha256(canonical_bytes(compute_input_manifest(grant))).hexdigest()
 
 
 def operation_fingerprint(request: OperationRequest) -> str:
@@ -225,6 +250,136 @@ class ScientificResultReceipt(RuntimeRecord):
         return validate_workspace_path(value)
 
 
+_COMPUTE_NAMES = ("summary.json", "summary.csv", "chart.svg", "report.md")
+_COMPUTE_TYPES = ("application/json", "text/csv", "image/svg+xml", "text/markdown")
+MAX_COMPUTE_OUTPUT_BYTES = 256 * 1024
+MAX_COMPUTE_ENVELOPE_BYTES = 2 * 1024 * 1024
+
+
+class ComputeLaunchSpec(RuntimeRecord):
+    """Host-created launch inputs. Paths never come from model or worker payloads."""
+    profile_id: Literal["prof.csv-stdlib@py3.14.7"]
+    profile_version: Literal["1"]
+    image_digest: Annotated[StrictStr, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
+    recipe_manifest_sha256: Digest
+    recipe_directory: Path
+    input_directory: Path
+    output_directory: Path
+
+    @field_validator("recipe_directory", "input_directory", "output_directory")
+    @classmethod
+    def trusted_absolute_path(cls, value):
+        text = str(value)
+        if (not value.is_absolute() or ".." in value.parts
+                or any(ord(char) < 32 or ord(char) == 127 for char in text)):
+            raise ValueError("compute launch paths must be canonical absolute host paths")
+        return value
+
+
+class ComputeOutputEntryV2(RuntimeRecord):
+    index: Annotated[StrictInt, Field(ge=0, le=3)]
+    name: Literal["summary.json", "summary.csv", "chart.svg", "report.md"]
+    content_type: Literal["application/json", "text/csv", "image/svg+xml", "text/markdown"]
+    object_ref: ObjectRef
+    data_base64: Annotated[StrictStr, Field(max_length=349_528)]
+
+
+class ComputeResultEnvelopeV2(RuntimeRecord):
+    """Closed host result envelope; each byte string is checked against its durable ref."""
+    schema_version: Literal[2]
+    binding_sha256: Digest
+    grant_id: Identifier
+    operation_id: Identifier
+    operation_fingerprint: Digest
+    recipe_id: Literal["csv.describe.v1"]
+    recipe_version: Literal["1"]
+    recipe_manifest_sha256: Digest
+    profile_id: Literal["prof.csv-stdlib@py3.14.7"]
+    profile_version: Literal["1"]
+    image_digest: Annotated[StrictStr, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
+    input_manifest_sha256: Digest
+    input_ref: ObjectRef
+    input_sha256: Digest
+    outputs: list[ComputeOutputEntryV2] = Field(min_length=4, max_length=4)
+
+    @model_validator(mode="after")
+    def exact_verified_outputs(self):
+        if (self.input_sha256 != self.input_ref.sha256.lower()
+                or self.input_ref.key != f"{self.input_ref.project_id}/{self.input_ref.sha256.lower()}"
+                or self.input_ref.content_type != "application/octet-stream"):
+            raise ValueError("compute input ref differs from its pinned hash")
+        total = 0
+        for index, entry in enumerate(self.outputs):
+            data = base64.b64decode(entry.data_base64, validate=True)
+            ref = entry.object_ref
+            if (entry.index != index or entry.name != _COMPUTE_NAMES[index]
+                    or entry.content_type != _COMPUTE_TYPES[index]
+                or ref.content_type != "application/octet-stream"
+                or ref.project_id != self.input_ref.project_id
+                or ref.key != f"{ref.project_id}/{ref.sha256.lower()}"
+                or ref.sha256.lower() != hashlib.sha256(data).hexdigest()
+                    or len(data) != ref.size or hashlib.sha256(data).hexdigest() != ref.sha256.lower()):
+                raise ValueError("compute output identity or bytes differ")
+            total += len(data)
+        if total > MAX_COMPUTE_OUTPUT_BYTES:
+            raise ValueError("compute outputs exceed 256 KiB")
+        if len(canonical_bytes(self.model_dump(mode="json"))) > MAX_COMPUTE_ENVELOPE_BYTES:
+            raise ValueError("compute result envelope exceeds 2 MiB")
+        return self
+
+
+class ScientificOutputReceiptV2(RuntimeRecord):
+    index: Annotated[StrictInt, Field(ge=0, le=3)]
+    name: Literal["summary.json", "summary.csv", "chart.svg", "report.md"]
+    content_type: Literal["application/json", "text/csv", "image/svg+xml", "text/markdown"]
+    path: StrictStr
+    sha256: Digest
+    size: Annotated[StrictInt, Field(ge=0, le=MAX_COMPUTE_OUTPUT_BYTES)]
+    object_ref: ObjectRef
+
+    @model_validator(mode="after")
+    def object_ref_matches_output(self):
+        if (
+            self.object_ref.content_type != "application/octet-stream"
+            or self.object_ref.key != f"{self.object_ref.project_id}/{self.sha256.lower()}"
+            or self.object_ref.sha256.lower() != self.sha256.lower()
+            or self.object_ref.size != self.size
+        ):
+            raise ValueError("scientific output object ref differs verified output bytes")
+        return self
+
+
+class ScientificResultReceiptV2(RuntimeRecord):
+    """Checkpoint proof for one completed CSV grant and its four fixed outputs."""
+    receipt_version: Literal[2]
+    tool_call_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    grant_id: Identifier
+    binding_sha256: Digest
+    operation_id: Identifier
+    effective_operation_id: Identifier
+    operation_fingerprint: Digest
+    input_manifest_sha256: Digest
+    recipe_manifest_sha256: Digest
+    profile_id: Literal["prof.csv-stdlib@py3.14.7"]
+    profile_version: Literal["1"]
+    image_digest: Annotated[StrictStr, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
+    input_sha256: Digest
+    outputs: list[ScientificOutputReceiptV2] = Field(min_length=4, max_length=4)
+
+    @model_validator(mode="after")
+    def fixed_order_and_paths(self):
+        total = 0
+        for index, output in enumerate(self.outputs):
+            if (output.index != index or output.name != _COMPUTE_NAMES[index]
+                    or output.content_type != _COMPUTE_TYPES[index]
+                    or output.path != f"outputs/{output.name}"):
+                raise ValueError("scientific output receipt differs from fixed output order")
+            total += output.size
+        if total > MAX_COMPUTE_OUTPUT_BYTES:
+            raise ValueError("scientific outputs exceed 256 KiB")
+        return self
+
+
 class RuntimeContextV1(RuntimeRecord):
     schema_version: Literal[1]
     run_id: UUID
@@ -255,6 +410,7 @@ class RuntimeContextV1(RuntimeRecord):
     operation_sequence: Nonnegative
     workspace_manifest: list[WorkspaceEntry] = Field(max_length=MAX_WORKSPACE_FILES)
     scientific_results: list[ScientificResultReceipt] = Field(default_factory=list, max_length=100, exclude_if=lambda value: not value)
+    scientific_results_v2: list[ScientificResultReceiptV2] = Field(default_factory=list, max_length=100, exclude_if=lambda value: not value)
     budget_remaining_tokens: Nonnegative | None = None
     """ADR-012 trusted per-generation budget snapshot (advisory to the worker).
 
@@ -309,7 +465,68 @@ class RuntimeContextV1(RuntimeRecord):
                 or self.messages[self.current_turn_user_index].role != "user"):
             raise ValueError("current turn anchor must reference canonical primary user")
         _unique_paths(self.workspace_manifest)
+        last_tool_calls = next((message.tool_calls for message in reversed(self.messages)
+                                if message.role == "assistant" and message.tool_calls), [])
+        active_tool_ids = {call.id for call in last_tool_calls}
         scientific = self.plan.scientific
+        v2_binding = scientific if isinstance(scientific, ScientificBindingV2) else None
+        if isinstance(scientific, ScientificBindingV2):
+            binding = scientific
+            agent = binding.agent_runtime_pins
+            if (agent.runtime_commit != self.runtime_commit or agent.image_digest != self.image_digest
+                    or agent.skills_digest != self.skills_digest
+                    or agent.environment_digest != self.environment_digest):
+                raise ValueError("scientific agent runtime pins differ from worker context")
+            if self.scientific_results:
+                raise ValueError("V2 scientific bindings cannot carry V1 receipts")
+            binding_digest = hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest()
+            issued = {call.id: call for message in self.messages for call in (message.tool_calls or [])
+                      if call.function.name == "scientific_csv_describe"}
+            completed = {message.tool_call_id for message in self.messages if message.role == "tool"}
+            manifest = {entry.path: (entry.sha256, entry.size) for entry in self.workspace_manifest}
+            current_mappings = {
+                mapping.tool_call_id: mapping for mapping in self.operation_mappings
+                if mapping.purpose == "tool" and mapping.turn_id == self.turn_id
+            }
+            receipt_ids, grant_ids = set(), set()
+            for receipt in self.scientific_results_v2:
+                grant = binding.csv_describe_grants.get(receipt.grant_id)
+                call = issued.get(receipt.tool_call_id)
+                mapping = current_mappings.get(receipt.tool_call_id)
+                try:
+                    arguments = json.loads(call.function.arguments) if call is not None else None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    arguments = None
+                if (grant is None or call is None or receipt.tool_call_id not in completed
+                        or receipt.tool_call_id in receipt_ids or receipt.grant_id in grant_ids
+                        or (receipt.tool_call_id in active_tool_ids and mapping is None)
+                        or arguments != {"grant_id": receipt.grant_id}
+                        or receipt.binding_sha256 != binding_digest
+                        or receipt.input_manifest_sha256 != compute_input_manifest_sha256(grant)
+                        or receipt.recipe_manifest_sha256 != grant.recipe_manifest_sha256
+                        or receipt.profile_id != grant.profile_id or receipt.profile_version != grant.profile_version
+                        or receipt.image_digest != grant.image_digest or receipt.input_sha256 != grant.input_sha256
+                        or any(output.object_ref.project_id != self.project_id for output in receipt.outputs)
+                        or any(manifest.get(output.path) != (output.sha256, output.size)
+                               for output in receipt.outputs)):
+                    raise ValueError("V2 scientific receipt differs from its approved grant or checkpoint")
+                if mapping is not None:
+                    expected_request = {
+                        "grant_id": receipt.grant_id,
+                        "grant": grant.model_dump(mode="json"),
+                    }
+                    if (mapping.operation_id != receipt.operation_id
+                            or mapping.request.kind != "compute"
+                            or mapping.request.reserve_tokens != 0
+                            or mapping.request.payload != expected_request
+                            or (receipt.effective_operation_id == receipt.operation_id
+                                and receipt.operation_fingerprint != mapping.payload_hash)):
+                        raise ValueError("V2 scientific receipt differs from its issued compute mapping")
+                receipt_ids.add(receipt.tool_call_id)
+                grant_ids.add(receipt.grant_id)
+            scientific = None
+        elif self.scientific_results_v2:
+            raise ValueError("V2 scientific receipts require a V2 binding")
         if scientific is not None and scientific.image_digest != self.image_digest:
             raise ValueError("scientific profile differs from the worker image")
         if self.scientific_results:
@@ -333,9 +550,6 @@ class RuntimeContextV1(RuntimeRecord):
             raise ValueError("workspace exceeds 64 MiB")
         operations = set()
         continuations = set()
-        last_tool_calls = next((message.tool_calls for message in reversed(self.messages)
-                                if message.role == "assistant" and message.tool_calls), [])
-        active_tool_ids = {call.id for call in last_tool_calls}
         for mapping in self.operation_mappings:
             request = mapping.request
             key = (mapping.turn_id, mapping.purpose, mapping.model_sequence, mapping.tool_call_id)
@@ -354,6 +568,34 @@ class RuntimeContextV1(RuntimeRecord):
                     or request.payload.get("provider_id") != str(self.provider_id)
                     or request.payload.get("recipient") != self.provider_endpoint):
                 raise ValueError("mapped model request changed provider identity")
+            if v2_binding is not None and mapping.purpose == "tool":
+                call = next((item for item in last_tool_calls if item.id == mapping.tool_call_id), None)
+                if request.kind in {"search", "compute"} and request.reserve_tokens != 0:
+                    raise ValueError("V2 scientific calls cannot reserve LLM tokens")
+                if request.kind == "compute":
+                    try:
+                        arguments = json.loads(call.function.arguments) if call is not None else None
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        arguments = None
+                    grant_id = request.payload.get("grant_id")
+                    approved_grant = v2_binding.csv_describe_grants.get(grant_id) if isinstance(grant_id, str) else None
+                    if (call is None or call.function.name != "scientific_csv_describe"
+                            or approved_grant is None or arguments != {"grant_id": grant_id}
+                            or request.payload != {"grant_id": grant_id,
+                                                   "grant": approved_grant.model_dump(mode="json")}):
+                        raise ValueError("V2 compute mapping differs from its approved grant call")
+                elif request.kind == "search":
+                    try:
+                        arguments = json.loads(call.function.arguments) if call is not None else None
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        arguments = None
+                    request_id = request.payload.get("request_id")
+                    approved_query = v2_binding.approved_crossref_queries.get(request_id) if isinstance(request_id, str) else None
+                    if (call is None or approved_query is None
+                            or arguments != {"request_id": request_id}
+                            or request.payload != {"request_id": request_id,
+                                                   "query": approved_query.model_dump(mode="json")}):
+                        raise ValueError("V2 search mapping differs from its approved Crossref query")
         self._pending_prefix()
         return self
 
