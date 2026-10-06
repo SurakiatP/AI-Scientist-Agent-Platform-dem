@@ -164,16 +164,16 @@ test('real owner browser completes and presents the approved resource measuremen
   if (readback.error || readback.status !== 0) throw new Error('browser artifact DB/S3 readback failed');
 });
 
-const w2BootstrapFile = process.env.SCIENTIFIC_W2_OWNER_BOOTSTRAP_FILE;
+const w2SessionFile = process.env.SCIENTIFIC_W2_OWNER_SESSION_FILE;
 const w2ProofFile = process.env.SCIENTIFIC_W2_PROOF;
 const w2EvidenceFile = process.env.SCIENTIFIC_W2_BROWSER_EVIDENCE;
 const w2Origin = process.env.SCIENTIFIC_W2_API_ORIGIN;
 const w2Python = process.env.SCIENTIFIC_W2_PYTHON;
 const w2CsvFixture = process.env.SCIENTIFIC_W2_CSV_FIXTURE;
-const w2Enabled = Boolean(w2BootstrapFile && w2ProofFile && w2EvidenceFile && w2Origin && w2Python && w2CsvFixture);
+const w2Enabled = Boolean(w2SessionFile && w2ProofFile && w2EvidenceFile && w2Origin && w2Python && w2CsvFixture);
 
 test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes four compute outputs', async ({ page }) => {
-  test.skip(!w2Enabled, 'NOT RUN: dedicated W2 owner bootstrap, host, and evidence paths are required');
+  test.skip(!w2Enabled, 'NOT RUN: dedicated W2 authenticated owner session, host, and evidence paths are required');
   test.setTimeout(600_000);
   const proof = JSON.parse(await readFile(w2ProofFile!, 'utf8')) as {
     project_id: string; session_id: string; compute_image_digest: string;
@@ -182,21 +182,16 @@ test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes
   const csvBytes = await readFile(w2CsvFixture!);
   const csvSha256 = createHash('sha256').update(csvBytes).digest('hex');
   if (proof.source_hashes.csv_fixture_sha256 !== csvSha256) throw new Error('W2 CSV fixture differs its prepared hash');
-  const bootstrapUrl = (await readFile(w2BootstrapFile!, 'utf8')).trim();
   const origin = new URL(w2Origin!).origin;
   const gotoHost = (pathname: string) => page.goto(new URL(pathname, origin).toString());
-  const bootstrap = new URL(bootstrapUrl);
-  if (bootstrap.origin !== origin || !bootstrap.hash.startsWith('#bootstrap=')) {
-    throw new Error('fresh W2 owner bootstrap does not match the configured same-origin host');
-  }
-  try {
-    await page.goto(bootstrapUrl);
-    await expect.poll(() => page.evaluate(() => location.hash.length === 0), { timeout: 20_000 }).toBe(true);
-  } catch {
-    await page.goto(origin).catch(() => undefined);
-    throw new Error('W2 owner bootstrap did not complete and clear its fragment');
-  }
-  if (new URL(page.url()).origin !== origin) throw new Error('W2 owner bootstrap navigated away from the actual host');
+  const cookies = JSON.parse(await readFile(w2SessionFile!, 'utf8'));
+  if (!Array.isArray(cookies) || cookies.length !== 1 || cookies[0].name !== 'owner_session'
+      || cookies[0].url !== origin || typeof cookies[0].value !== 'string' || !cookies[0].value
+      || cookies[0].httpOnly !== true || cookies[0].sameSite !== 'Strict')
+    throw new Error('W2 owner session does not match actual host');
+  await page.context().addCookies(cookies);
+  await gotoHost('/');
+  if (new URL(page.url()).origin !== origin) throw new Error('W2 owner session left actual host');
   await page.getByRole('button', { name: 'EN' }).click();
 
   await gotoHost(`/projects/${encodeURIComponent(proof.project_id)}/library`);
@@ -393,7 +388,7 @@ test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes
   await writeFile(w2EvidenceFile!, JSON.stringify({
     status: 'PASS', project_id: proof.project_id, session_id: proof.session_id, run_id: runId,
     query: 'coastal nitrate monitoring', csv_columns: ['temperature_c', 'nitrate_mg_l'],
-    outputs: outputEvidence, owner_bootstrap_fragment_cleared: true, setup_refresh: true,
+    outputs: outputEvidence, authenticated_owner_session_transferred: true, setup_refresh: true,
   }) + '\n', { mode: 0o600 });
   await chmod(w2EvidenceFile!, 0o600);
   const checker = path.resolve(process.cwd(), '../../backend/tests/live/w2_scientific_acceptance.py');

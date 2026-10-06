@@ -229,6 +229,19 @@ def _set_up_process_environment(config_path: Path, evidence_dir: Path) -> None:
     os.environ["SCIENTIST_SCHOLARLY_ENDPOINTS"] = SCHOLARLY_ENDPOINTS
 
 
+def write_browser_session(api, host, destination: Path) -> Path:
+    """Transfer the already bootstrapped test owner session without reusing its token."""
+    cookie = api.cookies.get("owner_session")
+    if not cookie or not host.base.startswith("http://127.0.0.1:"):
+        raise RuntimeError("W2 authenticated local owner session unavailable")
+    destination.write_text(json.dumps([{
+        "name": "owner_session", "value": cookie, "url": host.base,
+        "httpOnly": True, "secure": False, "sameSite": "Strict",
+    }]) + "\n")
+    destination.chmod(0o600)
+    return destination
+
+
 def run() -> None:
     try:
         raw, _core, config_path = load_config()
@@ -341,9 +354,10 @@ def run() -> None:
         }, sort_keys=True) + "\n")
         proof_file.chmod(0o600)
         phase = "browser_acceptance"
+        browser_session = write_browser_session(api, host, host.state / "browser-owner-session.json")
         browser_env = os.environ.copy()
         browser_env.update({
-            "SCIENTIFIC_W2_OWNER_BOOTSTRAP_FILE": str(host.state / "owner-bootstrap.url"),
+            "SCIENTIFIC_W2_OWNER_SESSION_FILE": str(browser_session),
             "SCIENTIFIC_W2_PROOF": str(proof_file),
             "SCIENTIFIC_W2_BROWSER_EVIDENCE": str(evidence_dir / "w2-browser-evidence.json"),
             "SCIENTIFIC_W2_API_ORIGIN": host.base,
