@@ -153,6 +153,7 @@ def _self_check_boundary_diagnostics(fixture) -> None:
 def _self_check_boundary_origin(fixture) -> None:
     secret = "SYNTHETIC_PRIVATE_DETAIL_MUST_NOT_APPEAR"
     import contextlib
+    import socket
     import scientist.dispatch_authority as dispatch_authority
     import scientist.dispatch_runtime as dispatch_runtime
     import scientist.private_worker_api as private_api
@@ -172,6 +173,7 @@ def _self_check_boundary_origin(fixture) -> None:
     private_api.parse_boundary = lambda _: object()
     private_api.session = lambda: contextlib.nullcontext(database)
     old_run, old_transport = fixture._run, broker_module._transport
+    old_resolver, old_getaddrinfo = broker_module._resolver, broker_module.socket.getaddrinfo
     old_dispatch_parser = dispatch_runtime.parse_dispatch_config
     old_dispatch_transport = dispatch_authority.BoundDispatchTransport
     old_read_bytes = Path.read_bytes
@@ -181,6 +183,13 @@ def _self_check_boundary_origin(fixture) -> None:
     dispatch_runtime.parse_dispatch_config = lambda _: identity
     dispatch_authority.BoundDispatchTransport = Transport
     Path.read_bytes = lambda path: b"synthetic" if str(path) == "/run/scientist/dispatch/config.json" else old_read_bytes(path)
+
+    def offline_dns_failure(host, port, **kwargs):
+        raise socket.gaierror("synthetic fixture DNS unavailable")
+
+    broker_module.socket.getaddrinfo = offline_dns_failure
+    synthetic_url = "https://research.example"
+    synthetic_plan = SimpleNamespace(data_recipients=[synthetic_url])
 
     async def request(app):
         incoming, outgoing = 0, []
@@ -199,6 +208,17 @@ def _self_check_boundary_origin(fixture) -> None:
         return outgoing
 
     try:
+        try:
+            broker_module._approved_recipient(synthetic_plan, synthetic_url)
+        except DomainError as exc:
+            if exc.code != "provider_unavailable" or not isinstance(exc.__cause__, socket.gaierror):
+                raise AssertionError("baseline resolver failure changed classification")
+        else:
+            raise AssertionError("baseline resolver unexpectedly resolved the synthetic fixture host")
+        resolver = getattr(fixture, "_synthetic_resolver", None)
+        if not callable(resolver):
+            raise AssertionError("fixture lacks the bounded synthetic DNS resolver")
+
         manifest = CheckpointManifest.model_construct(schema_version=1, run_id=uuid4(), revision=1,
             plan_digest="a"*64, runtime_commit=private_api.RUNTIME_COMMIT, image_digest="sha256:"+"b"*64,
             skills_digest="c"*64, context=ObjectRef.model_construct(project_id=uuid4(), key="fixture/context",
@@ -225,6 +245,19 @@ def _self_check_boundary_origin(fixture) -> None:
             run_result = {}
 
             def execute_during_run(app, *args, **kwargs):
+                if broker_module._resolver is not resolver:
+                    raise AssertionError("synthetic resolver was not installed with the fixture transport")
+                broker_module._approved_recipient(synthetic_plan, synthetic_url)
+                if mode == "success":
+                    for host, port in (
+                        ("other.example", 443), ("localhost", 443), ("research.example", 80),
+                        (123, 443), ("research.example", True),
+                    ):
+                        try:
+                            resolver(host, port)
+                        except OSError:
+                            continue
+                        raise AssertionError("synthetic resolver accepted an unapproved target")
                 target = app.app if mode == "success" else app
                 run_result["messages"] = asyncio.run(request(target))
                 return app
@@ -237,6 +270,8 @@ def _self_check_boundary_origin(fixture) -> None:
             except RuntimeError as caught:
                 if mode != "runtime" or caught is not failure:
                     raise
+            if broker_module._resolver is not old_resolver:
+                raise AssertionError("fixture resolver was not restored after _run")
             if not output.getvalue().startswith("scientific-fixture-boundary-origin safe_wrap_ready=true\n"):
                 raise AssertionError("fixture did not safely capture concrete boundary controller")
             response_messages = run_result.get("messages", [])
@@ -288,6 +323,8 @@ def _self_check_boundary_origin(fixture) -> None:
     finally:
         private_api.parse_boundary, private_api.session = old_parse, old_session
         fixture._run, broker_module._transport = old_run, old_transport
+        broker_module._resolver = old_resolver
+        broker_module.socket.getaddrinfo = old_getaddrinfo
         dispatch_runtime.parse_dispatch_config = old_dispatch_parser
         dispatch_authority.BoundDispatchTransport = old_dispatch_transport
         Path.read_bytes = old_read_bytes

@@ -287,13 +287,21 @@ class _BoundaryAckBarrier:
             await send(message)
 
 
+def _synthetic_resolver(host, port):
+    if type(host) is not str or host != "research.example" or type(port) is not int or port != 443:
+        raise OSError("scientific fixture resolver rejects target")
+    return ["93.184.216.34"]
+
+
 def _with_fixture(app, *args, **kwargs):
     from scientist import broker
     from scientist.dispatch_authority import BoundDispatchTransport
     from scientist.dispatch_runtime import parse_dispatch_config
 
     identity = parse_dispatch_config(Path("/run/scientist/dispatch/config.json").read_bytes())
+    original_resolver = broker._resolver
     broker._transport = BoundDispatchTransport(identity.executor_id, identity.process_incarnation, _synthetic_model)
+    broker._resolver = _synthetic_resolver
     boundary_state = {"calls": 0, "observed": 0}
     controller, original = None, None
     try:
@@ -357,6 +365,7 @@ def _with_fixture(app, *args, **kwargs):
     finally:
         if controller is not None:
             controller.boundary = original
+        broker._resolver = original_resolver
 
 
 uvicorn.run = _with_fixture
