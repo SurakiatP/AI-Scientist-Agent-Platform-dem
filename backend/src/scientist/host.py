@@ -31,7 +31,14 @@ from scientist import broker, objects, peer_reconciliation_supervisor, settings,
 from scientist import db as database
 from scientist.app import create_app
 from scientist.contracts import PlanSpec
-from scientist.dispatch_runtime import _SECRET_NAMES, DispatchServiceConfig, check_egress_network, DockerDispatchRuntime, _parse_template
+from scientist.dispatch_runtime import (
+    _SECRET_NAMES,
+    DispatchServiceConfig,
+    check_egress_network,
+    DockerDispatchRuntime,
+    _parse_template,
+    _validate_bucket,
+)
 from scientist.domain import _event
 from scientist.private_worker_api import RuntimePins, WorkerController
 from scientist.runtime_contracts import RUNTIME_COMMIT, BootstrapMetadata, RuntimeContextV1
@@ -150,9 +157,7 @@ class HostConfig(BaseModel):
     @field_validator("bucket")
     @classmethod
     def _bucket(cls, value: str) -> str:
-        if not value or len(value) > 63 or not value.replace("-", "").isalnum():
-            raise ValueError("invalid bucket")
-        return value
+        return _validate_bucket(value)
 
     @field_validator("secrets_dir", "state_dir")
     @classmethod
@@ -257,8 +262,9 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
     template = json.dumps({
         "schema_version": 1, "runtime_commit": RUNTIME_COMMIT, "image_digest": pin,
         "skills_digest": cfg.skills_digest, "environment_digest": cfg.environment_digest,
-            "provider_destinations": cfg.provider_destinations, "peer_destinations": cfg.peer_destinations,
-            "secret_files": {n: n for n in sorted(_SECRET_NAMES)},
+        "bucket": cfg.bucket,
+        "provider_destinations": cfg.provider_destinations, "peer_destinations": cfg.peer_destinations,
+        "secret_files": {n: n for n in sorted(_SECRET_NAMES)},
     }, sort_keys=True).encode()
     _parse_template(template)
     template_path = cfg.state_dir / "dispatch-template.json"

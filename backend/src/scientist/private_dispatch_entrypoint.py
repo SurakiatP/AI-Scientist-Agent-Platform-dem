@@ -206,7 +206,7 @@ def main() -> None:
     os.environ["SCIENTIST_S3_SECRET_KEY"] = secret_values["s3_secret_key"]
     os.environ["SCIENTIST_BROKER_CAPABILITY_KEY"] = secret_values["broker_capability_key"]
     os.environ["SCIENTIST_S3_ENDPOINT"] = s3_endpoint
-    os.environ["SCIENTIST_OBJECT_BUCKET"] = "scientist-b5"
+    os.environ["SCIENTIST_OBJECT_BUCKET"] = config.bucket
     import boto3
 
     objects.configure(
@@ -218,7 +218,7 @@ def main() -> None:
             aws_secret_access_key=secret_values["s3_secret_key"],
             region_name="us-east-1",
         ),
-        bucket="scientist-b5",
+        bucket=config.bucket,
     )
     container_id = Path("/etc/hostname").read_text(encoding="ascii").strip().lower()
     if not re.fullmatch(r"[a-f0-9]{12}", container_id):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -156,7 +157,157 @@ def test_launch_materialization_derives_reconciliation_from_runtime_target(tmp_p
     launch = parse_dispatch_config(launch_path.read_bytes())
     assert launch.mode == "peer_get_task"
     assert launch.peer_reconciliation == target
+    assert launch.bucket == "scientist-b5"
     assert json.loads(launch_path.read_text())["peer_destinations"] == {str(PEER_ID): "https://peer.example"}
+
+
+@pytest.mark.parametrize("mode", ["effects", "peer_get_task"])
+def test_launch_materialization_preserves_configured_bucket(tmp_path, mode):
+    template_path = tmp_path / "dispatch-template.json"
+    template_path.write_text(
+        DispatchTemplate.model_validate({**_template_values(), "bucket": "tenant-results"}).model_dump_json()
+    )
+    template_path.chmod(0o444)
+    runtime = _dispatch_runtime(tmp_path)
+
+    target = PeerReconciliationTarget(operation_id=OPERATION_ID, attempt=ATTEMPT) if mode == "peer_get_task" else None
+    launch_path = runtime._materialize_launch_config(
+        uuid4(), 1, uuid4(), uuid4(), "engine-1", peer_reconciliation=target,
+    )
+
+    launch = parse_dispatch_config(launch_path.read_bytes())
+    assert launch.mode == mode
+    assert launch.bucket == "tenant-results"
+
+
+@pytest.mark.parametrize("mode", ["effects", "peer_get_task"])
+def test_launch_materialization_reuses_canonical_schema_one_config_without_bucket(tmp_path, mode):
+    template_path = tmp_path / "dispatch-template.json"
+    template = DispatchTemplate.model_validate(_template_values())
+    template_path.write_text(template.model_dump_json())
+    template_path.chmod(0o444)
+    runtime = _dispatch_runtime(tmp_path)
+    run_id, executor_id, incarnation, generation = uuid4(), uuid4(), uuid4(), 1
+    target = PeerReconciliationTarget(operation_id=OPERATION_ID, attempt=ATTEMPT) if mode == "peer_get_task" else None
+    legacy_identity = DispatchIdentity.model_validate({
+        **template.model_dump(mode="python"),
+        "run_id": run_id,
+        "generation": generation,
+        "executor_id": executor_id,
+        "process_incarnation": incarnation,
+        "engine_id": "engine-1",
+        "mode": mode,
+        "peer_reconciliation": target,
+    })
+    legacy_bytes = legacy_identity.model_dump_json(exclude={"bucket"}).encode("utf-8")
+    launch_dir = tmp_path / "launches"
+    launch_dir.mkdir(mode=0o700)
+    launch_path = launch_dir / f"dispatch-{run_id.hex}-g{generation}-{executor_id.hex}-{incarnation.hex}.json"
+    launch_path.write_bytes(legacy_bytes)
+    launch_path.chmod(0o444)
+
+    result = runtime._materialize_launch_config(
+        run_id,
+        generation,
+        executor_id,
+        incarnation,
+        "engine-1",
+        peer_reconciliation=target,
+    )
+
+    assert result == launch_path
+    assert result.read_bytes() == legacy_bytes
+    assert parse_dispatch_config(result.read_bytes()).bucket == "scientist-b5"
+
+
+def test_launch_materialization_rejects_legacy_bytes_for_nondefault_bucket(tmp_path):
+    template_path = tmp_path / "dispatch-template.json"
+    template = DispatchTemplate.model_validate({**_template_values(), "bucket": "tenant-results"})
+    template_path.write_text(template.model_dump_json())
+    template_path.chmod(0o444)
+    runtime = _dispatch_runtime(tmp_path)
+    run_id, executor_id, incarnation, generation = uuid4(), uuid4(), uuid4(), 1
+    target = None
+    legacy_identity = DispatchIdentity.model_validate({
+        **template.model_dump(mode="python"),
+        "run_id": run_id,
+        "generation": generation,
+        "executor_id": executor_id,
+        "process_incarnation": incarnation,
+        "engine_id": "engine-1",
+        "mode": "effects",
+        "peer_reconciliation": target,
+    })
+    launch_dir = tmp_path / "launches"
+    launch_dir.mkdir(mode=0o700)
+    launch_path = launch_dir / f"dispatch-{run_id.hex}-g{generation}-{executor_id.hex}-{incarnation.hex}.json"
+    launch_path.write_bytes(legacy_identity.model_dump_json(exclude={"bucket"}).encode("utf-8"))
+    launch_path.chmod(0o444)
+
+    with pytest.raises(RuntimeError):
+        runtime._materialize_launch_config(run_id, generation, executor_id, incarnation, "engine-1")
+
+
+def test_launch_materialization_rejects_changed_identity_in_legacy_bytes(tmp_path):
+    template_path = tmp_path / "dispatch-template.json"
+    template = DispatchTemplate.model_validate(_template_values())
+    template_path.write_text(template.model_dump_json())
+    template_path.chmod(0o444)
+    runtime = _dispatch_runtime(tmp_path)
+    run_id, executor_id, incarnation, generation = uuid4(), uuid4(), uuid4(), 1
+    legacy_identity = DispatchIdentity.model_validate({
+        **template.model_dump(mode="python"),
+        "run_id": run_id,
+        "generation": generation,
+        "executor_id": executor_id,
+        "process_incarnation": incarnation,
+        "engine_id": "changed-engine",
+        "mode": "effects",
+        "peer_reconciliation": None,
+    })
+    launch_dir = tmp_path / "launches"
+    launch_dir.mkdir(mode=0o700)
+    launch_path = launch_dir / f"dispatch-{run_id.hex}-g{generation}-{executor_id.hex}-{incarnation.hex}.json"
+    launch_path.write_bytes(legacy_identity.model_dump_json(exclude={"bucket"}).encode("utf-8"))
+    launch_path.chmod(0o444)
+
+    with pytest.raises(RuntimeError):
+        runtime._materialize_launch_config(run_id, generation, executor_id, incarnation, "engine-1")
+
+
+def test_launch_materialization_rejects_symlink_without_reading_target(tmp_path, monkeypatch):
+    template_path = tmp_path / "dispatch-template.json"
+    template_path.write_text(DispatchTemplate.model_validate(_template_values()).model_dump_json())
+    template_path.chmod(0o444)
+    runtime = _dispatch_runtime(tmp_path)
+    run_id, executor_id, incarnation, generation = uuid4(), uuid4(), uuid4(), 1
+    launch_dir = tmp_path / "launches"
+    launch_dir.mkdir(mode=0o700)
+    launch_path = launch_dir / f"dispatch-{run_id.hex}-g{generation}-{executor_id.hex}-{incarnation.hex}.json"
+    target_path = tmp_path / "synthetic-target"
+    target_path.write_bytes(b"synthetic target")
+    launch_path.symlink_to(target_path)
+    read_attempted = []
+    read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path):
+        if path == launch_path:
+            read_attempted.append(path)
+            raise AssertionError("unsafe launch path was read")
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    with pytest.raises(RuntimeError):
+        runtime._materialize_launch_config(run_id, generation, executor_id, incarnation, "engine-1")
+    assert read_attempted == []
+
+
+@pytest.mark.parametrize("bucket", ["", "has/slash", "x" * 64, 42, None])
+def test_dispatch_models_reject_invalid_bucket(bucket):
+    with pytest.raises(ValidationError):
+        DispatchTemplate.model_validate({**_template_values(), "bucket": bucket})
+    with pytest.raises(ValidationError):
+        DispatchIdentity.model_validate({**_identity_values(), "bucket": bucket})
 
 
 def test_find_qualifies_physical_dispatch_by_reconciliation_operation_and_attempt(tmp_path, monkeypatch):
@@ -332,7 +483,7 @@ def test_start_labels_reconciliation_container_before_first_mutation(tmp_path, m
 def test_reconciliation_entrypoint_runs_only_trusted_recovery_callback(monkeypatch):
     target = PeerReconciliationTarget(operation_id=OPERATION_ID, attempt=ATTEMPT)
     identity = DispatchIdentity.model_validate(
-        _identity_values(mode="peer_get_task", peer_reconciliation=target)
+        _identity_values(bucket="tenant-results", mode="peer_get_task", peer_reconciliation=target)
     )
     monkeypatch.setattr(private_dispatch_entrypoint, "_CONFIG", types.SimpleNamespace(read_bytes=identity.model_dump_json().encode))
     secret_values = {
@@ -345,7 +496,11 @@ def test_reconciliation_entrypoint_runs_only_trusted_recovery_callback(monkeypat
     monkeypatch.setattr(private_dispatch_entrypoint, "_read_secret", lambda name: secret_values[name].encode())
     monkeypatch.setattr(private_dispatch_entrypoint, "_wait_for_active_executor", lambda config, container: events.append(("ready", config.executor_id, container)))
     monkeypatch.setattr(private_dispatch_entrypoint.database, "DATABASE_URL", "before")
-    monkeypatch.setattr(private_dispatch_entrypoint.objects, "configure", lambda *_args, **_kwargs: events.append(("objects",)))
+    monkeypatch.setattr(
+        private_dispatch_entrypoint.objects,
+        "configure",
+        lambda *_args, **kwargs: events.append(("objects", kwargs)),
+    )
     monkeypatch.setattr(private_dispatch_entrypoint.checkpoints, "configure_trusted_pins", lambda **_kwargs: events.append(("pins",)))
     monkeypatch.setattr(private_dispatch_entrypoint.broker, "configure", lambda **kwargs: events.append(("broker", kwargs)))
     monkeypatch.setattr(private_dispatch_entrypoint.Path, "read_text", lambda *_args, **_kwargs: "abcdefabcdef")
@@ -358,6 +513,8 @@ def test_reconciliation_entrypoint_runs_only_trusted_recovery_callback(monkeypat
     events = []
     private_dispatch_entrypoint.main()
     assert [item[0] for item in events] == ["objects", "ready", "pins", "broker"]
+    assert events[0][1]["bucket"] == "tenant-results"
+    assert os.environ["SCIENTIST_OBJECT_BUCKET"] == "tenant-results"
     assert callbacks == [identity]
     assert events[-1][1]["peer_destinations"] == {str(PEER_ID): "https://peer.example"}
 
@@ -460,7 +617,7 @@ def test_private_readiness_rejects_mismatched_or_malformed_reconciliation_scope(
 
 
 def test_main_builds_s3_client_with_secret_file_credentials_and_path_style(monkeypatch):
-    identity = DispatchIdentity.model_validate(_identity_values())
+    identity = DispatchIdentity.model_validate(_identity_values(bucket="tenant-results"))
     monkeypatch.setattr(private_dispatch_entrypoint, "_CONFIG", types.SimpleNamespace(read_bytes=lambda: identity.model_dump_json().encode()))
     secrets = {
         "database_url": "postgresql+psycopg://scientist@database/scientist",
@@ -489,7 +646,8 @@ def test_main_builds_s3_client_with_secret_file_credentials_and_path_style(monke
     assert client.meta.config.s3["addressing_style"] == "path"
     assert client._request_signer._credentials.access_key == secrets["s3_access_key"]
     assert client._request_signer._credentials.secret_key == secrets["s3_secret_key"]
-    assert captured["bucket"] == "scientist-b5"
+    assert captured["bucket"] == "tenant-results"
+    assert os.environ["SCIENTIST_OBJECT_BUCKET"] == "tenant-results"
 
 
 def test_normal_effects_inactive_check_uses_durable_operation_binding(tmp_path, monkeypatch):

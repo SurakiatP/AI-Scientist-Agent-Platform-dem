@@ -27,6 +27,15 @@ from scientist.runtime_contracts import RUNTIME_COMMIT
 from scientist.supervisor import DockerWorkerEngine, ExecutorRef
 
 _MAX_CONFIG_BYTES = 64 * 1024
+_DEFAULT_OBJECT_BUCKET = "scientist-b5"
+
+
+def _validate_bucket(value: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 63 or not value.replace("-", "").isalnum():
+        raise ValueError("invalid bucket")
+    return value
+
+
 _RUN_LABEL = "scientist.platform/run"
 _GEN_LABEL = "scientist.platform/generation"
 _EXEC_LABEL = "scientist.platform/executor"
@@ -172,6 +181,7 @@ class DispatchIdentity(BaseModel):
     executor_id: UUID
     process_incarnation: UUID
     engine_id: str = Field(min_length=1, max_length=200)
+    bucket: str = Field(default=_DEFAULT_OBJECT_BUCKET, validate_default=True)
     runtime_commit: str = Field(pattern=r"^[a-f0-9]{40}$")
     image_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
     skills_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -184,6 +194,11 @@ class DispatchIdentity(BaseModel):
     # Launch-only (not in the static template): services subnet the entrypoint must pin its clients inside.
     service_subnet: str | None = None
     db_require_auth: str = Field(default="scram-sha-256", pattern=r"^scram-sha-256$")
+
+    @field_validator("bucket")
+    @classmethod
+    def validate_bucket(cls, value: str) -> str:
+        return _validate_bucket(value)
 
     @field_validator("service_subnet")
     @classmethod
@@ -254,6 +269,7 @@ class DispatchTemplate(BaseModel):
     image_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
     skills_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     environment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    bucket: str = Field(default=_DEFAULT_OBJECT_BUCKET, validate_default=True)
     provider_destinations: Mapping[UUID, str] = Field(max_length=32)
     peer_destinations: Mapping[UUID, str] = Field(default_factory=dict, max_length=100, validate_default=True)
     secret_files: dict[str, str]
@@ -264,6 +280,11 @@ class DispatchTemplate(BaseModel):
         if value != RUNTIME_COMMIT:
             raise ValueError("dispatch template runtime commit is not reviewed")
         return value
+
+    @field_validator("bucket")
+    @classmethod
+    def validate_bucket(cls, value: str) -> str:
+        return _validate_bucket(value)
 
     @field_validator("provider_destinations")
     @classmethod
@@ -498,12 +519,19 @@ class DockerDispatchRuntime:
         })
         path = launcher / f"dispatch-{run_id.hex}-g{generation}-{executor_id.hex}-{incarnation.hex}.json"
         content = launch.model_dump_json().encode("utf-8")
+        legacy_content = (
+            launch.model_dump_json(exclude={"bucket"}).encode("utf-8")
+            if launch.bucket == _DEFAULT_OBJECT_BUCKET
+            else None
+        )
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             existing = path.lstat()
-            if (not stat.S_ISREG(existing.st_mode) or stat.S_IMODE(existing.st_mode) != 0o444
-                    or path.read_bytes() != content):
+            if not stat.S_ISREG(existing.st_mode) or stat.S_IMODE(existing.st_mode) != 0o444:
+                raise RuntimeError("existing per-launch config differs from trusted identity")
+            existing_content = path.read_bytes()
+            if existing_content != content and existing_content != legacy_content:
                 raise RuntimeError("existing per-launch config differs from trusted identity")
             return path
         try:

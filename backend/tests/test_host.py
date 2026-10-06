@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
@@ -228,6 +229,25 @@ def test_compose_configures_runtime(tmp_path):
     assert parsed.image_digest == WORKER_DIGEST and dict(parsed.provider_destinations) == {__import__("uuid").UUID(PROVIDER): ORIGIN}
     assert supervisor._config.dispatch.config.launcher_dir == str(cfg.state_dir / "launches")
     assert host._destinations == {PROVIDER: ORIGIN}
+
+
+def test_compose_preserves_configured_bucket_in_dispatch_template(tmp_path):
+    values = _config_dict(tmp_path)
+    values["bucket"] = "tenant-results"
+    cfg = host.load_config(_write(tmp_path, values))
+
+    host.compose(cfg, engine=FakeEngine(), s3=FakeS3())
+
+    template = _parse_template((cfg.state_dir / "dispatch-template.json").read_bytes())
+    assert template.bucket == "tenant-results"
+
+
+@pytest.mark.parametrize("bucket", ["", "has/slash", "x" * 64, 42, None])
+def test_host_rejects_invalid_bucket(tmp_path, bucket):
+    values = _config_dict(tmp_path)
+    values["bucket"] = bucket
+    with pytest.raises(ValidationError):
+        host.HostConfig.model_validate(values)
 
 
 def test_compose_refuses_engine_mismatch(tmp_path, monkeypatch):
