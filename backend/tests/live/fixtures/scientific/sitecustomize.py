@@ -82,6 +82,7 @@ def _hold_boundary(status, receipt_committed, first_for_run, targeted):
 
 
 _SAFE_ERROR_CODES = frozenset({
+    "profile_configuration_unavailable",
     "scientific_binding_unavailable", "storage_unavailable", "forbidden", "invalid_request",
     "generation_conflict", "checkpoint_conflict", "context_mismatch", "run_inactive",
     "invalid_boundary", "expired",

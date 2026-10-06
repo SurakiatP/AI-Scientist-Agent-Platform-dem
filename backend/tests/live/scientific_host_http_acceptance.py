@@ -108,6 +108,8 @@ def _self_check_boundary_diagnostics(fixture) -> None:
             {"type": "http", "path": "/control/boundary"}, lambda: None, send)
 
     for messages, expected in (
+        ([dict(original[0], status=503), dict(original[1], body=b'{"detail":"profile_configuration_unavailable"}')],
+         "scientific-fixture-response status=503 code=profile_configuration_unavailable\n"),
         (original, "scientific-fixture-response status=403 code=forbidden\n"),
         ([original[0], dict(original[1], body=json.dumps({"detail": "scientific_binding_unavailable"}).encode())],
          "scientific-fixture-response status=403 code=scientific_binding_unavailable\n"),
