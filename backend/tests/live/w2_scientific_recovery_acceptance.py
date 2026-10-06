@@ -72,8 +72,8 @@ def _load_runtime():
         ["git", "-C", str(ROOT), "status", "--porcelain", "--", "backend/src", "runtime"],
         capture_output=True, text=True, check=True,
     ).stdout.strip(), "backend/runtime differs from immutable image sources")
-    engine = common.H("w2-recovery-preflight")
-    need(engine.engine_id() == common.EXPECTED_ENGINE_ID, "owned Docker engine changed")
+    engine = w2.engine_probe(common)
+    need(engine.engine_id == common.EXPECTED_ENGINE_ID, "owned Docker engine changed")
     common.guard_storage_headroom()
     for name, expected in {
         "scientist-b5-postgres": raw["postgres_container_id"],
@@ -350,7 +350,7 @@ def _read_outputs(api, h, artifacts: dict[str, dict[str, Any]]) -> dict[str, str
 def _run_recovery() -> None:
     w2, c, http, httpx, text, raw, evidence = _load_runtime()
     w2.self_check()
-    engine = c.H("w2-recovery-run")
+    engine = w2.engine_probe(c)
     provider = uuid.uuid4()
     host = _host(c, http, raw, evidence, "w2-scientific-recovery", provider)
     api = None
@@ -456,7 +456,7 @@ def _run_stop() -> None:
     """Prepare a no-Crossref run, signal Playwright only after the fixture stalls."""
     w2, c, http, _httpx, text, raw, evidence = _load_runtime()
     w2.self_check()
-    engine = c.H("w2-stop-run")
+    engine = w2.engine_probe(c)
     provider = uuid.uuid4()
     host = _host(c, http, raw, evidence, "w2-stop-unknown", provider)
     api = None

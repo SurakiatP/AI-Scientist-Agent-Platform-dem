@@ -252,6 +252,13 @@ def configure_host_database(host) -> None:
     host.env["PGPASSFILE"] = passfile
 
 
+def engine_probe(common):
+    probe = common.H("w2-engine-probe")
+    probe.eng = common.DockerWorkerEngine()
+    probe.engine_id = probe.eng.engine_id()
+    return probe
+
+
 def run() -> None:
     try:
         raw, _core, config_path = load_config()
@@ -274,9 +281,9 @@ def run() -> None:
         _not_run("loaded B5 runtime authority is not bound to the W2 namespace")
     if os.environ.get("PGPASSFILE") is None:
         _not_run("W2 PostgreSQL passfile is not configured")
-    engine = c.H("w2-scientific-engine")
+    engine = engine_probe(c)
     try:
-        if engine.engine_id() != c.EXPECTED_ENGINE_ID:
+        if engine.engine_id != c.EXPECTED_ENGINE_ID:
             _not_run("owned Docker engine identity differs")
         c.guard_storage_headroom()
         dirty_sources = subprocess.run(
