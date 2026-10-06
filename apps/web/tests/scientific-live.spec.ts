@@ -230,6 +230,8 @@ test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes
   await page.getByRole('button', { name: 'Review plan' }).click();
   const planRegion = page.getByRole('region', { name: 'Plan review' });
   await expect(planRegion).toBeVisible({ timeout: 30_000 });
+  await expect.poll(() => new URL(page.url()).searchParams.get('run'), { timeout: 30_000 })
+    .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
   const runId = new URL(page.url()).searchParams.get('run');
   if (!runId) throw new Error('W2 UI did not create a run after plan review');
   await planRegion.getByRole('button', { name: 'Prepare plan', exact: true }).click({ timeout: 30_000 });
