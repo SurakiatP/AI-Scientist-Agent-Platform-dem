@@ -150,7 +150,14 @@ def _configure_dispatch_runtime(identity: DispatchIdentity) -> RuntimePins:
         peer_destinations={str(key): value for key, value in identity.peer_destinations.items()},
     )
     from scientist import profile_preparation
-    profile_preparation.configure_evidence_key(broker._key())
+    expected_images = {profile_preparation.PROFILE_ID: identity.image_digest}
+    if identity.compute_image_digest is not None:
+        expected_images[profile_preparation.COMPUTE_PROFILE_ID] = identity.compute_image_digest
+    profile_preparation.configure_builder(
+        None,
+        expected_image_digests=expected_images,
+        evidence_key=broker._key(),
+    )
     return pins
 
 

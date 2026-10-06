@@ -309,6 +309,23 @@ def _stage_compute_recipe(state_dir: Path) -> tuple[Path, str]:
         raise
 
 
+def _dispatch_template_payload(
+    cfg: HostConfig, worker_image_digest: str, compute_image_digest: str | None
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "runtime_commit": RUNTIME_COMMIT,
+        "image_digest": worker_image_digest,
+        "compute_image_digest": compute_image_digest,
+        "skills_digest": cfg.skills_digest,
+        "environment_digest": cfg.environment_digest,
+        "bucket": cfg.bucket,
+        "provider_destinations": cfg.provider_destinations,
+        "peer_destinations": cfg.peer_destinations,
+        "secret_files": {name: name for name in sorted(_SECRET_NAMES)},
+    }
+
+
 def compose(cfg: HostConfig, *, engine=None, s3=None):
     global _compute_engine, _compute_image_digest, _compute_recipe_directory, _compute_recipe_manifest, _compute_state_dir
     """Verify every prerequisite, then install the trusted runtime. Mutates globals only after all checks pass."""
@@ -352,13 +369,9 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
             raise HostError("compute_environment_unavailable") from exc
     else:
         scientific_authority.configure_compute_profile(None, None)
-    template = json.dumps({
-        "schema_version": 1, "runtime_commit": RUNTIME_COMMIT, "image_digest": pin,
-        "skills_digest": cfg.skills_digest, "environment_digest": cfg.environment_digest,
-        "bucket": cfg.bucket,
-        "provider_destinations": cfg.provider_destinations, "peer_destinations": cfg.peer_destinations,
-        "secret_files": {n: n for n in sorted(_SECRET_NAMES)},
-    }, sort_keys=True).encode()
+    template = json.dumps(
+        _dispatch_template_payload(cfg, pin, compute_pin), sort_keys=True
+    ).encode()
     _parse_template(template)
     template_path = cfg.state_dir / "dispatch-template.json"
     scratch = cfg.state_dir / f".template-{uuid4().hex}"
