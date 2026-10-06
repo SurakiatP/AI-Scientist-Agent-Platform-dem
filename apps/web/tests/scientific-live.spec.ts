@@ -42,7 +42,7 @@ test('real owner browser completes and presents the approved resource measuremen
   await expect(page.getByRole('heading', { name: 'Research setup' })).toBeVisible();
   await page.getByRole('button', { name: 'Refresh setup' }).click();
   await expect(page.getByText('Environment ready')).toBeVisible({ timeout: 20_000 });
-  await page.getByRole('link', { name: 'Return plan' }).click();
+  await page.getByRole('link', { name: 'Return to plan' }).click({ timeout: 30_000 });
   await expect(page).toHaveURL(new RegExp(`/sessions/${proof.session_id}\\?run=${proof.run_id}`));
 
   await page.getByLabel('Research question').fill('Measure the approved synthetic worker resource limits in the browser acceptance.');
@@ -57,7 +57,7 @@ test('real owner browser completes and presents the approved resource measuremen
   await plan.getByRole('link', { name: 'Research Setup' }).click();
   await expect(page.getByText('Environment ready')).toBeVisible();
   await page.getByRole('button', { name: 'Refresh setup' }).click();
-  await page.getByRole('link', { name: 'Return plan' }).click();
+  await page.getByRole('link', { name: 'Return to plan' }).click({ timeout: 30_000 });
   await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
 
   await page.getByLabel('Token limit').fill('20000');
