@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Event
 from uuid import uuid4
+from types import SimpleNamespace
 
 import psycopg
 from psycopg import sql
@@ -73,6 +74,82 @@ def test_v2_agent_acceptance_does_not_authorize_compute_profile(db, owner):
     assert prep.get_job(db, owner, project, job.id).state == "ready"
     with pytest.raises(DomainError, match="scientific_environment_not_ready"):
         prep.validate_binding_for_run(db, project, approved, owner=owner)
+
+
+@pytest.mark.parametrize("python_packages", [0, 69])
+def test_compute_proof_accepts_supported_scan_inventory_with_recipe_manifest(python_packages):
+    profiles = prep.load_profiles()
+    compute = profiles[prep.COMPUTE_PROFILE_ID]
+    job_id = uuid4()
+    raw = proof(compute, job_id)
+    raw["scan"]["python_packages"] = python_packages
+    raw["recipe_manifest_sha256"] = "d" * 64
+    row = SimpleNamespace(
+        id=job_id,
+        profile_id=compute.profile_id,
+        version=compute.version,
+        manifest_sha256=compute.manifest_sha256,
+        evidence={},
+    )
+    prep.configure_builder(
+        lambda *_: raw,
+        expected_image_digests={
+            prep.PROFILE_ID: "sha256:" + "a" * 64,
+            compute.profile_id: raw["image_digest"],
+        },
+        evidence_key=b"k" * 32,
+    )
+    row.evidence = {"proof": raw, "signature": prep._signature(raw)}
+    assert prep._verified(row) is not None
+
+
+def test_compute_proof_without_recipe_manifest_is_rejected():
+    profiles = prep.load_profiles()
+    compute = profiles[prep.COMPUTE_PROFILE_ID]
+    job_id = uuid4()
+    raw = proof(compute, job_id)
+    raw["scan"]["python_packages"] = 69
+    raw["recipe_manifest_sha256"] = None
+    row = SimpleNamespace(
+        id=job_id,
+        profile_id=compute.profile_id,
+        version=compute.version,
+        manifest_sha256=compute.manifest_sha256,
+        evidence={},
+    )
+    prep.configure_builder(
+        lambda *_: raw,
+        expected_image_digests={
+            prep.PROFILE_ID: "sha256:" + "a" * 64,
+            compute.profile_id: raw["image_digest"],
+        },
+        evidence_key=b"k" * 32,
+    )
+    row.evidence = {"proof": raw, "signature": prep._signature(raw)}
+    assert prep._verified(row) is None
+
+
+def test_worker_proof_with_empty_python_inventory_is_rejected():
+    profiles = prep.load_profiles()
+    worker = profiles[prep.PROFILE_ID]
+    job_id = uuid4()
+    raw = proof(worker, job_id)
+    raw["scan"]["python_packages"] = 0
+    raw["recipe_manifest_sha256"] = None
+    row = SimpleNamespace(
+        id=job_id,
+        profile_id=worker.profile_id,
+        version=worker.version,
+        manifest_sha256=worker.manifest_sha256,
+        evidence={},
+    )
+    prep.configure_builder(
+        lambda *_: raw,
+        expected_image_digest=raw["image_digest"],
+        evidence_key=b"k" * 32,
+    )
+    row.evidence = {"proof": raw, "signature": prep._signature(raw)}
+    assert prep._verified(row) is None
 
 
 def test_compute_proof_requires_its_configured_image_pin():

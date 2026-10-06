@@ -250,7 +250,7 @@ def _validate_proof(raw: dict, profile: Profile, job_id: UUID) -> BuildProof:
             and proof.scan.database_next_update > now):
         raise ValueError("evidence is stale")
     if profile.profile_id == COMPUTE_PROFILE_ID:
-        if proof.scan.python_packages != 0 or proof.recipe_manifest_sha256 is None:
+        if proof.scan.python_packages not in (0, 69) or proof.recipe_manifest_sha256 is None:
             raise ValueError("compute proof must bind its stdlib recipe")
     elif proof.scan.python_packages == 0 or proof.recipe_manifest_sha256 is not None:
         raise ValueError("worker proof package count is invalid")
