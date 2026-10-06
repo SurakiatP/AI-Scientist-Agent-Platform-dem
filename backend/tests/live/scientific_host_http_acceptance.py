@@ -130,6 +130,24 @@ def _self_check_boundary_diagnostics(fixture) -> None:
         if sent != messages or output.getvalue() != expected or len(expected) > 128 or secret in output.getvalue():
             raise AssertionError("fixture response diagnostic changed response bytes or emitted unsafe content")
 
+    diagnostic_secret = "SYNTHETIC_NESTED_ERROR_DETAIL_MUST_NOT_APPEAR"
+    nested = [
+        {"type": "http.response.start", "status": 503, "headers": [(b"authorization", diagnostic_secret.encode())]},
+        {"type": "http.response.body", "body": json.dumps({"detail": {"code": "storage_unavailable", "message": diagnostic_secret}}).encode(), "more_body": False},
+    ]
+    sent, output = [], io.StringIO()
+    with redirect_stderr(output):
+        asyncio.run(app_for(nested, sent))
+    if output.getvalue() != (
+        "scientific-fixture-response status=503 code=other "
+        "candidate_field=detail candidate_kind=object nested_code=storage_unavailable\n"
+    ):
+        raise AssertionError("fixture did not report the safe nested error shape")
+    if diagnostic_secret in output.getvalue():
+        raise AssertionError("fixture leaked private diagnostic detail")
+    if len(sent) != len(nested) or any(actual is not expected for actual, expected in zip(sent, nested)):
+        raise AssertionError("fixture changed response ASGI message identity or order")
+
     failure = RuntimeError(secret)
     async def broken_app(scope, receive, send):
         raise failure

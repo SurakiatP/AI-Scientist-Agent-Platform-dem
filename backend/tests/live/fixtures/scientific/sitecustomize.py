@@ -115,12 +115,62 @@ def _error_code(status, response):
     return candidate if isinstance(candidate, str) and candidate in _SAFE_ERROR_CODES else "other"
 
 
-def _diagnose(status, code):
+def _error_shape(response):
+    chunks = []
+    remaining = 4096
+    for message in response:
+        if message.get("type") != "http.response.body":
+            continue
+        chunk = message.get("body", b"")
+        if isinstance(chunk, bytes) and chunk:
+            chunks.append(chunk[:remaining])
+            remaining -= min(remaining, len(chunk))
+        if not remaining:
+            break
+    try:
+        payload = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return "candidate_field=unavailable candidate_kind=invalid nested_code=none"
+    if not isinstance(payload, dict):
+        return "candidate_field=none candidate_kind=non_object nested_code=none"
+    if "code" in payload:
+        field = "code"
+        candidate = payload["code"]
+    elif "detail" in payload:
+        field = "detail"
+        candidate = payload["detail"]
+    else:
+        return "candidate_field=none candidate_kind=missing nested_code=none"
+    if isinstance(candidate, dict):
+        kind = "object"
+        nested = candidate.get("code")
+        nested_code = nested if isinstance(nested, str) and nested in _SAFE_ERROR_CODES else (
+            "other" if isinstance(nested, str) else "none"
+        )
+    elif isinstance(candidate, str):
+        kind, nested_code = "string", "none"
+    elif isinstance(candidate, list):
+        kind, nested_code = "array", "none"
+    elif candidate is None:
+        kind, nested_code = "null", "none"
+    elif isinstance(candidate, bool):
+        kind, nested_code = "boolean", "none"
+    elif isinstance(candidate, (int, float)):
+        kind, nested_code = "number", "none"
+    else:
+        kind, nested_code = "other", "none"
+    return f"candidate_field={field} candidate_kind={kind} nested_code={nested_code}"
+
+
+def _diagnose(status, code, response=None):
     if type(status) is not int or not 100 <= status <= 599:
         status = 0
     if not isinstance(code, str) or (code not in _SAFE_ERROR_CODES and code not in ("validation_error", "other")):
         code = "other"
-    print(f"scientific-fixture-response status={status} code={code}", file=sys.stderr, flush=True)
+    line = f"scientific-fixture-response status={status} code={code}"
+    if status >= 500 and code == "other":
+        line += " " + _error_shape(response or [])
+    print(line, file=sys.stderr, flush=True)
 
 
 def _synthetic_model(request, target):
@@ -166,7 +216,7 @@ class _BoundaryAckBarrier:
         start = next((m for m in response if m.get("type") == "http.response.start"), None)
         if start is None or start.get("status") != 200:
             status = start.get("status", 0) if start is not None else 0
-            _diagnose(status, _error_code(status, response))
+            _diagnose(status, _error_code(status, response), response)
             for message in response:
                 await send(message)
             return
