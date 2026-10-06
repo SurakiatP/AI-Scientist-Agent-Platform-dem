@@ -95,7 +95,7 @@ function Report({ artifact, language }: { artifact: ArtifactView; language: Lang
     setContent(null); setError(null);
     void requestBlob(`/api/v1/artifacts/${encodeURIComponent(artifact.artifact_id)}/content`, controller.signal).then(async ({ blob, contentType }) => {
       if (controller.signal.aborted) return;
-      const media = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf'].includes(contentType);
+      const media = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml', 'application/pdf'].includes(contentType);
       const readable = ['text/plain', 'text/markdown', 'text/csv', 'application/json'].includes(contentType);
       if (media) {
         objectUrl = URL.createObjectURL(blob);
