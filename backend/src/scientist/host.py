@@ -36,6 +36,7 @@ from scientist.domain import _event
 from scientist.private_worker_api import RuntimePins, WorkerController
 from scientist.runtime_contracts import RUNTIME_COMMIT, BootstrapMetadata, RuntimeContextV1
 from scientist.supervisor import DockerWorkerEngine, WorkerBootstrap
+from scientist.web_assets import checked_web_root, create_web_router
 
 _MAX_CONFIG_BYTES = 64 * 1024
 _START_FAILURES = 3
@@ -101,6 +102,7 @@ class HostConfig(BaseModel):
     secrets_dir: Path
     state_dir: Path
     scientific_bundle_dir: Path | None = None
+    web_dist_dir: Path | None = None
     max_active: int = Field(strict=True, ge=1, le=3)
     poll_seconds: float = Field(default=2.0, ge=0.2, le=30)
     provider_destinations: dict[str, str]
@@ -161,6 +163,16 @@ class HostConfig(BaseModel):
     @classmethod
     def _scientific_bundle(cls, value: Path | None) -> Path | None:
         return _private_dir(value) if value is not None else None
+
+    @field_validator("web_dist_dir")
+    @classmethod
+    def _web_dist(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        try:
+            return checked_web_root(value)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("web distribution is unavailable") from exc
 
     @field_validator("provider_destinations")
     @classmethod
@@ -557,6 +569,9 @@ def main(argv: list[str] | None = None) -> int:
         stage = "serve"
         token = token_urlsafe(32)
         app = create_app(bootstrap_token=token, bootstrap_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30))
+        web_dist_dir = getattr(cfg, "web_dist_dir", None)
+        if web_dist_dir is not None:
+            app.include_router(create_web_router(web_dist_dir))
         server = make_server(app, cfg.listen_port)
         stage = "bind"  # take the port before recovering or launching anything; uvicorn exits via SystemExit if taken
         try:

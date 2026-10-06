@@ -98,6 +98,21 @@ async function getCsrf(): Promise<string> {
   return csrfFlight;
 }
 
+export async function bootstrapOwner(token: string): Promise<void> {
+  const response = await fetch('/api/v1/bootstrap', {
+    method: 'POST',
+    credentials: 'same-origin',
+    redirect: 'error',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+  const body: unknown = await response.json().catch(() => null);
+  if (!response.ok) throw toApiError(response.status, body);
+  const csrf = (body as { csrf_token?: unknown } | null)?.csrf_token;
+  if (typeof csrf !== 'string' || !csrf) throw new ApiError('invalid_response', 502, '');
+  csrfToken = csrf;
+}
+
 export async function refreshOwnerSession(): Promise<void> {
   csrfToken = null;
   await getCsrf();

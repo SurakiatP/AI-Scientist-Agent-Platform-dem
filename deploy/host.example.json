@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "database_url": "postgresql+psycopg://localhost/DELIVEREDDB",
+  "listen_port": 8765,
+  "expected_engine_id": "REPLACE_WITH_OWNED_ENGINE_ID",
+  "worker_image": "REPLACE_WITH_REVIEWED_IMAGE@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "dispatch_image": "REPLACE_WITH_REVIEWED_IMAGE@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "service_network": "REPLACE_WITH_OWNED_SERVICE_NETWORK",
+  "egress_network": null,
+  "skills_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "environment_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "s3_endpoint": "http://127.0.0.1:9000",
+  "bucket": "DELIVEREDBUCKET",
+  "secrets_dir": "/absolute/private/delivered-app/secrets",
+  "state_dir": "/absolute/private/delivered-app/state",
+  "scientific_bundle_dir": null,
+  "web_dist_dir": "/absolute/path/to/AI-Scientist-Agent-Platform-dem/apps/web/dist",
+  "max_active": 1,
+  "poll_seconds": 2,
+  "provider_destinations": {
+    "00000000-0000-4000-8000-000000000001": "https://provider.example.invalid"
+  },
+  "peer_destinations": {}
+}
