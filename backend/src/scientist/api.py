@@ -16,12 +16,12 @@ from sqlalchemy import text
 from typing import Annotated
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from scientist import domain, files, objects, research, supervisor, profile_preparation
 from scientist import secrets as secret_store
 from scientist.auth import DomainError, authenticate_owner_session
-from scientist.contracts import DecisionSubmit, ObjectRef, PlanSpec, Principal, PreparationSubmit
+from scientist.contracts import CsvResearchSelection, DecisionSubmit, ObjectRef, PlanSpec, Principal, PreparationSubmit
 from scientist.db import session as database_session
 
 MAX_UPLOAD_BYTES = objects.MAX_UPLOAD_BYTES
@@ -128,7 +128,17 @@ class PlanPatch(Body):
 class PreparePlan(Body):
     expected_revision: int
     search_terms: list[str] = Field(default_factory=list, max_length=10)
-    workflow: Literal['literature', 'resources'] = 'literature'
+    workflow: Literal['literature', 'resources', 'crossref_csv'] = 'literature'
+    csv_selection: CsvResearchSelection | None = None
+
+    @model_validator(mode="after")
+    def workflow_selection(self):
+        if self.workflow == 'crossref_csv':
+            if self.csv_selection is None or self.search_terms:
+                raise ValueError("CSV research requires an explicit selection and no search_terms")
+        elif self.csv_selection is not None:
+            raise ValueError("CSV selection requires crossref_csv workflow")
+        return self
 
 
 class Publish(Body):
@@ -370,7 +380,7 @@ def patch_plan(request: Request, run_id: UUID, body: PlanPatch):
 def prepare_plan(request: Request, run_id: UUID, body: PreparePlan):
     with database_session() as db:
         principal = _principal(request)
-        plan = research.build_plan(db, principal, run_id, body.search_terms, workflow=body.workflow)
+        plan = research.build_plan(db, principal, run_id, body.search_terms, workflow=body.workflow, csv_selection=body.csv_selection)
         run = domain.revise_plan(db, principal, run_id, body.expected_revision, plan)
         db.commit()
         return run

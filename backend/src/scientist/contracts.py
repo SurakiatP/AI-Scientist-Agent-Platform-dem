@@ -205,6 +205,19 @@ class CsvDescribeGrantV1(Contract):
         return self
 
 
+class CsvResearchSelection(Contract):
+    crossref: CrossrefQueryV1
+    csv_file_id: UUID
+    numeric_columns: list[Annotated[StrictStr, Field(min_length=1, max_length=128)]] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def closed_columns(self):
+        if (len(set(self.numeric_columns)) != len(self.numeric_columns)
+                or any(not name.strip() or _has_control(name) for name in self.numeric_columns)):
+            raise ValueError("numeric columns must be unique bounded names")
+        return self
+
+
 class ComputeProfilePin(Contract):
     profile_id: Literal["prof.csv-stdlib@py3.14.7"]
     version: Literal["1"]
@@ -559,7 +572,7 @@ class DecisionSubmit(Contract):
         return self
 
 
-MODELS = (RuntimePins, ScientificBinding, ScientificBindingV2, CrossrefQueryV1, CsvDescribeGrantV1, ComputeProfilePin, ResearchRequirementView, ResearchProfileView, PreparationSubmit, PreparationJobView, ResearchSetupView, RunReadinessView, Principal, APIError, ObjectRef, PackageSpec, PeerDataRef, PeerReleaseSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
+MODELS = (RuntimePins, ScientificBinding, ScientificBindingV2, CrossrefQueryV1, CsvResearchSelection, CsvDescribeGrantV1, ComputeProfilePin, ResearchRequirementView, ResearchProfileView, PreparationSubmit, PreparationJobView, ResearchSetupView, RunReadinessView, Principal, APIError, ObjectRef, PackageSpec, PeerDataRef, PeerReleaseSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
 
 
 def _ts_type(schema: dict[str, Any]) -> str:

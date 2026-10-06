@@ -46,6 +46,12 @@ export interface CrossrefQueryV1 {
   limit: number;
 }
 
+export interface CsvResearchSelection {
+  crossref: CrossrefQueryV1;
+  csv_file_id: string;
+  numeric_columns: string[];
+}
+
 export interface CsvDescribeGrantV1 {
   recipe_id: "csv.describe.v1";
   recipe_version: "1";

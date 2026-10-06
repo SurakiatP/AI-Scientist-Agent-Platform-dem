@@ -94,7 +94,7 @@ def prepare_server(catalog_source: Path, output: Path) -> None:
                 *sorted((root / "backend/migrations").glob("*.sql")),
                 *sorted((root / "runtime/profiles").glob("*.json")),
                 *(root / f"runtime/{name}" for name in
-                  ("__init__.py", "entrypoint.py", "prepare.py", "skills-manifest.json", "requirements.lock")),
+                  ("__init__.py", "entrypoint.py", "compute_entrypoint.py", "prepare.py", "skills-manifest.json", "requirements.lock")),
                 root / "docs/skills/capability-registry.json",
                 root / "backend/Dockerfile", root / "backend/Dockerfile.dockerignore"]
     for source in selected:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from sqlalchemy import text
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -9,18 +10,24 @@ from sqlalchemy.orm import Session
 
 from scientist import settings
 from scientist.auth import DomainError
-from scientist.contracts import PlanSpec, Principal
+from scientist.contracts import CsvResearchSelection, CsvDescribeGrantV1, ObjectRef, PlanSpec, Principal, ScientificBindingV2
 from scientist.domain import get_plan
 
 _MAX_TERMS, _MAX_TERM_LEN = 10, 150
 
 
-def build_plan(db: Session, owner: Principal, run_id: UUID, search_terms: list[str], *, workflow: str = 'literature') -> PlanSpec:
+def build_plan(db: Session, owner: Principal, run_id: UUID, search_terms: list[str], *, workflow: str = 'literature', csv_selection: CsvResearchSelection | None = None) -> PlanSpec:
     """Draft the initial workflow: search literature, verify references, synthesize evidence.
 
     Keeps the run's snapshot digest, provider/model and owner-set limits; the caller
     persists the draft through domain.revise_plan so the revision check stays authoritative.
     """
+    if workflow == 'crossref_csv':
+        if csv_selection is None or search_terms:
+            raise DomainError('invalid_request', 400)
+        return _csv_plan(db, owner, run_id, csv_selection)
+    if csv_selection is not None:
+        raise DomainError('invalid_request', 400)
     if workflow == 'resources':
         from scientist.scientific_authority import resource_binding
         current = get_plan(db, owner, run_id).plan
@@ -44,6 +51,51 @@ def build_plan(db: Session, owner: Principal, run_id: UUID, search_terms: list[s
     if not provider or not scholarly:
         raise DomainError("data_destinations_not_configured", 409)
     return current.model_copy(update={"stages": stages, "allowed_ops": ["search", "llm"], "data_recipients": [*scholarly, provider], "scientific": None})
+
+
+def _csv_plan(db: Session, owner: Principal, run_id: UUID, requested: CsvResearchSelection) -> PlanSpec:
+    from scientist import scientific_authority as authority
+    from scientist.capability_registry import load_registry
+    from scientist.instruction_loader import load_instruction_bundle, load_instruction_pins
+
+    current = get_plan(db, owner, run_id).plan
+    snapshot = db.execute(text("SELECT project_id, manifest FROM input_snapshots WHERE run_id=:run AND digest=:digest"),
+                          {'run': run_id, 'digest': current.input_snapshot_digest}).one()
+    captured = next((item for item in snapshot.manifest.get('files', [])
+                     if item.get('id') == str(requested.csv_file_id)), None)
+    if captured is None or captured.get('state', 'ready') != 'ready' or captured.get('content_type') != 'text/csv':
+        raise DomainError('scientific_input_unavailable', 409)
+    try:
+        ref = ObjectRef(project_id=snapshot.project_id, key=captured['object_key'],
+                        sha256=captured['sha256'], size=captured['size'], content_type='application/octet-stream')
+        profile, manifest_hash = authority.trusted_compute_profile()
+        grant = CsvDescribeGrantV1(recipe_id='csv.describe.v1', recipe_version='1',
+            recipe_manifest_sha256=manifest_hash, profile_id=profile.profile_id,
+            profile_version=profile.version, image_digest=profile.image_digest,
+            input_ref=ref, input_sha256=ref.sha256, numeric_columns=requested.numeric_columns)
+        if not authority._grant_matches_snapshot_file(db, snapshot.project_id, grant, [captured]):
+            raise DomainError('scientific_input_unavailable', 409)
+        registry_path = authority.ROOT / 'docs/skills/capability-registry.json'
+        if not registry_path.is_file():
+            registry_path = authority.ROOT / 'runtime/capability-registry.json'
+        selection = load_registry(registry_path).select(['paper-lookup', 'exploratory-data-analysis'])
+        instructions = load_instruction_bundle(selection, authority._bundle_root,
+            load_instruction_pins(authority.ROOT / 'runtime/skills-manifest.json'),
+            token_counter=lambda value: len(value.encode('utf-8')), token_budget=65536)
+        binding = ScientificBindingV2(binding_version=2, catalog_commit=selection.catalog_commit,
+            registry_sha256=selection.registry_sha256, capability_ids=list(selection.capability_ids),
+            instruction_fingerprint=instructions.instruction_fingerprint,
+            agent_runtime_pins=authority._current_runtime_pins(), input_snapshot_digest=current.input_snapshot_digest,
+            approved_crossref_queries={'crossref': requested.crossref}, required_compute_profiles=[profile],
+            csv_describe_grants={'csv_describe': grant})
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise DomainError('scientific_binding_unavailable', 409) from exc
+    provider = settings.provider_endpoint(current.provider_id)
+    if not provider or 'https://api.crossref.org' not in settings.scholarly_endpoints():
+        raise DomainError('data_destinations_not_configured', 409)
+    return current.model_copy(update={'scientific': binding,
+        'stages': ['Retrieve Crossref metadata', 'Describe approved CSV columns', 'Explain evidence and outputs'],
+        'allowed_ops': ['search', 'compute', 'llm'], 'data_recipients': ['https://api.crossref.org', provider], 'packages': []})
 
 
 def _norm_id(kind: str, value: object) -> str | None:
