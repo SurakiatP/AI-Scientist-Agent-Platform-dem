@@ -125,7 +125,7 @@ def load_config(*, require_ready: bool = True) -> tuple[dict, dict, Path]:
                     raise NotRunError("reviewed W2 web distribution is unavailable")
             elif not path.is_dir():
                 raise NotRunError(f"W2 {key} directory is not prepared")
-    return raw, core, config_path
+    return raw, core, paths["b5_live_config"]
 
 
 def _load_fixture_module():
