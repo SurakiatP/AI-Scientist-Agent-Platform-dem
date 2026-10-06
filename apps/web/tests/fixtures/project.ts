@@ -56,7 +56,7 @@ export async function installProjectFixtureRoutes(page: Page, options: { prepara
     }
     const json = (data: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) });
     if (method === 'GET' && path === '/owner/session') { csrfFetchCount += 1; return json({ identity: 'fixture-owner', kind: 'owner', csrf_token: `fixture-csrf-token-${csrfFetchCount}` }); }
-    if (method === 'GET' && path === '/capabilities') return json({ allowed_content_types: ['application/pdf', 'text/csv', 'text/markdown', 'text/plain', 'application/json', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'], max_bytes: 25 * 1024 * 1024 });
+    if (method === 'GET' && path === '/capabilities') return json({ file_types: ['.csv', '.json', '.md', '.pdf', '.txt', '.xlsx'], max_upload_bytes: 25 * 1024 * 1024, protocols: { mcp: 'not_configured', a2a: 'not_configured' } });
     if (method === 'GET' && path === '/projects') return json(projects);
     if (method === 'POST' && path === '/projects') return json(projects[0], 201);
     if (method === 'GET' && /^\/projects\/[0-9a-f-]+$/.test(path)) {

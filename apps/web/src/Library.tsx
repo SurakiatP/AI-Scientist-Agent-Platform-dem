@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import type { CitationView, FileView, ProjectView, RunView } from '../../../contracts/api-types';
 import { ApiError, apiCodeLabel, apiErrorMessage, refreshOwnerSession, request, requestBlob } from './api';
 import { useAppPreferences } from './App';
 
 const text = (language: 'th' | 'en', en: string, th: string) => language === 'th' ? th : en;
-type UploadPolicy = { allowed_content_types: string[]; max_bytes: number };
+type UploadPolicy = { file_types: string[]; max_upload_bytes: number };
 
 export function Library() {
   const { projectId = '' } = useParams();
@@ -63,6 +63,11 @@ export function Library() {
       request<UploadPolicy>('/api/v1/capabilities', { signal: controller.signal }),
     ]).then(([fileList, citationList, runList, uploadPolicy]) => {
       if (controller.signal.aborted) return;
+      if (!isUploadPolicy(uploadPolicy)) {
+        setError(text(language, 'The server returned an invalid upload policy.', 'เซิร์ฟเวอร์ส่งนโยบายอัปโหลดที่ไม่ถูกต้อง'));
+        setLoading(false);
+        return;
+      }
       setFiles(fileList); setCitations(citationList); setRuns(runList); setPolicy(uploadPolicy); setLoading(false);
     }).catch((reason: unknown) => {
       if (!controller.signal.aborted) { setError(reason instanceof ApiError && reason.status === 404 ? 'not-found' : reason instanceof ApiError && reason.status === 403 ? 'forbidden' : apiErrorMessage(reason, language, 'Unable to load project library.')); setLoading(false); }
@@ -70,15 +75,16 @@ export function Library() {
     return () => { controller.abort(); mutationRef.current?.abort(); previewRef.current?.abort(); statusRef.current?.abort(); closePreview(false); };
   }, [activeProjectId]);
 
-  const acceptedTypes = useMemo(() => policy?.allowed_content_types ?? [], [policy]);
-  const readableTypes = acceptedTypes.map((type) => ({ 'application/pdf': 'PDF', 'text/csv': 'CSV', 'text/markdown': 'Markdown', 'text/plain': 'Plain text', 'application/json': 'JSON' }[type] ?? type)).join(', ');
+  const acceptedTypes = policy?.file_types ?? [];
+  const readableTypes = acceptedTypes.map((type) => ({ '.pdf': 'PDF', '.csv': 'CSV', '.md': 'Markdown', '.txt': 'Plain text', '.json': 'JSON', '.xlsx': 'XLSX' }[type] ?? type)).join(', ');
 
   async function upload(file: File | undefined) {
     setUploadMessage('');
     if (!file || !policy || uploading) return;
+    const suffix = file.name.match(/\.[^.]+$/)?.[0].toLowerCase() ?? '';
     const type = file.type || inferType(file.name);
-    if (!acceptedTypes.includes(type)) { setUploadMessage(text(language, 'This file type is not supported.', 'ไม่รองรับไฟล์ชนิดนี้')); return; }
-    if (file.size > policy.max_bytes) { setUploadMessage(text(language, `File exceeds the ${formatSize(policy.max_bytes)} limit.`, `ไฟล์มีขนาดเกิน ${formatSize(policy.max_bytes)}`)); return; }
+    if (!acceptedTypes.includes(suffix)) { setUploadMessage(text(language, 'This file type is not supported.', 'ไม่รองรับไฟล์ชนิดนี้')); return; }
+    if (file.size > policy.max_upload_bytes) { setUploadMessage(text(language, `File exceeds the ${formatSize(policy.max_upload_bytes)} limit.`, `ไฟล์มีขนาดเกิน ${formatSize(policy.max_upload_bytes)}`)); return; }
     const targetProject = activeProjectId;
     const controller = new AbortController(); mutationRef.current = controller;
     setUploading(true); setUploadMessage(text(language, 'Sending file…', 'กำลังส่งไฟล์…'));
@@ -178,9 +184,9 @@ export function Library() {
       {!loading && error && <div role="alert"><p>{error === 'not-found' ? text(language, 'This project was not found.', 'ไม่พบโครงการนี้') : error === 'forbidden' ? text(language, 'You do not have access to this project.', 'คุณไม่มีสิทธิ์เข้าถึงโครงการนี้') : text(language, 'Project library could not be loaded.', 'โหลดคลังโครงการไม่สำเร็จ')} {error !== 'not-found' && error !== 'forbidden' && error}</p><Link to="/projects">{text(language, 'Back to projects', 'กลับไปยังโครงการ')}</Link></div>}
       {!loading && !error && activeProjectId && <>
         <section aria-labelledby="files-heading"><h2 id="files-heading">{text(language, 'Shared files', 'ไฟล์ที่แชร์ในโครงการ')}</h2>
-          <p>{text(language, `Accepted formats: ${readableTypes || 'unavailable'} · Maximum size: ${policy ? formatSize(policy.max_bytes) : 'unavailable'}`, `รูปแบบที่รับ: ${readableTypes || 'ไม่มีข้อมูล'} · ขนาดสูงสุด: ${policy ? formatSize(policy.max_bytes) : 'ไม่มีข้อมูล'}`)}</p>
+          <p>{text(language, `Accepted formats: ${readableTypes || 'unavailable'} · Maximum size: ${policy ? formatSize(policy.max_upload_bytes) : 'unavailable'}`, `รูปแบบที่รับ: ${readableTypes || 'ไม่มีข้อมูล'} · ขนาดสูงสุด: ${policy ? formatSize(policy.max_upload_bytes) : 'ไม่มีข้อมูล'}`)}</p>
           <button className="button button-quiet" type="button" onClick={() => void refreshFiles()}>{text(language, 'Refresh file status', 'รีเฟรชสถานะไฟล์')}</button>
-          <label htmlFor="library-upload">{text(language, 'Upload project files', 'อัปโหลดไฟล์โครงการ')}</label><input id="library-upload" type="file" disabled={!policy || uploading} accept={acceptAttribute(acceptedTypes)} onChange={(event) => { const selected = event.target.files?.[0]; event.target.value = ''; void upload(selected); }} />
+          <label htmlFor="library-upload">{text(language, 'Upload project files', 'อัปโหลดไฟล์โครงการ')}</label><input id="library-upload" type="file" disabled={!policy || uploading} accept={acceptedTypes.join(',')} onChange={(event) => { const selected = event.target.files?.[0]; event.target.value = ''; void upload(selected); }} />
           {uploadMessage && <p role="status">{uploadMessage}</p>}
           {csrfRecovery && <p role="alert">{text(language, 'Your owner session may have changed. Refresh it, then retry this action manually.', 'เซสชันเจ้าของอาจเปลี่ยนไปแล้ว โปรดต่ออายุเซสชัน แล้วลองดำเนินการนี้อีกครั้งด้วยตนเอง')} <button type="button" disabled={refreshingSession} onClick={() => void refreshSession()}>{refreshingSession ? text(language, 'Refreshing…', 'กำลังต่ออายุ…') : text(language, 'Refresh session', 'ต่ออายุเซสชัน')}</button></p>}
           {files.length === 0 ? <p>{text(language, 'No files have been added to this project.', 'ยังไม่มีไฟล์ในโครงการนี้')}</p> : <ul>{files.map((file) => <li key={file.id} id={`file-${file.id}`}>
@@ -219,8 +225,12 @@ export function Library() {
   </section>;
 }
 
-function acceptAttribute(types: string[]) { return types.map((type) => ({ 'application/pdf': '.pdf', 'text/csv': '.csv', 'text/markdown': '.md,.markdown', 'text/plain': '.txt', 'application/json': '.json', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx' }[type] ?? type)).join(','); }
-function inferType(filename: string) { const ext = filename.split('.').pop()?.toLowerCase(); return ({ pdf: 'application/pdf', csv: 'text/csv', md: 'text/markdown', markdown: 'text/markdown', txt: 'text/plain', json: 'application/json', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' } as Record<string, string>)[ext ?? ''] ?? ''; }
+function isUploadPolicy(value: unknown): value is UploadPolicy {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const policy = value as Partial<UploadPolicy>;
+  return Array.isArray(policy.file_types) && policy.file_types.length > 0 && policy.file_types.every((type) => typeof type === 'string' && /^\.[a-z0-9]+$/i.test(type)) && typeof policy.max_upload_bytes === 'number' && Number.isSafeInteger(policy.max_upload_bytes) && policy.max_upload_bytes > 0;
+}
+function inferType(filename: string) { const ext = filename.split('.').pop()?.toLowerCase(); return ({ pdf: 'application/pdf', csv: 'text/csv', md: 'text/markdown', txt: 'text/plain', json: 'application/json', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' } as Record<string, string>)[ext ?? ''] ?? ''; }
 function stateLabel(state: FileView['state'], language: 'th' | 'en') { const values = { uploading: ['Uploading', 'กำลังอัปโหลด'], preparing: ['Preparing', 'กำลังเตรียมไฟล์'], ready: ['Ready', 'พร้อมใช้งาน'], failed: ['Failed', 'ไม่สำเร็จ'] }; return text(language, values[state][0], values[state][1]); }
 function translateFileError(value: string | null | undefined, language: 'th' | 'en') { return value ? apiCodeLabel(value, language) : text(language, 'Unknown file issue', 'ปัญหาไฟล์ที่ไม่ทราบสาเหตุ'); }
 function formatSize(size: number) { if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toLocaleString(undefined, { maximumFractionDigits: 1 })} MiB`; return `${Math.ceil(size / 1024)} KiB`; }
