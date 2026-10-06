@@ -236,7 +236,15 @@ test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes
   if (!runId) throw new Error('W2 UI did not create a run after plan review');
   await planRegion.getByRole('button', { name: 'Prepare plan', exact: true }).click({ timeout: 30_000 });
 
-  await expect.poll(async () => page.evaluate(async (id) => {
+  await expect.poll(async () => page.evaluate(async ({
+    id, csvSha256, csvSize, computeRecipeManifestSha256, computeImageDigest,
+  }: {
+    id: string;
+    csvSha256: string;
+    csvSize: number;
+    computeRecipeManifestSha256: string;
+    computeImageDigest: string;
+  }) => {
     const [planResponse, readinessResponse] = await Promise.all([
       fetch(`/api/v1/runs/${encodeURIComponent(id)}/plan`, { credentials: 'same-origin' }),
       fetch(`/api/v1/runs/${encodeURIComponent(id)}/readiness`, { credentials: 'same-origin' }),
@@ -265,13 +273,19 @@ test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes
       scientific!.approved_crossref_queries.crossref?.query === 'coastal nitrate monitoring' &&
       JSON.stringify(scientific!.csv_describe_grants.csv_describe?.numeric_columns) === JSON.stringify(['temperature_c', 'nitrate_mg_l']) &&
       scientific!.csv_describe_grants.csv_describe?.input_sha256 === csvSha256 &&
-      scientific!.csv_describe_grants.csv_describe?.input_ref.size === csvBytes.byteLength &&
-      scientific!.csv_describe_grants.csv_describe?.recipe_manifest_sha256 === proof.compute_recipe_manifest_sha256 &&
-      scientific!.csv_describe_grants.csv_describe?.image_digest === proof.compute_image_digest &&
-      scientific!.required_compute_profiles.some((profile) => profile.profile_id === 'prof.csv-stdlib@py3.14.7' && profile.image_digest === proof.compute_image_digest) &&
+      scientific!.csv_describe_grants.csv_describe?.input_ref.size === csvSize &&
+      scientific!.csv_describe_grants.csv_describe?.recipe_manifest_sha256 === computeRecipeManifestSha256 &&
+      scientific!.csv_describe_grants.csv_describe?.image_digest === computeImageDigest &&
+      scientific!.required_compute_profiles.some((profile) => profile.profile_id === 'prof.csv-stdlib@py3.14.7' && profile.image_digest === computeImageDigest) &&
       readiness.run_id === id &&
       readiness.revision === currentPlan.revision && readiness.plan_digest === currentPlan.plan_digest;
-  }, runId), { timeout: 180_000 }).toBe(true);
+  }, {
+    id: runId,
+    csvSha256,
+    csvSize: csvBytes.byteLength,
+    computeRecipeManifestSha256: proof.compute_recipe_manifest_sha256,
+    computeImageDigest: proof.compute_image_digest,
+  }), { timeout: 180_000 }).toBe(true);
 
     const setupQuery = new URLSearchParams({ session: proof.session_id, run: runId });
     await gotoHost(`/projects/${encodeURIComponent(proof.project_id)}/research-setup?${setupQuery}`);
