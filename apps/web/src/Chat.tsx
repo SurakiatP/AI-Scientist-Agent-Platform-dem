@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunReadinessView, RunView } from '../../../contracts/api-types';
-import { ApiError, apiErrorMessage, preparePlan, request, strictPlanView, strictReadiness, validUuid, type ResearchWorkflow } from './api';
+import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunReadinessView, RunView, ScientificBindingV2 } from '../../../contracts/api-types';
+import { ApiError, apiErrorMessage, preparePlan, request, requestBlob, strictPlanView, strictReadiness, validUuid, type CsvSelection, type ResearchWorkflow } from './api';
 import { useAppPreferences } from './App';
 import { ArtifactCard, ArtifactViewer } from './ArtifactViewer';
 import type { DecisionRequiredPayload } from '../../../contracts/api-types';
@@ -20,12 +20,24 @@ function newKey(): string { // randomUUID needs a secure context; getRandomValue
   const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
-function readDraft(key: string): { question: string; selected: string[]; workflow: ResearchWorkflow } {
+type CrossrefMode = 'query' | 'doi';
+function readDraft(key: string): { question: string; selected: string[]; workflow: ResearchWorkflow; crossrefMode: CrossrefMode; crossrefTerm: string; csvFileId: string; csvColumnsText: string } {
   try {
-    const v = JSON.parse(sessionStorage.getItem(key) ?? 'null') as { question?: unknown; selected?: unknown; workflow?: unknown } | null;
-    return { question: typeof v?.question === 'string' ? v.question : '', selected: Array.isArray(v?.selected) ? v.selected.filter((x): x is string => typeof x === 'string') : [], workflow: v?.workflow === 'resources' ? 'resources' : 'literature' };
-  } catch { return { question: '', selected: [], workflow: 'literature' }; }
+    const v = JSON.parse(sessionStorage.getItem(key) ?? 'null') as { question?: unknown; selected?: unknown; workflow?: unknown; crossrefMode?: unknown; crossrefTerm?: unknown; csvFileId?: unknown; csvColumnsText?: unknown } | null;
+    return {
+      question: typeof v?.question === 'string' ? v.question : '',
+      selected: Array.isArray(v?.selected) ? v.selected.filter((x): x is string => typeof x === 'string') : [],
+      workflow: v?.workflow === 'resources' || v?.workflow === 'crossref_csv' ? v.workflow : 'literature',
+      crossrefMode: v?.crossrefMode === 'doi' ? 'doi' : 'query',
+      crossrefTerm: typeof v?.crossrefTerm === 'string' ? v.crossrefTerm : '',
+      csvFileId: typeof v?.csvFileId === 'string' ? v.csvFileId : '',
+      csvColumnsText: typeof v?.csvColumnsText === 'string' ? v.csvColumnsText : '',
+    };
+  } catch { return { question: '', selected: [], workflow: 'literature', crossrefMode: 'query', crossrefTerm: '', csvFileId: '', csvColumnsText: '' }; }
 }
+const parseCsvColumns = (value: string) => value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
+const normalizedDoi = (value: string) => value.trim().toLowerCase().replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:)/, '').trim();
+const validDoi = (value: string) => /^10\.[0-9]{4,9}\//.test(value) && !/[\s<>"']/.test(value);
 const TERMINAL = ['completed', 'failed', 'canceled', 'rejected'];
 const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
@@ -47,6 +59,10 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const [question, setQuestion] = useState(() => readDraft(draftKey).question);
   const [selected, setSelected] = useState<string[]>(() => readDraft(draftKey).selected);
   const [workflow, setWorkflow] = useState<ResearchWorkflow>(() => readDraft(draftKey).workflow);
+  const [crossrefMode, setCrossrefMode] = useState<CrossrefMode>(() => readDraft(draftKey).crossrefMode);
+  const [crossrefTerm, setCrossrefTerm] = useState(() => readDraft(draftKey).crossrefTerm);
+  const [csvFileId, setCsvFileId] = useState(() => readDraft(draftKey).csvFileId);
+  const [csvColumnsText, setCsvColumnsText] = useState(() => readDraft(draftKey).csvColumnsText);
   const [searchTerm, setSearchTerm] = useState('');
   const [preparingPlan, setPreparingPlan] = useState(false);
   const preparationFlight = useRef(false);
@@ -83,7 +99,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const attempt = useRef<{ key: string; signature: string } | null>(null);
   const opener = useRef<HTMLElement | null>(null);
 
-  useEffect(() => { sessionStorage.setItem(draftKey, JSON.stringify({ question, selected, workflow })); }, [draftKey, question, selected, workflow]);
+  useEffect(() => { sessionStorage.setItem(draftKey, JSON.stringify({ question, selected, workflow, crossrefMode, crossrefTerm, csvFileId, csvColumnsText })); }, [draftKey, question, selected, workflow, crossrefMode, crossrefTerm, csvFileId, csvColumnsText]);
   useEffect(() => {
     const controller = new AbortController();
     const signal = controller.signal;
@@ -175,21 +191,61 @@ function ChatSession({ pollMs }: { pollMs: number }) {
 
   const ready = (id: string) => files.find((f) => f.id === id)?.state === 'ready';
   const hasModel = connections?.some((c) => c.state === 'ready') ?? false;
-  const signature = useMemo(() => JSON.stringify([question.trim(), selected]), [question, selected]);
+  const csvFile = files.find((file) => file.id === csvFileId);
+  const v2Binding = plan?.plan.scientific && 'binding_version' in plan.plan.scientific && plan.plan.scientific.binding_version === 2
+    ? plan.plan.scientific as ScientificBindingV2
+    : null;
+  const savedCrossref = v2Binding?.approved_crossref_queries?.crossref;
+  const savedCsvGrant = v2Binding?.csv_describe_grants?.csv_describe;
+  const csvColumns = useMemo(() => parseCsvColumns(csvColumnsText), [csvColumnsText]);
+  const validCsvColumns = csvColumns.length > 0 && csvColumns.length <= 8 && new Set(csvColumns).size === csvColumns.length && csvColumns.every((column) => column.length <= 128 && !/[\u0000-\u001f\u007f]/.test(column));
+  const validCrossrefTerm = crossrefMode === 'query'
+    ? crossrefTerm.trim().length > 0 && crossrefTerm.trim().length <= 512 && !/[\u0000-\u001f\u007f]/.test(crossrefTerm)
+    : validDoi(normalizedDoi(crossrefTerm));
+  const csvSelection: CsvSelection | undefined = workflow === 'crossref_csv' && csvFile && csvFile.state === 'ready' && csvFile.content_type.split(';')[0].trim().toLowerCase() === 'text/csv' && validCrossrefTerm && validCsvColumns
+    ? { crossref: { source_id: 'crossref', version: 1, access_mode: 'public_read', query: crossrefMode === 'query' ? crossrefTerm.trim() : null, doi: crossrefMode === 'doi' ? normalizedDoi(crossrefTerm) : null, limit: 10 }, csv_file_id: csvFile.id, numeric_columns: csvColumns }
+      : undefined;
+  const selectedInputIds = workflow === 'crossref_csv' ? (csvFileId ? [csvFileId] : []) : selected;
+  const [savedInputMatches, setSavedInputMatches] = useState(false);
+  useEffect(() => {
+    if (!v2Binding || !savedCsvGrant || workflow !== 'crossref_csv' || !csvFile || csvFile.state !== 'ready' || savedCsvGrant.input_ref.project_id !== projectId) {
+      setSavedInputMatches(false);
+      return;
+    }
+    const controller = new AbortController();
+    setSavedInputMatches(false);
+    void requestBlob(`${base}/files/${encodeURIComponent(csvFile.id)}/content`, controller.signal, 1_048_576).then(async ({ blob }) => {
+      const digestBytes = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+      const digestHex = [...new Uint8Array(digestBytes)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+      if (!controller.signal.aborted) setSavedInputMatches(blob.size === savedCsvGrant.input_ref.size && digestHex === savedCsvGrant.input_sha256);
+    }).catch(() => { if (!controller.signal.aborted) setSavedInputMatches(false); });
+    return () => controller.abort();
+  }, [base, csvFile?.id, csvFile?.state, projectId, savedCsvGrant?.input_ref.project_id, savedCsvGrant?.input_ref.size, savedCsvGrant?.input_sha256, workflow, v2Binding]);
+  const csvDraftMatchesSaved = !v2Binding || Boolean(
+    workflow === 'crossref_csv' && csvSelection && savedCrossref && savedCsvGrant &&
+    csvSelection.crossref.source_id === savedCrossref.source_id && csvSelection.crossref.version === savedCrossref.version &&
+    csvSelection.crossref.access_mode === savedCrossref.access_mode && csvSelection.crossref.query === savedCrossref.query &&
+    csvSelection.crossref.doi === savedCrossref.doi && csvSelection.crossref.limit === savedCrossref.limit &&
+    csvSelection.numeric_columns.length === savedCsvGrant.numeric_columns.length &&
+    csvSelection.numeric_columns.every((column, index) => column === savedCsvGrant.numeric_columns[index]) && savedInputMatches,
+  );
+  const csvDraftDiffers = Boolean(v2Binding && !csvDraftMatchesSaved);
+  const signature = useMemo(() => JSON.stringify([question.trim(), selectedInputIds, workflow, crossrefMode, crossrefTerm.trim(), csvFileId, csvColumns]), [question, selectedInputIds, workflow, crossrefMode, crossrefTerm, csvFileId, csvColumns]);
 
   async function submit() {
     setError('');
     if (!question.trim()) { setError(text(language, 'Enter a research question first.', 'กรุณาพิมพ์คำถามวิจัยก่อน')); return; }
     if (!hasModel) { setError(text(language, 'No model is ready. Open Settings to choose and check one.', 'ยังไม่มีโมเดลที่พร้อมใช้ เปิดการตั้งค่าเพื่อเลือกและตรวจสอบ')); return; }
-    if (selected.some((id) => !ready(id))) { setError(text(language, 'Wait for selected files to finish preparing or remove them.', 'รอให้ไฟล์ที่เลือกเตรียมเสร็จ หรือนำออก')); return; }
+    if (workflow === 'crossref_csv' && !csvSelection) { setError(text(language, 'Choose a ready CSV, enter one Crossref query or DOI, and name up to eight numeric columns.', 'เลือกไฟล์ CSV ที่พร้อม ป้อนคำค้นหรือ DOI ของ Crossref หนึ่งรายการ และระบุคอลัมน์ตัวเลขไม่เกินแปดคอลัมน์')); return; }
+    if (selectedInputIds.some((id) => !ready(id))) { setError(text(language, 'Wait for selected files to finish preparing or remove them.', 'รอให้ไฟล์ที่เลือกเตรียมเสร็จ หรือนำออก')); return; }
     if (!attempt.current || attempt.current.signature !== signature) attempt.current = { key: newKey(), signature };
     setSubmitting(true);
     try {
       const connection = connections!.find((c) => c.state === 'ready')!;
       // retry_of is NOT sent: the server rejects unknown fields (422). TODO(contract): link a retry to its predecessor once the API allows it.
-      const created = await request<RunView>(`/api/v1/sessions/${sessionId}/runs`, json({ submission_key: attempt.current.key, question: question.trim(), input_ids: selected, provider_id: connection.id, model: connection.model }));
+      const created = await request<RunView>(`/api/v1/sessions/${sessionId}/runs`, json({ submission_key: attempt.current.key, question: question.trim(), input_ids: selectedInputIds, provider_id: connection.id, model: connection.model }));
       attempt.current = null; setRetryOf(null);
-      setSubmissions((old) => ({ ...old, [created.run_id]: { question: question.trim(), selected } }));
+      setSubmissions((old) => ({ ...old, [created.run_id]: { question: question.trim(), selected: selectedInputIds } }));
       setMessages((old) => [...old, { id: `local-${created.run_id}`, sequence: old.length + 1, role: 'owner', content: question.trim() }]);
       setSearchTerm(question.trim().slice(0, 150));
       setQuestion(''); setSelected([]); setActiveRun(created); setRun(created);
@@ -249,19 +305,19 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const peerReviewRequired = plan?.plan.peer_releases !== undefined
     && (!Array.isArray(plan.plan.peer_releases) || plan.plan.peer_releases.length > 0);
   const releaseReady = !peerReviewRequired || (peerReview.key === reviewKey && peerReview.ready);
-  const approvalReady = releaseReady && readiness !== null && plan !== null && readinessMatches(readiness, plan);
+  const approvalReady = releaseReady && readiness !== null && plan !== null && readinessMatches(readiness, plan) && !csvDraftDiffers;
   async function savePlan() {
     if (!plan || !validBudgets) return;
     const next = await guarded(() => request<RunView>(`/api/v1/runs/${plan.run_id}/plan`, { ...json({ expected_revision: plan.revision, plan: { ...plan.plan, stages: stagesText.split('\n').map((s) => s.trim()).filter(Boolean), token_limit: tokenLimit, elapsed_limit_ms: timeLimitMs } }), method: 'PATCH' }));
     if (next) { setRun(next); loadPlan(plan.run_id); setPlanNote(text(language, 'Edits saved. Review the updated plan before approving.', 'บันทึกการแก้ไขแล้ว ตรวจสอบแผนที่อัปเดตก่อนอนุมัติ')); }
   }
   async function prepareCurrentPlan() {
-    if (!plan || preparationFlight.current || approving || (workflow === 'literature' && !searchTerm.trim())) return;
+    if (!plan || preparationFlight.current || approving || (workflow === 'literature' && !searchTerm.trim()) || (workflow === 'crossref_csv' && !csvSelection)) return;
     preparationFlight.current = true; setPreparingPlan(true); setError('');
     try {
-      const next = await preparePlan(plan.run_id, plan.revision, workflow === 'resources' ? [] : [searchTerm.trim().slice(0, 150)], workflow);
+      const next = await preparePlan(plan.run_id, plan.revision, workflow === 'literature' ? [searchTerm.trim().slice(0, 150)] : [], workflow, csvSelection);
       if (next.run_id !== plan.run_id || latestRunId.current !== plan.run_id) throw new ApiError('invalid_response', 502, '');
-      setRun(next); await loadPlan(plan.run_id);
+      setRun(next); await loadPlan(plan.run_id, true);
       setPlanNote(text(language, 'Plan prepared. Review the current requirements and limits before approving.', 'เตรียมแผนแล้ว ตรวจทานข้อกำหนดและขีดจำกัดปัจจุบันก่อนอนุมัติ'));
     } catch (reason) {
       setError(apiErrorMessage(reason, language)); await loadPlan(plan.run_id);
@@ -310,11 +366,20 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     {plan && run?.state === 'awaiting_approval' && <section aria-label={text(language, 'Plan review', 'ตรวจทานแผน')}>
       <h2>{text(language, 'Review the plan', 'ตรวจทานแผน')}</h2>
       {workflow === 'literature' && <><label htmlFor="plan-search-term">{text(language, 'Literature search term', 'คำค้นวรรณกรรม')}</label><input id="plan-search-term" value={searchTerm} maxLength={150} onChange={(event) => setSearchTerm(event.target.value)} /></>}
-      <button type="button" className="button button-quiet button-small" disabled={preparingPlan || approving || (workflow === 'literature' && !searchTerm.trim())} onClick={() => void prepareCurrentPlan()}>{preparingPlan ? text(language, 'Preparing plan…', 'กำลังเตรียมแผน…') : text(language, 'Prepare plan', 'เตรียมแผน')}</button>
+      <button type="button" className="button button-quiet button-small" disabled={preparingPlan || approving || (workflow === 'literature' && !searchTerm.trim()) || (workflow === 'crossref_csv' && !csvSelection)} onClick={() => void prepareCurrentPlan()}>{preparingPlan ? text(language, 'Preparing plan…', 'กำลังเตรียมแผน…') : text(language, 'Prepare plan', 'เตรียมแผน')}</button>
       <dl><dt>{text(language, 'Model', 'โมเดล')}</dt><dd>{connections?.find((c) => c.id === plan.plan.provider_id)?.label ?? text(language, 'Selected connection', 'การเชื่อมต่อที่เลือก')} / {plan.plan.model}</dd>
         <dt>{text(language, 'Data recipients', 'ผู้รับข้อมูล')}</dt><dd>{plan.plan.data_recipients.join(', ') || text(language, 'None', 'ไม่มี')}</dd>
         <dt>{text(language, 'Packages', 'แพ็กเกจ')}</dt><dd>{plan.plan.packages.map((p) => `${p.name} ${p.version}`).join(', ') || text(language, 'None', 'ไม่มี')}</dd>
         <dt>{text(language, 'Limits', 'ขีดจำกัด')}</dt><dd>{plan.plan.token_limit} {text(language, 'tokens', 'โทเคน')} · {Math.round(plan.plan.elapsed_limit_ms / 1000)} {text(language, 's', 'วินาที')}</dd></dl>
+      {v2Binding && savedCrossref && savedCsvGrant && <section className="saved-scientific-inputs" aria-label={text(language, 'Saved scientific inputs', 'ข้อมูลวิทยาศาสตร์ที่บันทึกไว้')}>
+        <h3>{text(language, 'Saved scientific inputs', 'ข้อมูลวิทยาศาสตร์ที่บันทึกไว้')}</h3>
+        <dl>
+          <dt>{text(language, 'Approved Crossref query', 'คำค้น Crossref ที่อนุมัติ')}</dt><dd>{savedCrossref.query ?? `DOI: ${savedCrossref.doi}`}</dd>
+          <dt>{text(language, 'CSV input identity', 'ข้อมูลระบุไฟล์ CSV')}</dt><dd><code>{savedCsvGrant.input_ref.key}</code><br /><code>SHA-256 {savedCsvGrant.input_sha256}</code><br />{savedCsvGrant.input_ref.size} {text(language, 'bytes', 'ไบต์')}</dd>
+          <dt>{text(language, 'Numeric columns', 'คอลัมน์ตัวเลข')}</dt><dd>{savedCsvGrant.numeric_columns.join(', ')}</dd>
+        </dl>
+      </section>}
+      {csvDraftDiffers && <p role="status">{text(language, 'The current draft differs from the saved scientific inputs. Prepare the plan again before approval.', 'ฉบับร่างปัจจุบันแตกต่างจากข้อมูลวิทยาศาสตร์ที่บันทึกไว้ โปรดเตรียมแผนใหม่ก่อนอนุมัติ')}</p>}
       {peerReviewRequired && <PeerReleaseReview key={reviewKey} reviewKey={reviewKey} releases={plan.plan.peer_releases} language={language} onReady={peerReviewReady} />}
       <div className="plan-readiness">
         <h3>{text(language, 'Research readiness', 'ความพร้อมของงานวิจัย')}</h3>
@@ -336,7 +401,21 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       {retryOf && <p role="status">{text(language, 'Retrying a previous run. Review the question and files, then approve a new plan; earlier outputs stay separate.', 'กำลังลองงานก่อนหน้าใหม่ ตรวจทานคำถามและไฟล์ แล้วอนุมัติแผนใหม่ ผลลัพธ์เดิมยังแยกไว้')}</p>}
       <label htmlFor="question">{text(language, 'Research question', 'คำถามวิจัย')}</label>
       <textarea id="question" value={question} onChange={(e) => setQuestion(e.target.value)} />
-      <label htmlFor="research-workflow">{text(language, 'Research workflow', 'รูปแบบงานวิจัย')}</label><select id="research-workflow" value={workflow} onChange={(event) => setWorkflow(event.target.value as ResearchWorkflow)}><option value="literature">{text(language, 'Review literature', 'ตรวจทานวรรณกรรม')}</option><option value="resources">{text(language, 'Measure workspace resources', 'ตรวจทรัพยากรของงาน')}</option></select>
+      <label htmlFor="research-workflow">{text(language, 'Research workflow', 'รูปแบบงานวิจัย')}</label><select id="research-workflow" value={workflow} onChange={(event) => setWorkflow(event.target.value as ResearchWorkflow)}><option value="literature">{text(language, 'Review literature', 'ตรวจทานวรรณกรรม')}</option><option value="resources">{text(language, 'Measure workspace resources', 'ตรวจทรัพยากรของงาน')}</option><option value="crossref_csv">{text(language, 'Find papers and describe a CSV', 'ค้นหาบทความและสรุปไฟล์ CSV')}</option></select>
+      {workflow === 'crossref_csv' && <fieldset className="scientific-inputs">
+        <legend>{text(language, 'Scientific inputs', 'ข้อมูลวิจัย')}</legend>
+        <label htmlFor="crossref-mode">{text(language, 'Crossref request type', 'ชนิดคำขอ Crossref')}</label>
+        <select id="crossref-mode" value={crossrefMode} onChange={(event) => setCrossrefMode(event.target.value as CrossrefMode)}><option value="query">{text(language, 'Search query', 'คำค้น')}</option><option value="doi">DOI</option></select>
+        <label htmlFor="crossref-term">{crossrefMode === 'doi' ? 'DOI' : text(language, 'Crossref query', 'คำค้น Crossref')}</label>
+        <input id="crossref-term" value={crossrefTerm} maxLength={crossrefMode === 'doi' ? 255 : 512} onChange={(event) => setCrossrefTerm(event.target.value)} />
+        <label htmlFor="csv-input-file">{text(language, 'CSV input file', 'ไฟล์ CSV สำหรับวิเคราะห์')}</label>
+        <select id="csv-input-file" value={csvFileId} onChange={(event) => setCsvFileId(event.target.value)}>
+          <option value="">{text(language, 'Choose an uploaded CSV', 'เลือกไฟล์ CSV ที่อัปโหลดแล้ว')}</option>
+          {files.filter((file) => file.content_type.split(';')[0].trim().toLowerCase() === 'text/csv' || file.filename.toLowerCase().endsWith('.csv')).map((file) => <option key={file.id} value={file.id} disabled={file.state !== 'ready'}>{file.filename} · {fileStateLabel(file.state, language)}</option>)}
+        </select>
+        <label htmlFor="csv-numeric-columns">{text(language, 'Numeric columns (comma or line separated)', 'คอลัมน์ตัวเลข (คั่นด้วยจุลภาคหรือขึ้นบรรทัดใหม่)')}</label>
+        <textarea id="csv-numeric-columns" aria-label={text(language, 'Numeric columns', 'คอลัมน์ตัวเลข')} value={csvColumnsText} onChange={(event) => setCsvColumnsText(event.target.value)} />
+      </fieldset>}
       <ul aria-label={text(language, 'Project files', 'ไฟล์ของโครงการ')}>{files.map((f) => <li key={f.id}>{f.filename} · {fileStateLabel(f.state, language)}
         {!selected.includes(f.id) && <button type="button" className="button button-quiet button-small" disabled={f.state !== 'ready'} aria-label={`${text(language, 'Add to question', 'เพิ่มในคำถาม')}: ${f.filename}`} onClick={() => setSelected((s) => [...s, f.id])}>{text(language, 'Add to question', 'เพิ่มในคำถาม')}</button>}</li>)}</ul>
       <div aria-label={text(language, 'Selected files', 'ไฟล์ที่เลือก')}>{selected.map((id) => { const name = files.find((f) => f.id === id)?.filename ?? id; return <span key={id} className="file-chip">{name}<button type="button" aria-label={`${text(language, 'Remove from question', 'นำออกจากคำถาม')}: ${name}`} onClick={() => setSelected((s) => s.filter((x) => x !== id))}>×</button></span>; })}</div>

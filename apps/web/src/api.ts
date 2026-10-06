@@ -1,7 +1,8 @@
-import type { PlanView, PreparationJobView, RunReadinessView, RunView } from '../../../contracts/api-types';
+import type { CsvResearchSelection, PlanView, PreparationJobView, RunReadinessView, RunView } from '../../../contracts/api-types';
 
-export type ResearchWorkflow = 'literature' | 'resources';
-export const preparePlan = (runId: string, expectedRevision: number, searchTerms: string[], workflow: ResearchWorkflow = 'literature') => request<RunView>(`/api/v1/runs/${encodeURIComponent(runId)}/prepare-plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_revision: expectedRevision, workflow, search_terms: searchTerms }) });
+export type ResearchWorkflow = 'literature' | 'resources' | 'crossref_csv';
+export type CsvSelection = CsvResearchSelection;
+export const preparePlan = (runId: string, expectedRevision: number, searchTerms: string[], workflow: ResearchWorkflow = 'literature', csvSelection?: CsvSelection) => request<RunView>(`/api/v1/runs/${encodeURIComponent(runId)}/prepare-plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_revision: expectedRevision, workflow, search_terms: searchTerms, ...(workflow === 'crossref_csv' && csvSelection ? { csv_selection: csvSelection } : {}) }) });
 export const getPreparation = (projectId: string, jobId: string, signal?: AbortSignal) => request<PreparationJobView>(`/api/v1/projects/${encodeURIComponent(projectId)}/preparations/${encodeURIComponent(jobId)}`, { signal });
 
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
@@ -9,7 +10,13 @@ export const validUuid = (value: unknown): value is string => typeof value === '
 const digest = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 const integer = (value: unknown, minimum = 0): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum;
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === 'string');
-const optionalString = (value: unknown) => value === undefined || value === null || typeof value === 'string';
+const optionalString = (value: unknown): boolean => value === undefined || value === null || typeof value === 'string';
+const exactKeys = (value: unknown, required: string[], optional: string[] = []): value is Record<string, unknown> =>
+  record(value) && required.every((key) => Object.prototype.hasOwnProperty.call(value, key)) && Object.keys(value).every((key) => required.includes(key) || optional.includes(key));
+const validRef = (item: unknown): boolean => exactKeys(item, ['project_id', 'key', 'sha256', 'size', 'content_type']) &&
+  validUuid(item.project_id) && typeof item.key === 'string' && item.key.length > 0 && item.key.length <= 2048 &&
+  typeof item.sha256 === 'string' && /^[a-fA-F0-9]{64}$/.test(item.sha256) && integer(item.size) && item.content_type === 'application/octet-stream';
+const sameStrings = (value: unknown, expected: string[]): boolean => strings(value) && value.length === expected.length && value.every((item, index) => item === expected[index]);
 
 export function strictPlanView(value: unknown, currentRun: RunView): value is PlanView {
   if (!record(value) || !validUuid(value.run_id) || value.run_id !== currentRun.run_id || !integer(value.revision, 1) || !integer(currentRun.revision, 1) || value.revision !== currentRun.revision || !digest(value.plan_digest) || !record(value.plan)) return false;
@@ -17,7 +24,29 @@ export function strictPlanView(value: unknown, currentRun: RunView): value is Pl
   if (!digest(plan.input_snapshot_digest) || !validUuid(plan.provider_id) || typeof plan.model !== 'string' || !plan.model || !strings(plan.stages) || !strings(plan.allowed_ops) || !strings(plan.data_recipients) || !integer(plan.token_limit) || !integer(plan.elapsed_limit_ms) || !Array.isArray(plan.packages) || !plan.packages.every((item) => record(item) && typeof item.name === 'string' && typeof item.version === 'string' && typeof item.source === 'string' && digest(item.sha256)) || (plan.peer_releases !== undefined && (!Array.isArray(plan.peer_releases) || !plan.peer_releases.every(record)))) return false;
   if (plan.scientific === undefined || plan.scientific === null) return true;
   const binding = plan.scientific;
-  return record(binding) && binding.catalog_commit === '154988403bb5a18e9d3c0ce4e6d5e2e4b184a298' && digest(binding.registry_sha256) && strings(binding.capability_ids) && binding.capability_ids.length > 0 && digest(binding.instruction_fingerprint) && typeof binding.profile_id === 'string' && binding.profile_id.length > 0 && (binding.profile_version === undefined || binding.profile_version === '1') && (binding.tool_version === undefined || binding.tool_version === '1') && typeof binding.image_digest === 'string' && /^sha256:[0-9a-f]{64}$/.test(binding.image_digest) && binding.input_snapshot_digest === plan.input_snapshot_digest && (binding.parameters === undefined || record(binding.parameters)) && integer(binding.max_result_bytes, 1) && integer(binding.timeout_ms, 1) && integer(binding.memory_limit_bytes, 1) && integer(binding.workspace_limit_bytes, 1);
+  if (!record(binding) || binding.catalog_commit !== '154988403bb5a18e9d3c0ce4e6d5e2e4b184a298' || !digest(binding.registry_sha256) || !strings(binding.capability_ids) || binding.capability_ids.length === 0 || new Set(binding.capability_ids).size !== binding.capability_ids.length || !digest(binding.instruction_fingerprint) || binding.input_snapshot_digest !== plan.input_snapshot_digest) return false;
+  if ('binding_version' in binding) {
+    if (binding.binding_version !== 2 || !exactKeys(binding, ['binding_version', 'catalog_commit', 'registry_sha256', 'capability_ids', 'instruction_fingerprint', 'agent_runtime_pins', 'input_snapshot_digest', 'approved_crossref_queries', 'required_compute_profiles', 'csv_describe_grants'])) return false;
+    const pins = binding.agent_runtime_pins;
+    const queries = binding.approved_crossref_queries;
+    const profiles = binding.required_compute_profiles;
+    const grants = binding.csv_describe_grants;
+    const validQuery = (item: unknown): boolean => exactKeys(item, ['source_id', 'version', 'access_mode', 'query', 'doi', 'limit']) &&
+      item.source_id === 'crossref' && item.version === 1 && item.access_mode === 'public_read' && integer(item.limit, 1) && item.limit <= 20 &&
+      ((typeof item.query === 'string' && item.query.trim().length > 0 && item.query.length <= 512 && !/[\u0000-\u001f\u007f-\u009f]/.test(item.query) && item.doi === null) ||
+       (item.query === null && typeof item.doi === 'string' && item.doi.length <= 255 && !/[\u0000-\u001f\u007f-\u009f]/.test(item.doi) && /^10\.[0-9]{4,9}\/[^\s<>"']+$/.test(item.doi)));
+    if (!exactKeys(pins, ['image_digest', 'skills_digest', 'environment_digest'], ['runtime_commit']) ||
+        (pins.runtime_commit !== undefined && pins.runtime_commit !== 'bd0affe5e5f723579df8902852f5d0c47795f355') ||
+        typeof pins.image_digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(pins.image_digest) || !digest(pins.skills_digest) || !digest(pins.environment_digest)) return false;
+    if (!exactKeys(queries, ['crossref']) || !validQuery(queries.crossref)) return false;
+    if (!Array.isArray(profiles) || profiles.length !== 1 || !profiles.every((item) => exactKeys(item, ['profile_id', 'version', 'image_digest']) && item.profile_id === 'prof.csv-stdlib@py3.14.7' && item.version === '1' && typeof item.image_digest === 'string' && /^sha256:[0-9a-f]{64}$/.test(item.image_digest))) return false;
+    if (!exactKeys(grants, ['csv_describe'])) return false;
+    const grant = grants.csv_describe;
+    if (!exactKeys(grant, ['recipe_id', 'recipe_version', 'recipe_manifest_sha256', 'profile_id', 'profile_version', 'image_digest', 'input_ref', 'input_sha256', 'numeric_columns', 'max_input_bytes', 'max_output_bytes', 'timeout_ms', 'memory_limit_bytes', 'workspace_limit_bytes']) ||
+        grant.recipe_id !== 'csv.describe.v1' || grant.recipe_version !== '1' || !digest(grant.recipe_manifest_sha256) || grant.profile_id !== 'prof.csv-stdlib@py3.14.7' || grant.profile_version !== '1' || typeof grant.image_digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(grant.image_digest) || !validRef(grant.input_ref) || ((grant.input_ref as Record<string, unknown>).size as number) > 1048576 || !digest(grant.input_sha256) || grant.input_sha256 !== String((grant.input_ref as Record<string, unknown>).sha256).toLowerCase() || !strings(grant.numeric_columns) || grant.numeric_columns.length === 0 || grant.numeric_columns.length > 8 || new Set(grant.numeric_columns).size !== grant.numeric_columns.length || !grant.numeric_columns.every((column) => column.trim().length > 0 && column.length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/.test(column)) || grant.max_input_bytes !== 1048576 || grant.max_output_bytes !== 262144 || grant.timeout_ms !== 30000 || grant.memory_limit_bytes !== 1073741824 || grant.workspace_limit_bytes !== 67108864) return false;
+    return profiles[0].image_digest === grant.image_digest && sameStrings(binding.capability_ids, ['paper-lookup', 'exploratory-data-analysis']);
+  }
+  return typeof binding.profile_id === 'string' && binding.profile_id.length > 0 && (binding.profile_version === undefined || binding.profile_version === '1') && (binding.tool_version === undefined || binding.tool_version === '1') && typeof binding.image_digest === 'string' && /^sha256:[0-9a-f]{64}$/.test(binding.image_digest) && (binding.parameters === undefined || record(binding.parameters)) && integer(binding.max_result_bytes, 1) && integer(binding.timeout_ms, 1) && integer(binding.memory_limit_bytes, 1) && integer(binding.workspace_limit_bytes, 1);
 }
 
 export function strictReadiness(value: unknown, currentRun: RunView): value is RunReadinessView {

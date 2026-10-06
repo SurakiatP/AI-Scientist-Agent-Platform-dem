@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
-import { installResearchFixtureRoutes, makeRun, makePlan, PROJECT_ID, SESSION_ID, SESSION_URL, NEW_RUN_ID, PLOT_ID } from './fixtures/research';
+import { createHash } from 'node:crypto';
+import { strictPlanView } from '../src/api';
+import { installResearchFixtureRoutes, makeRun, makePlan, PROJECT_ID, SESSION_ID, SESSION_URL, NEW_RUN_ID, PLOT_ID, READY_FILE } from './fixtures/research';
 import type { PreparationJobView, ResearchSetupView, RunReadinessView } from '../../../contracts/api-types';
 
 test.setTimeout(20000);
@@ -121,6 +123,152 @@ test('shared setup is reachable from Settings and reading never starts preparati
   await page.reload();
   await expect(page.getByText(PROFILE.purpose)).toBeVisible();
   expect(api.submissions).toHaveLength(0);
+});
+
+test('Crossref CSV preparation requires explicit query and ready CSV, then rechecks the V2 plan before approval', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: null });
+  const prepareBodies: Array<Record<string, unknown>> = [];
+  const plan = validCsvPlanV2();
+  const readyRun = makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] });
+  let revision = 1;
+  await page.route(`**/api/v1/projects/${PROJECT_ID}/runs`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify([readyRun]) }));
+  await page.route(`**/api/v1/sessions/${SESSION_ID}/runs`, async (route) => {
+    const body = route.request().postDataJSON();
+    expect(body.input_ids).toEqual([READY_FILE]);
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify(readyRun), status: 201 });
+  });
+  await page.route(`**/api/v1/runs/${NEW_RUN_ID}/prepare-plan`, async (route) => {
+    prepareBodies.push(route.request().postDataJSON());
+    revision = 2;
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ...readyRun, revision }) });
+  });
+  await page.route(`**/api/v1/projects/${PROJECT_ID}/files/${READY_FILE}/content`, (route) => route.fulfill({ contentType: 'text/csv', body: 'x,y\n1,2\n3,\n5,6\n' }));
+  await page.route(`**/api/v1/runs/${NEW_RUN_ID}/plan`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ...plan, revision, plan_digest: `${'d'.repeat(63)}${revision}` }) }));
+  await page.route(`**/api/v1/runs/${NEW_RUN_ID}/readiness`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ run_id: NEW_RUN_ID, revision, plan_digest: `${'d'.repeat(63)}${revision}`, binding_sha256: '9'.repeat(64), state: 'ready', requirements: [] }) }));
+  await page.route(`**/api/v1/runs/${NEW_RUN_ID}`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ...readyRun, revision }) }));
+
+  await page.goto(SESSION_URL);
+  await page.getByLabel('Research question').fill('Describe these measurements and find related studies.');
+  await page.getByLabel('Research workflow').selectOption('crossref_csv');
+  await page.getByLabel('Crossref query').fill('microplastic exposure');
+  await page.getByLabel('CSV input file').selectOption(READY_FILE);
+  await page.getByLabel('Numeric columns').fill('x,y');
+  await page.getByRole('button', { name: 'TH', exact: true }).click();
+  await expect(page.getByLabel('คำค้น Crossref')).toHaveValue('microplastic exposure');
+  await expect(page.getByLabel('คอลัมน์ตัวเลข')).toHaveValue('x,y');
+  await page.getByRole('button', { name: 'EN', exact: true }).click();
+  await page.getByRole('button', { name: 'Review plan' }).click();
+  await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
+  await page.getByRole('button', { name: 'Prepare plan', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Approve plan', exact: true })).toBeEnabled();
+  expect(prepareBodies).toEqual([{
+    expected_revision: 1,
+    workflow: 'crossref_csv',
+    search_terms: [],
+    csv_selection: {
+      crossref: { source_id: 'crossref', version: 1, access_mode: 'public_read', query: 'microplastic exposure', doi: null, limit: 10 },
+      csv_file_id: READY_FILE,
+      numeric_columns: ['x', 'y'],
+    },
+  }]);
+  await page.getByRole('button', { name: 'Approve plan', exact: true }).click();
+  await expect.poll(() => fixture.writes.filter((write) => write.path.endsWith('/approve')).length).toBe(1);
+  expect(fixture.writes.find((write) => write.path.endsWith('/approve'))!.body.expected_revision).toBe(2);
+});
+
+function validCsvPlanV2() {
+  const plan = makePlan();
+  const input = 'x,y\n1,2\n3,\n5,6\n';
+  const inputHash = createHash('sha256').update(input).digest('hex');
+  return {
+    ...plan,
+    plan: {
+      ...plan.plan,
+      allowed_ops: ['llm', 'search', 'compute'],
+      data_recipients: ['fixture-provider', 'https://api.crossref.org'],
+      scientific: {
+        binding_version: 2,
+        catalog_commit: '154988403bb5a18e9d3c0ce4e6d5e2e4b184a298',
+        registry_sha256: 'a'.repeat(64),
+        capability_ids: ['paper-lookup', 'exploratory-data-analysis'],
+        instruction_fingerprint: 'b'.repeat(64),
+        agent_runtime_pins: { runtime_commit: 'bd0affe5e5f723579df8902852f5d0c47795f355', image_digest: `sha256:${'c'.repeat(64)}`, skills_digest: 'd'.repeat(64), environment_digest: 'e'.repeat(64) },
+        input_snapshot_digest: plan.plan.input_snapshot_digest,
+        approved_crossref_queries: { crossref: { source_id: 'crossref', version: 1, access_mode: 'public_read', query: 'microplastic exposure', doi: null, limit: 10 } },
+        required_compute_profiles: [{ profile_id: 'prof.csv-stdlib@py3.14.7', version: '1', image_digest: `sha256:${'f'.repeat(64)}` }],
+        csv_describe_grants: { csv_describe: {
+          recipe_id: 'csv.describe.v1', recipe_version: '1', recipe_manifest_sha256: '1'.repeat(64),
+          profile_id: 'prof.csv-stdlib@py3.14.7', profile_version: '1', image_digest: `sha256:${'f'.repeat(64)}`,
+          input_ref: { project_id: PROJECT_ID, key: `inputs/${inputHash}`, sha256: inputHash, size: Buffer.byteLength(input), content_type: 'application/octet-stream' },
+          input_sha256: inputHash, numeric_columns: ['x', 'y'], max_input_bytes: 1048576,
+          max_output_bytes: 262144, timeout_ms: 30000, memory_limit_bytes: 1073741824, workspace_limit_bytes: 67108864,
+        } },
+      },
+    },
+  };
+}
+
+test('V2 scientific plans reject unknown fields, unsafe limits, incomplete capabilities, and unknown versions', () => {
+  const run = makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] });
+  const cases: Array<[string, (binding: any) => void]> = [
+    ['endpoint', (binding) => { binding.approved_crossref_queries.crossref.endpoint = 'https://evil.example'; }],
+    ['credential', (binding) => { binding.approved_crossref_queries.crossref.api_key = 'synthetic-only'; }],
+    ['timeout', (binding) => { binding.csv_describe_grants.csv_describe.timeout_ms = 60000; }],
+    ['output limit', (binding) => { binding.csv_describe_grants.csv_describe.max_output_bytes = 1048576; }],
+    ['input limit', (binding) => { binding.csv_describe_grants.csv_describe.max_input_bytes = 1048577; }],
+    ['input object size', (binding) => { binding.csv_describe_grants.csv_describe.input_ref.size = 1048577; }],
+    ['C1 query control', (binding) => { binding.approved_crossref_queries.crossref.query = 'microplastic\u0085 exposure'; }],
+    ['C1 DOI control', (binding) => { binding.approved_crossref_queries.crossref.query = null; binding.approved_crossref_queries.crossref.doi = '10.1234/example\u0085record'; }],
+    ['C1 CSV header control', (binding) => { binding.csv_describe_grants.csv_describe.numeric_columns = ['x\u0085y']; }],
+    ['required capability', (binding) => { binding.capability_ids = ['paper-lookup']; }],
+    ['binding version', (binding) => Object.assign(binding, { binding_version: 3, profile_id: 'reviewed-cpu', profile_version: '1', tool_version: '1', image_digest: `sha256:${'c'.repeat(64)}`, parameters: {}, max_result_bytes: 1024, timeout_ms: 1000, memory_limit_bytes: 1073741824, workspace_limit_bytes: 67108864 })],
+  ];
+  for (const [label, mutate] of cases) {
+    const plan = validCsvPlanV2();
+    mutate(plan.plan.scientific as any);
+    expect(strictPlanView(plan, run), label).toBe(false);
+  }
+});
+
+test('CSV plan review shows its saved authority and requires reprepare after draft changes', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] }) });
+  const plan = validCsvPlanV2();
+  await page.addInitScript(({ key, value }) => sessionStorage.setItem(key, JSON.stringify(value)), {
+    key: `research-draft:${SESSION_ID}`,
+    value: { question: 'Describe the measurements.', selected: [], workflow: 'crossref_csv', crossrefMode: 'query', crossrefTerm: 'microplastic exposure', csvFileId: READY_FILE, csvColumnsText: 'x,y' },
+  });
+  const input = 'x,y\n1,2\n3,\n5,6\n';
+  const inputHash = createHash('sha256').update(input).digest('hex');
+  await page.route(`**/api/v1/projects/${PROJECT_ID}/files/${READY_FILE}/content`, (route) => route.fulfill({ contentType: 'text/csv', body: input }));
+  await page.route(`**/api/v1/runs/${NEW_RUN_ID}/plan`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(plan) }));
+  await page.route(`**/api/v1/runs/${NEW_RUN_ID}/readiness`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ run_id: NEW_RUN_ID, revision: plan.revision, plan_digest: plan.plan_digest, binding_sha256: '9'.repeat(64), state: 'ready', requirements: [] }) }));
+  await page.goto(SESSION_URL);
+  await expect(page.getByText('microplastic exposure', { exact: true })).toBeVisible();
+  await expect(page.getByText(new RegExp(`inputs/${inputHash}`))).toBeVisible();
+  await expect(page.getByText(/x, y/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Approve plan', exact: true })).toBeEnabled();
+  await page.getByLabel('Crossref query').fill('different query');
+  await page.getByLabel('Numeric columns').fill('x,z');
+  await expect(page.getByText('The current draft differs from the saved scientific inputs. Prepare the plan again before approval.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Approve plan', exact: true })).toBeDisabled();
+  expect(fixture.writes.filter((write) => write.path.endsWith('/approve'))).toHaveLength(0);
+});
+
+test('malformed V2 scientific binding blocks plan approval', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] }) });
+  const invalidPlan = { ...makePlan(), plan: { ...makePlan().plan, scientific: {
+    binding_version: 2,
+    catalog_commit: '154988403bb5a18e9d3c0ce4e6d5e2e4b184a298',
+    registry_sha256: 'a'.repeat(64), capability_ids: ['paper-lookup'], instruction_fingerprint: 'b'.repeat(64),
+    agent_runtime_pins: { image_digest: 'invalid', skills_digest: 'd'.repeat(64), environment_digest: 'e'.repeat(64) },
+    input_snapshot_digest: 'e'.repeat(64),
+  } } };
+  await page.route(`**/api/v1/runs/${NEW_RUN_ID}/plan`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(invalidPlan) }));
+  await page.route(`**/api/v1/runs/${NEW_RUN_ID}/readiness`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ run_id: NEW_RUN_ID, revision: 1, plan_digest: makePlan().plan_digest, binding_sha256: '9'.repeat(64), state: 'ready', requirements: [] }) }));
+  await page.goto(SESSION_URL);
+  await expect(page.getByRole('alert')).toContainText('invalid response');
+  await expect(page.getByRole('button', { name: 'Approve plan', exact: true })).toHaveCount(0);
+  expect(fixture.writes.filter((write) => write.path.endsWith('/approve'))).toHaveLength(0);
 });
 
 test('unverified preparation cannot appear ready', async ({ page }) => {

@@ -1,5 +1,8 @@
 .research-chat { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; max-width: 900px; margin: 0 auto; padding: 24px 18px 60px; }
 .research-chat section, .artifact-card { padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface); }
+.research-chat .saved-scientific-inputs { padding: 12px 16px; margin: 16px 0; background: var(--soft); }
+.saved-scientific-inputs dl { display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(0, 2fr); gap: 6px 12px; }
+.saved-scientific-inputs dd { margin: 0; overflow-wrap: anywhere; }
 .research-chat textarea { width: 100%; min-height: 96px; font: inherit; }
 .connection-badge { display: inline-block; padding: 4px 10px; border-radius: 999px; background: var(--soft); color: var(--ink); }
 .connection-badge.is-offline { color: var(--warning); border: 1px solid var(--warning); }
@@ -37,3 +40,5 @@
 .peer-payload-dialog::backdrop { background: rgb(4 24 45 / 65%); backdrop-filter: blur(4px); }
 .peer-payload-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .peer-payload-dialog pre { max-height: 65vh; }
+.scientific-inputs { display: grid; gap: 10px; min-width: 0; padding: 12px 16px 16px; margin: 16px 0; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface); }
+.scientific-inputs legend { padding: 0 6px; color: var(--muted); font-size: 13px; }
