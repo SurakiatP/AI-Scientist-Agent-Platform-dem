@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { RunEvent } from '../../../contracts/api-types';
-import { CONNECTION_ID, DECISION_BUDGET, DECISION_UNKNOWN, NEW_RUN_ID, PROJECT_ID, RUN_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
+import { CONNECTION_ID, DECISION_BUDGET, DECISION_UNKNOWN, NEW_RUN_ID, PROJECT_ID, RUN_ID, SESSION_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
+import { REPORT_ID } from './fixtures/project';
 
 type ChatEventSource = { url: string; closed: boolean; emit: (item: unknown) => void; fail: () => void };
 
@@ -168,6 +169,61 @@ test('duplicate creation is blocked while pending and reconciled with one key', 
   fixture.releaseSubmit();
   await expect(page.getByText('Review the plan')).toBeVisible();
   expect(fixture.submitCount()).toBe(1);
+});
+
+test('new run URL survives refresh and preserves conversation query state', async ({ page }) => {
+  await installResearchFixtureRoutes(page, { run: null });
+  await page.goto(`${SESSION_URL}?output=${REPORT_ID}&source=plan`);
+  await page.getByLabel('Research question').fill('Q');
+  await page.getByRole('button', { name: 'Review plan' }).click();
+  await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
+
+  const createdUrl = new URL(page.url());
+  expect(createdUrl.pathname).toBe(SESSION_URL);
+  expect(createdUrl.searchParams.get('run')).toBe(NEW_RUN_ID);
+  expect(createdUrl.searchParams.get('output')).toBe(REPORT_ID);
+  expect(createdUrl.searchParams.get('source')).toBe('plan');
+
+  await page.reload();
+  await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
+  expect(new URL(page.url()).searchParams.get('run')).toBe(NEW_RUN_ID);
+});
+
+test('late run creation does not navigate away after the conversation changes', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: null, holdSubmit: true });
+  await page.goto(SESSION_URL);
+  await page.getByLabel('Research question').fill('Q');
+  await page.getByRole('button', { name: 'Review plan' }).click();
+  await expect.poll(() => fixture.submitCount()).toBe(1);
+
+  const response = page.waitForResponse((item) =>
+    item.url().includes(`/api/v1/sessions/${SESSION_ID}/runs`) && item.status() === 201,
+  );
+  await page.getByRole('link', { name: 'Project details' }).click();
+  fixture.releaseSubmit();
+  await response;
+  await expect(page).toHaveURL(new RegExp(`/projects/${PROJECT_ID}$`));
+});
+
+test('late run creation keeps an owner-selected run in the URL', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { holdSubmit: true });
+  await page.goto(SESSION_URL);
+  await page.getByLabel('Research question').fill('Q');
+  await page.getByRole('button', { name: 'Review plan' }).click();
+  await expect.poll(() => fixture.submitCount()).toBe(1);
+
+  await page.evaluate((path) => {
+    window.history.pushState(window.history.state, '', path);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
+  }, `${SESSION_URL}?run=${RUN_ID}`);
+  await expect(page).toHaveURL(new RegExp(`run=${RUN_ID}`));
+
+  const response = page.waitForResponse((item) =>
+    item.url().includes(`/api/v1/sessions/${SESSION_ID}/runs`) && item.status() === 201,
+  );
+  fixture.releaseSubmit();
+  await response;
+  await expect(page).toHaveURL(new RegExp(`run=${RUN_ID}`));
 });
 
 test('an unconfirmed submission reuses its key', async ({ page }) => {

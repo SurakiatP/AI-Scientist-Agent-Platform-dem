@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunReadinessView, RunView, ScientificBindingV2 } from '../../../contracts/api-types';
 import { ApiError, apiErrorMessage, preparePlan, request, requestBlob, strictPlanView, strictReadiness, validUuid, type CsvSelection, type ResearchWorkflow } from './api';
 import { useAppPreferences } from './App';
@@ -49,7 +49,11 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const { language } = useAppPreferences();
   const location = useLocation();
   const navigate = useNavigate();
-  const requestedRun = new URLSearchParams(location.search).get('run');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const latestSearchParams = useRef(searchParams);
+  latestSearchParams.current = searchParams;
+  const mounted = useRef(false);
+  const requestedRun = searchParams.get('run');
   const base = `/api/v1/projects/${encodeURIComponent(projectId)}`;
   const draftKey = `research-draft:${sessionId}`; // question text and file ids only; never secrets
   const [messages, setMessages] = useState<MessageView[]>([]);
@@ -94,12 +98,16 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const [stopPending, setStopPending] = useState(false);
   const [submissions, setSubmissions] = useState<Record<string, { question: string; selected: string[] }>>({});
   const [retryOf, setRetryOf] = useState<string | null>(null);
-  const expanded = new URLSearchParams(location.search).get('output');
+  const expanded = searchParams.get('output');
   const expandedByClick = useRef(false);
   const attempt = useRef<{ key: string; signature: string } | null>(null);
   const opener = useRef<HTMLElement | null>(null);
 
   useEffect(() => { sessionStorage.setItem(draftKey, JSON.stringify({ question, selected, workflow, crossrefMode, crossrefTerm, csvFileId, csvColumnsText })); }, [draftKey, question, selected, workflow, crossrefMode, crossrefTerm, csvFileId, csvColumnsText]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   useEffect(() => {
     const controller = new AbortController();
     const signal = controller.signal;
@@ -244,12 +252,15 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       const connection = connections!.find((c) => c.state === 'ready')!;
       // retry_of is NOT sent: the server rejects unknown fields (422). TODO(contract): link a retry to its predecessor once the API allows it.
       const created = await request<RunView>(`/api/v1/sessions/${sessionId}/runs`, json({ submission_key: attempt.current.key, question: question.trim(), input_ids: selectedInputIds, provider_id: connection.id, model: connection.model }));
+      if (!mounted.current || latestSearchParams.current.get('run') !== requestedRun) return;
       attempt.current = null; setRetryOf(null);
       setSubmissions((old) => ({ ...old, [created.run_id]: { question: question.trim(), selected: selectedInputIds } }));
       setMessages((old) => [...old, { id: `local-${created.run_id}`, sequence: old.length + 1, role: 'owner', content: question.trim() }]);
       setSearchTerm(question.trim().slice(0, 150));
       setQuestion(''); setSelected([]); setActiveRun(created); setRun(created);
-      if (requestedRun !== null) { const search = new URLSearchParams(location.search); search.set('run', created.run_id); navigate({ search: search.toString() }, { replace: true }); }
+      const nextSearch = new URLSearchParams(latestSearchParams.current);
+      nextSearch.set('run', created.run_id);
+      setSearchParams(nextSearch, { replace: true });
     } catch (reason) {
       const definite = reason instanceof ApiError && reason.status < 500;
       if (definite) attempt.current = null;
