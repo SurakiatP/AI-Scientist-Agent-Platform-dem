@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Union
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
 
 class Contract(BaseModel):
@@ -95,6 +95,35 @@ class PeerReleaseSpec(Contract):
         return self
 
 
+class ScientificBinding(Contract):
+    """Owner-approved instructions and bounded local computation identity."""
+    catalog_commit: Literal["154988403bb5a18e9d3c0ce4e6d5e2e4b184a298"]
+    registry_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    capability_ids: list[Annotated[StrictStr, Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]] = Field(min_length=1, max_length=177)
+    instruction_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    profile_id: str = Field(pattern=r"^prof\.[a-z0-9-]+@py[0-9.]+$", max_length=100)
+    profile_version: Literal["1"] = "1"
+    image_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    tool_version: Literal["1"] = "1"
+    input_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    max_result_bytes: Annotated[StrictInt, Field(ge=1, le=1048576)]
+    timeout_ms: Annotated[StrictInt, Field(ge=1, le=30000)]
+    memory_limit_bytes: Annotated[StrictInt, Field(ge=1, le=1073741824)]
+    workspace_limit_bytes: Annotated[StrictInt, Field(ge=1, le=67108864)]
+
+    @model_validator(mode="after")
+    def bounded_parameters(self):
+        if len(set(self.capability_ids)) != len(self.capability_ids):
+            raise ValueError("scientific capabilities must be unique")
+        parameters = canonical_peer_parameters_bytes(self.parameters)
+        if len(parameters) > 65536:
+            raise ValueError("scientific parameters exceed 64 KiB")
+        if self.capability_ids == ["get-available-resources"] and self.parameters:
+            raise ValueError("resource measurement accepts no parameters")
+        return self
+
+
 class PlanSpec(Contract):
     input_snapshot_digest: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
     provider_id: UUID
@@ -104,11 +133,14 @@ class PlanSpec(Contract):
     data_recipients: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(max_length=100)
     packages: list[PackageSpec] = Field(max_length=200)
     peer_releases: list[PeerReleaseSpec] = Field(default_factory=list, max_length=20, exclude_if=lambda value: not value)
+    scientific: ScientificBinding | None = Field(default=None, exclude_if=lambda value: value is None)
     token_limit: int = Field(ge=0)
     elapsed_limit_ms: int = Field(ge=0)
 
     @model_validator(mode="after")
     def bound_plan_size(self):
+        if self.scientific is not None and self.scientific.input_snapshot_digest != self.input_snapshot_digest:
+            raise ValueError("scientific input differs from the approved snapshot")
         if len(self.model_dump_json().encode()) > 256 * 1024:
             raise ValueError("plan exceeds 262144 bytes")
         return self
@@ -240,6 +272,69 @@ class ConnectionView(Contract):
     has_secret: bool
 
 
+class ResearchRequirementView(Contract):
+    id: ShortText
+    label: ShortText
+    purpose: Annotated[str, Field(min_length=1, max_length=1000)]
+    state: Literal["ready", "missing", "preparing", "blocked", "failed"]
+    action: Literal["none", "configure_connection", "prepare_environment", "request_approval", "provide_hardware"]
+    reason: ShortText | None = None
+
+
+class ResearchProfileView(Contract):
+    profile_id: ShortText
+    version: ShortText
+    manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    label: ShortText
+    purpose: Annotated[str, Field(min_length=1, max_length=1000)]
+    state: Literal["ready", "missing", "preparing", "blocked", "failed"]
+    memory_limit_bytes: Annotated[StrictInt, Field(ge=1)]
+    workspace_limit_bytes: Annotated[StrictInt, Field(ge=1)]
+    reason: ShortText | None = None
+
+
+class PreparationSubmit(Contract):
+    profile_id: ShortText
+    version: ShortText
+    manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    request_id: UUID
+
+
+class PreparationJobView(Contract):
+    id: UUID
+    project_id: UUID
+    profile_id: ShortText
+    version: ShortText
+    manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    state: Literal["queued", "building", "checking", "ready", "blocked", "failed", "unknown"]
+    stage: Literal["queued", "context", "image", "compatibility", "security", "license", "isolation", "complete", "owner_decision"]
+    error_code: ShortText | None = None
+    evidence_verified: bool = False
+
+    @model_validator(mode="after")
+    def readiness_has_evidence(self):
+        if self.state == "ready" and (not self.evidence_verified or self.stage != "complete"):
+            raise ValueError("prepared environment lacks accepted evidence")
+        return self
+
+
+class ResearchSetupView(Contract):
+    project_id: UUID
+    requirements: list[ResearchRequirementView] = Field(max_length=200)
+    profiles: list[ResearchProfileView] = Field(max_length=100)
+    connections: list[ConnectionView] = Field(max_length=100)
+    preparations: list[PreparationJobView] = Field(max_length=100)
+
+
+class RunReadinessView(Contract):
+    run_id: UUID
+    revision: Annotated[StrictInt, Field(ge=1)]
+    plan_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    binding_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    state: Literal["ready", "missing", "preparing", "blocked", "failed"]
+    requirements: list[ResearchRequirementView] = Field(max_length=200)
+
+
 class PlanReadyPayload(Contract):
     plan_digest: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
 
@@ -347,7 +442,7 @@ class DecisionSubmit(Contract):
         return self
 
 
-MODELS = (Principal, APIError, ObjectRef, PackageSpec, PeerDataRef, PeerReleaseSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
+MODELS = (ScientificBinding, ResearchRequirementView, ResearchProfileView, PreparationSubmit, PreparationJobView, ResearchSetupView, RunReadinessView, Principal, APIError, ObjectRef, PackageSpec, PeerDataRef, PeerReleaseSpec, PlanSpec, ArtifactView, PlanView, RunView, PendingDecisionView, OperationRequest, OperationResult, CheckpointManifest, ProjectView, SessionView, FileView, FindingView, CitationView, ConnectionView, MessageView, DecisionSubmit, PlanReadyPayload, RunStatePayload, StageStartedPayload, StageCompletedPayload, ArtifactReadyPayload, DecisionRequiredPayload, UsageUpdatedPayload, RunEvent)
 
 
 def _ts_type(schema: dict[str, Any]) -> str:
