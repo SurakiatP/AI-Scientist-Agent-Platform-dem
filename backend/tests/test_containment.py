@@ -341,12 +341,19 @@ def test_stale_bound_worker_is_recovered_when_exact_container_was_garbage_collec
 
     def docker(*args, **kwargs):
         commands.append(args)
-        assert args == ("ps", "-aq", "--no-trunc", "--filter", f"id={ref.container_id}")
-        return ""
+        if args == ("ps", "-aq", "--no-trunc", "--filter", f"id={ref.container_id}"):
+            return ""
+        if args[:3] == ("network", "ls", "-q"):
+            return ""
+        pytest.fail(f"unexpected engine command: {args}")
 
     monkeypatch.setattr(engine, "_docker", docker)
     assert engine.stop_worker(ref, 0) is True
-    assert commands == [("ps", "-aq", "--no-trunc", "--filter", f"id={ref.container_id}")]
+    assert commands == [
+        ("ps", "-aq", "--no-trunc", "--filter", f"id={ref.container_id}"),
+        ("network", "ls", "-q", "--no-trunc", "--filter",
+         f"name=scientist-run-{ref.run_id.hex[:12]}-g{ref.generation}"),
+    ]
 
     checks = iter(("owned-engine", "changed-engine"))
     monkeypatch.setattr(engine, "engine_id", lambda: next(checks))
@@ -371,3 +378,64 @@ def test_stop_worker_absence_proof_fails_closed_on_wrong_engine_or_inspection_er
 
     monkeypatch.setattr(engine, "_docker", inspection_error)
     assert engine.stop_worker(ref, 0) is False
+
+
+@pytest.mark.parametrize(
+    "container_present,network_problem,expected",
+    [
+        (True, None, True),
+        (False, None, True),
+        (True, "foreign", False),
+        (True, "wrong-labels", False),
+        (True, "wrong-owner", False),
+        (True, "nonempty", False),
+    ],
+)
+def test_stop_worker_cleans_only_its_exact_empty_run_network(
+    monkeypatch, container_present, network_problem, expected
+):
+    engine = DockerWorkerEngine()
+    executor_id, run_id, incarnation = supervisor.uuid4(), supervisor.uuid4(), supervisor.uuid4()
+    container_id, network_id = "a" * 64, "b" * 64
+    network_name = f"scientist-run-{run_id.hex[:12]}-g2"
+    ref = ExecutorRef(executor_id, run_id, 2, "worker", None, incarnation, "owned-engine", container_id)
+    labels = {
+        supervisor._RUN_LABEL: str(run_id),
+        supervisor._GEN_LABEL: "2",
+        supervisor._EXEC_LABEL: str(executor_id),
+    }
+    network = {"Id": network_id, "Name": network_name, "Labels": labels, "Containers": {}}
+    if network_problem == "foreign":
+        network["Name"] = "shared-services-network"
+    elif network_problem == "wrong-labels":
+        network["Labels"] = {**labels, supervisor._RUN_LABEL: str(supervisor.uuid4())}
+    elif network_problem == "wrong-owner":
+        network["Labels"] = {**labels, supervisor._EXEC_LABEL: str(supervisor.uuid4())}
+    elif network_problem == "nonempty":
+        network["Containers"] = {"e" * 64: {"Name": "still-attached"}}
+    state = {"container": container_present, "network": True}
+    calls = []
+
+    def docker(*args, **kwargs):
+        calls.append(args)
+        if args[:3] == ("ps", "-aq", "--no-trunc"):
+            return container_id if state["container"] else ""
+        if args[:2] == ("inspect", "--format"):
+            return f"{executor_id}|{container_id}|false"
+        if args[:2] == ("rm", "--force"):
+            state["container"] = False
+            return container_id
+        if args[:3] == ("network", "ls", "-q"):
+            return network_id if state["network"] else ""
+        if args[:3] == ("network", "inspect", "--format"):
+            return json.dumps(network)
+        if args[:2] == ("network", "rm"):
+            state["network"] = False
+            return network_id
+        return ""
+
+    monkeypatch.setattr(engine, "engine_id", lambda: "owned-engine")
+    monkeypatch.setattr(engine, "_docker", docker)
+    assert engine.stop_worker(ref, 0) is expected
+    assert state["network"] is not expected
+    assert any(args[:2] == ("network", "rm") for args in calls) is expected

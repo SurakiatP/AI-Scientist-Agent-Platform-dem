@@ -1124,6 +1124,14 @@ def _fence_generation(db: Session, run_id: UUID, generation: int | None, grace_s
         with ThreadPoolExecutor(max_workers=min(len(pending_rows), 8)) as pool:
             outcomes = list(pool.map(stop_one, [ref for _, ref in pending_rows]))
 
+    # The worker may still have the dispatch sibling attached during the first pass.
+    for index, ((_, ref), stopped) in enumerate(zip(pending_rows, outcomes)):
+        if ref.kind == "worker" and not stopped:
+            try:
+                outcomes[index] = bool(cfg.engine.stop_worker(ref, 0))
+            except Exception:
+                outcomes[index] = False
+
     for (row, ref), stopped in zip(pending_rows, outcomes):
         proof = {
             "source": "owned-engine-generation-fence",
@@ -1811,7 +1819,7 @@ for entry in entries:
             if not present:
                 # A stopped executor can be garbage-collected before recovery.
                 # Require exact-ID absence and a fresh same-engine check.
-                return self.engine_id() == executor.engine_id
+                return self._remove_run_network(executor)
             if present.splitlines() != [executor.container_id]:
                 return False
             labels = self._docker("inspect", "--format",
@@ -1825,9 +1833,42 @@ for entry in entries:
             # Remove the exact fenced identity; absence is checked on same engine.
             self._docker("rm", "--force", executor.container_id)
             exists = self._docker("ps", "-aq", "--no-trunc", "--filter", f"id={executor.container_id}")
-            return not exists and self.engine_id() == executor.engine_id
+            return not exists and self._remove_run_network(executor)
         except Exception:
             return False
+
+    def _remove_run_network(self, executor: ExecutorRef) -> bool:
+        if executor.kind != "worker":
+            return self.engine_id() == executor.engine_id
+        if self.engine_id() != executor.engine_id:
+            return False
+        name = f"scientist-run-{executor.run_id.hex[:12]}-g{executor.generation}"
+        ids = self._docker(
+            "network", "ls", "-q", "--no-trunc", "--filter", f"name={name}"
+        ).splitlines()
+        if not ids:
+            return self.engine_id() == executor.engine_id
+        if len(ids) != 1 or not re.fullmatch(r"[a-f0-9]{64}", ids[0]):
+            return False
+        details = json.loads(self._docker("network", "inspect", "--format", "{{json .}}", ids[0]))
+        labels = details.get("Labels")
+        if (
+            details.get("Id") != ids[0]
+            or details.get("Name") != name
+            or not isinstance(labels, dict)
+            or labels.get(_RUN_LABEL) != str(executor.run_id)
+            or labels.get(_GEN_LABEL) != str(executor.generation)
+            or labels.get(_EXEC_LABEL) != str(executor.executor_id)
+        ):
+            return False
+        endpoints = details.get("Containers")
+        if not isinstance(endpoints, dict) or endpoints:
+            return False
+        self._docker("network", "rm", ids[0])
+        remaining = self._docker(
+            "network", "ls", "-q", "--no-trunc", "--filter", f"id={ids[0]}"
+        )
+        return not remaining and self.engine_id() == executor.engine_id
 
 
 def _bootstrap_files(bootstrap: WorkerBootstrap, capability: str) -> tuple[dict[str, bytes], bytes]:

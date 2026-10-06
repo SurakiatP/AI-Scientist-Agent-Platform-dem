@@ -1115,6 +1115,33 @@ def test_fence_generation_stops_executors_concurrently_without_session(db, proje
                       ("worker", "inactive", "owned-engine-generation-fence")]
 
 
+def test_fence_generation_retries_worker_after_dispatch_stop(db, project_session, monkeypatch):
+    run, _ = _reserved_stop_run(db, project_session, monkeypatch)
+    calls = []
+    worker_graces = []
+
+    class Engine:
+        def stop_worker(self, ref, grace_seconds):
+            calls.append("worker")
+            worker_graces.append(grace_seconds)
+            return calls.count("worker") == 2
+
+    class Dispatch:
+        def stop(self, db, ref, grace_seconds):
+            calls.append("dispatch")
+            return True
+
+        def inactive(self, db, ref, operation_id):
+            return True
+
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=Engine(), dispatch=Dispatch()))
+    assert supervisor._fence_generation(db, run.run_id, 1, 17) is True
+    assert calls.count("worker") == 2
+    assert calls.count("dispatch") == 1
+    assert calls[-1] == "worker"
+    assert worker_graces == [17, 0]
+
+
 def test_fence_generation_one_failed_concurrent_stop_is_incomplete(db, project_session, monkeypatch):
     run, _ = _reserved_stop_run(db, project_session, monkeypatch)
     _slow_fence_fakes(monkeypatch, dispatch_ok=False)
