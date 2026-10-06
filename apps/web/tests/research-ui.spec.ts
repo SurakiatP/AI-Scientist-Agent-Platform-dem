@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { RunEvent } from '../../../contracts/api-types';
-import { DECISION_BUDGET, DECISION_UNKNOWN, NEW_RUN_ID, PROJECT_ID, RUN_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
+import { CONNECTION_ID, DECISION_BUDGET, DECISION_UNKNOWN, NEW_RUN_ID, PROJECT_ID, RUN_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
 
 type ChatEventSource = { url: string; closed: boolean; emit: (item: unknown) => void; fail: () => void };
 
@@ -182,6 +182,35 @@ test('an unconfirmed submission reuses its key', async ({ page }) => {
   const keys = fixture.writes.filter((w) => w.path.endsWith('/runs')).map((w) => w.body.submission_key);
   expect(keys).toHaveLength(2);
   expect(keys[0]).toBe(keys[1]);
+});
+
+test('composer waits for model readiness before allowing plan review', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: null });
+  let releaseConnections!: () => void;
+  let signalConnectionsRequested!: () => void;
+  const connectionGate = new Promise<void>((resolve) => { releaseConnections = resolve; });
+  const connectionsRequested = new Promise<void>((resolve) => { signalConnectionsRequested = resolve; });
+  await page.route('**/api/v1/connections', async (route) => {
+    signalConnectionsRequested();
+    await connectionGate;
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{
+      id: CONNECTION_ID, label: 'Fixture', provider: 'fixture-provider', model: 'fixture-model',
+      state: 'ready', has_secret: true,
+    }]) });
+  });
+
+  await page.goto(SESSION_URL);
+  await page.getByLabel('Research question').fill('Does temperature change diffusion?');
+  await connectionsRequested;
+  const reviewButton = page.getByRole('button', { name: 'Review plan' });
+  await expect(reviewButton).toBeDisabled();
+
+  releaseConnections();
+  await expect(reviewButton).toBeEnabled();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await reviewButton.click();
+  await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
+  expect(fixture.writes.filter((write) => write.path.endsWith('/runs'))).toHaveLength(1);
 });
 
 test('composer rejects empty questions and unconfigured models with next actions', async ({ page }) => {

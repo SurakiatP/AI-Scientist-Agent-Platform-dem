@@ -43,6 +43,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const [messages, setMessages] = useState<MessageView[]>([]);
   const [files, setFiles] = useState<FileView[]>([]);
   const [connections, setConnections] = useState<ConnectionView[] | null>(null);
+  const [connectionsLoading, setConnectionsLoading] = useState(true);
   const [question, setQuestion] = useState(() => readDraft(draftKey).question);
   const [selected, setSelected] = useState<string[]>(() => readDraft(draftKey).selected);
   const [workflow, setWorkflow] = useState<ResearchWorkflow>(() => readDraft(draftKey).workflow);
@@ -90,7 +91,11 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     void request<MessageView[]>(`/api/v1/sessions/${sessionId}/messages`, { signal }).then((m) => { if (!signal.aborted) setMessages(m); }).catch((reason: unknown) => { if (!signal.aborted) setError(apiErrorMessage(reason, language, 'Unable to load this conversation.')); });
     void request<FileView[]>(`${base}/files`, { signal }).then((f) => { if (!signal.aborted) setFiles(f); }).catch((reason: unknown) => { if (!signal.aborted) setError(apiErrorMessage(reason, language, 'Unable to load project files.')); });
     // TODO(contract): no connections route exists yet; failure leaves connections null ("Settings unavailable").
-    void request<ConnectionView[]>('/api/v1/connections', { signal }).then((c) => { if (!signal.aborted) setConnections(c); }).catch(() => { if (!signal.aborted) setConnections(null); });
+    void request<ConnectionView[]>('/api/v1/connections', { signal }).then((c) => {
+      if (!signal.aborted) { setConnections(c); setConnectionsLoading(false); }
+    }).catch(() => {
+      if (!signal.aborted) { setConnections(null); setConnectionsLoading(false); }
+    });
     return () => controller.abort();
   }, [base, sessionId]);
   useEffect(() => { // an explicit return target must not select another run
@@ -335,9 +340,9 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       <ul aria-label={text(language, 'Project files', 'ไฟล์ของโครงการ')}>{files.map((f) => <li key={f.id}>{f.filename} · {fileStateLabel(f.state, language)}
         {!selected.includes(f.id) && <button type="button" className="button button-quiet button-small" disabled={f.state !== 'ready'} aria-label={`${text(language, 'Add to question', 'เพิ่มในคำถาม')}: ${f.filename}`} onClick={() => setSelected((s) => [...s, f.id])}>{text(language, 'Add to question', 'เพิ่มในคำถาม')}</button>}</li>)}</ul>
       <div aria-label={text(language, 'Selected files', 'ไฟล์ที่เลือก')}>{selected.map((id) => { const name = files.find((f) => f.id === id)?.filename ?? id; return <span key={id} className="file-chip">{name}<button type="button" aria-label={`${text(language, 'Remove from question', 'นำออกจากคำถาม')}: ${name}`} onClick={() => setSelected((s) => s.filter((x) => x !== id))}>×</button></span>; })}</div>
-      {!hasModel && <p>{connections ? text(language, 'No model is ready.', 'ยังไม่มีโมเดลที่พร้อมใช้') : text(language, 'Settings unavailable.', 'การตั้งค่ายังไม่พร้อมใช้งาน')} <Link to="/settings">{text(language, 'Open Settings', 'เปิดการตั้งค่า')}</Link></p>}
+      {!connectionsLoading && !hasModel && <p>{connections ? text(language, 'No model is ready.', 'ยังไม่มีโมเดลที่พร้อมใช้') : text(language, 'Settings unavailable.', 'การตั้งค่ายังไม่พร้อมใช้งาน')} <Link to="/settings">{text(language, 'Open Settings', 'เปิดการตั้งค่า')}</Link></p>}
       {error && <p role="alert">{error}</p>}
-      <button type="button" className="button button-primary" disabled={submitting} onClick={() => void submit()}>{submitting ? text(language, 'Creating…', 'กำลังสร้าง…') : text(language, 'Review plan', 'ตรวจทานแผน')}</button>
+      <button type="button" className="button button-primary" disabled={submitting || connectionsLoading} onClick={() => void submit()}>{submitting ? text(language, 'Creating…', 'กำลังสร้าง…') : text(language, 'Review plan', 'ตรวจทานแผน')}</button>
     </section>
     {expandedArtifact && <ArtifactViewer artifact={expandedArtifact} onClose={closeOutput} language={language} />}
   </section>;
