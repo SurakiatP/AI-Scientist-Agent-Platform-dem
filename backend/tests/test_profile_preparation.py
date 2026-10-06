@@ -75,6 +75,84 @@ def test_v2_agent_acceptance_does_not_authorize_compute_profile(db, owner):
         prep.validate_binding_for_run(db, project, approved, owner=owner)
 
 
+def test_compute_proof_requires_its_configured_image_pin():
+    from types import SimpleNamespace
+
+    profiles = prep.load_profiles()
+    compute = profiles[prep.COMPUTE_PROFILE_ID]
+    job_id = uuid4()
+    raw = proof(compute, job_id)
+    raw["scan"]["python_packages"] = 0
+    raw["recipe_manifest_sha256"] = "d" * 64
+    row = SimpleNamespace(
+        id=job_id,
+        profile_id=compute.profile_id,
+        version=compute.version,
+        manifest_sha256=compute.manifest_sha256,
+    )
+    compute_pin = "sha256:" + "e" * 64
+    worker_pin = "sha256:" + "a" * 64
+    raw["image_digest"] = compute_pin
+
+    prep.configure_builder(lambda *_: raw, expected_image_digest=worker_pin, evidence_key=b"k" * 32)
+    row.evidence = {"proof": raw, "signature": prep._signature(raw)}
+    assert prep._verified(row, expected_image_digest=compute_pin) is None
+
+    prep.configure_builder(
+        lambda *_: raw,
+        expected_image_digests={prep.PROFILE_ID: worker_pin, compute.profile_id: compute_pin},
+        evidence_key=b"k" * 32,
+    )
+    row.evidence = {"proof": raw, "signature": prep._signature(raw)}
+    assert prep._verified(row).image_digest == compute_pin
+
+
+def test_profile_image_pin_configuration_rejects_unknown_and_conflicting_values():
+    with pytest.raises(ValueError, match="conflicting"):
+        prep.configure_builder(
+            lambda *_: {},
+            expected_image_digest="sha256:" + "a" * 64,
+            expected_image_digests={prep.PROFILE_ID: "sha256:" + "a" * 64},
+            evidence_key=b"k" * 32,
+        )
+    with pytest.raises(ValueError, match="invalid"):
+        prep.configure_builder(
+            lambda *_: {},
+            expected_image_digests={
+                prep.PROFILE_ID: "sha256:" + "a" * 64,
+                "prof.unknown@py3.14.7": "sha256:" + "b" * 64,
+            },
+            evidence_key=b"k" * 32,
+        )
+
+
+def test_compute_preparation_does_not_call_builder_without_compute_pin(db, owner):
+    project = new_project(db)
+    compute = prep.load_profiles()[prep.COMPUTE_PROFILE_ID]
+    calls = []
+    prep.configure_builder(
+        lambda profile, job_id: calls.append((profile.profile_id, job_id)),
+        expected_image_digests={prep.PROFILE_ID: "sha256:" + "a" * 64},
+        evidence_key=b"k" * 32,
+    )
+    job = prep.request_preparation(
+        db,
+        owner,
+        project,
+        PreparationSubmit(
+            profile_id=compute.profile_id,
+            version=compute.version,
+            manifest_sha256=compute.manifest_sha256,
+            request_id=uuid4(),
+        ),
+    )
+    db.commit()
+
+    assert prep.process_next_job(db) == job.id
+    assert calls == []
+    assert prep.get_job(db, owner, project, job.id).state == "failed"
+
+
 @pytest.mark.parametrize("compute", [False, True])
 def test_v2_readiness_reports_only_required_environment_lanes(db, owner, monkeypatch, compute):
     from types import SimpleNamespace
@@ -103,7 +181,8 @@ def test_v2_readiness_reports_only_required_environment_lanes(db, owner, monkeyp
     expected = [("model_connection", "missing"), (prep.PROFILE_ID, "ready")]
     if compute:
         expected.append(("prof.csv-stdlib@py3.14.7", "blocked"))
-    assert [(r.id, r.state) for r in readiness.requirements] == expected
+    actual = [(r.id, r.state) for r in readiness.requirements]
+    assert actual == expected, actual
 
 
 @pytest.fixture(autouse=True)

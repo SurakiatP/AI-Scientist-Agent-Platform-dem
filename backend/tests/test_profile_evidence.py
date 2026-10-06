@@ -4,6 +4,7 @@ from hashlib import sha256
 import hmac
 import json
 import os
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -38,9 +39,9 @@ def synthetic_proof(profile):
                                  isolation_test_sha256="e" * 64))
 
 
-def sign(directory, payload, key=KEY):
+def sign(directory, payload, key=KEY, domain=evidence.DOMAIN):
     """Fixture signing only; production exposes no acceptance/sealing function."""
-    signature = hmac.digest(key, evidence.DOMAIN + evidence._bytes(payload), "sha256").hex()
+    signature = hmac.digest(key, domain + evidence._bytes(payload), "sha256").hex()
     (directory / "accepted.json").write_bytes(evidence._bytes({**payload, "signature": signature}))
 
 
@@ -209,6 +210,116 @@ def test_invalid_receipt_or_directory_rejected(accepted, action, monkeypatch):
 def test_factory_rejects_invalid_trusted_configuration(tmp_path, key, image):
     with pytest.raises(ValueError):
         evidence.accepted_image_builder(tmp_path, key=key, expected_image_digest=image)
+
+
+def test_compute_receipt_uses_its_pin_sources_and_staged_recipe_manifest(tmp_path):
+    profiles = prep.load_profiles()
+    worker = profiles[prep.PROFILE_ID]
+    profile = profiles[prep.COMPUTE_PROFILE_ID]
+    root = Path(__file__).resolve().parents[2]
+    worker_dir = tmp_path / "profiles"
+    compute_dir = tmp_path / "compute-profiles"
+    worker_dir.mkdir(mode=0o700)
+    compute_dir.mkdir(mode=0o700)
+    recipe_names = ("csv_describe.py", "cpu_recipes.py", "scientific_render.py")
+    source_names = (
+        "runtime/compute_entrypoint.py",
+        "backend/src/scientist/cpu_recipes.py",
+        "backend/src/scientist/scientific_render.py",
+    )
+    source_hashes = {
+        name: sha256((root / name).read_bytes()).hexdigest() for name in source_names
+    }
+    manifest = {
+        "schema_version": 1,
+        "files": [
+            {"name": recipe_name, "sha256": source_hashes[source_name]}
+            for recipe_name, source_name in zip(recipe_names, source_names, strict=True)
+        ],
+    }
+    manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("ascii")
+    artifacts = {
+        "source.json": json.dumps(source_hashes, sort_keys=True).encode(),
+        "scan.json": b"scan evidence",
+        "sbom.json": b"stdlib-only SBOM",
+        "isolation.json": b"compute containment",
+        "recipe-manifest.json": manifest_bytes,
+    }
+    for name, content in artifacts.items():
+        (compute_dir / name).write_bytes(content)
+    digests = {name: sha256(content).hexdigest() for name, content in artifacts.items()}
+    now = datetime.now(timezone.utc)
+    proof = synthetic_proof(profile)
+    proof.update(
+        job_id=str(uuid4()),
+        recipe_manifest_sha256=sha256(manifest_bytes).hexdigest(),
+        source_manifest_sha256=digests["source.json"],
+        sbom_sha256=digests["sbom.json"],
+        scan={
+            "report_sha256": digests["scan.json"],
+            "scanned_at": now.isoformat(),
+            "database_updated_at": (now - timedelta(hours=1)).isoformat(),
+            "database_next_update": (now + timedelta(hours=12)).isoformat(),
+            "high": 0,
+            "critical": 0,
+            "os_packages": 14,
+            "python_packages": 0,
+        },
+        containment={**proof["containment"], "isolation_test_sha256": digests["isolation.json"]},
+    )
+    payload = {
+        "proof": proof,
+        "files": digests,
+        "source_sha256": source_hashes,
+    }
+    sign(compute_dir, payload, domain=b"scientist.accepted-compute.v1\0")
+    accepted = evidence.accepted_image_builder(
+        {worker.profile_id: worker_dir, profile.profile_id: compute_dir},
+        key=KEY,
+        expected_image_digests={worker.profile_id: IMAGE, profile.profile_id: IMAGE},
+        source_root=root,
+    )
+    result = accepted(profile, uuid4())
+    assert result["image_digest"] == IMAGE
+    assert result["recipe_manifest_sha256"] == sha256(manifest_bytes).hexdigest()
+
+    wrong_pin = evidence.accepted_image_builder(
+        {worker.profile_id: worker_dir, profile.profile_id: compute_dir},
+        key=KEY,
+        expected_image_digests={
+            worker.profile_id: IMAGE,
+            profile.profile_id: "sha256:" + "f" * 64,
+        },
+        source_root=root,
+    )
+    with pytest.raises(prep.BuildFailure):
+        wrong_pin(profile, uuid4())
+
+    manifest_path = compute_dir / "recipe-manifest.json"
+    manifest_path.unlink()
+    with pytest.raises(prep.BuildFailure):
+        accepted(profile, uuid4())
+    manifest_path.write_bytes(manifest_bytes + b" ")
+    with pytest.raises(prep.BuildFailure):
+        accepted(profile, uuid4())
+
+
+def test_agent_receipt_cannot_authorize_compute_profile(accepted, tmp_path):
+    agent_dir, root, _, _ = accepted
+    compute_dir = tmp_path / "compute-profiles"
+    compute_dir.mkdir(mode=0o700)
+    (compute_dir / "accepted.json").write_bytes((agent_dir / "accepted.json").read_bytes())
+    profiles = prep.load_profiles()
+    worker = profiles[prep.PROFILE_ID]
+    compute = profiles[prep.COMPUTE_PROFILE_ID]
+    builder = evidence.accepted_image_builder(
+        {worker.profile_id: agent_dir, compute.profile_id: compute_dir},
+        key=KEY,
+        expected_image_digests={worker.profile_id: IMAGE, compute.profile_id: IMAGE},
+        source_root=root,
+    )
+    with pytest.raises(prep.BuildFailure, match="accepted_environment_unavailable"):
+        builder(compute, uuid4())
 
 
 def test_deployed_registry_fallback_is_fixed_and_hash_bound(accepted):

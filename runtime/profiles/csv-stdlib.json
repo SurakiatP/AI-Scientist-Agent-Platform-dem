@@ -1,0 +1,21 @@
+{
+  "architecture": "linux/arm64",
+  "catalog_commit": "154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+  "compatibility_checks": [
+    "python_version",
+    "csv_describe_recipe"
+  ],
+  "label": "CSV descriptive statistics",
+  "lock_sha256": {},
+  "max_result_bytes": 262144,
+  "memory_limit_bytes": 1073741824,
+  "profile_id": "prof.csv-stdlib@py3.14.7",
+  "purpose": "Describe one approved CSV input with the pinned standard-library recipe.",
+  "python_version": "3.14.7",
+  "runtime_commit": "bd0affe5e5f723579df8902852f5d0c47795f355",
+  "schema_version": 1,
+  "skills_manifest_sha256": "c58bdcdc9cf3587b4efb001bad92be7a27725c2589a3b5fba00a16146fbb3989",
+  "timeout_ms": 30000,
+  "version": "1",
+  "workspace_limit_bytes": 67108864
+}

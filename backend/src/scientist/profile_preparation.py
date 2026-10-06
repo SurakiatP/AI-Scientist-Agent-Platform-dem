@@ -7,7 +7,7 @@ import hmac
 import json
 import re
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Callable, Literal
+from typing import Annotated, Callable, Literal, Mapping
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
@@ -22,6 +22,7 @@ from scientist.contracts import (PreparationJobView, PreparationSubmit, Principa
 
 ROOT = Path(__file__).resolve().parents[3]
 PROFILE_ID = "prof.worker-base@py3.14.7"
+COMPUTE_PROFILE_ID = "prof.csv-stdlib@py3.14.7"
 _SHA = r"^[a-f0-9]{64}$"
 _IMAGE_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 Digest = Annotated[str, Field(pattern=_SHA)]
@@ -29,6 +30,7 @@ Positive = Annotated[StrictInt, Field(ge=1)]
 _builder: Callable[["Profile", UUID], dict] | None = None
 _evidence_key: bytes | None = None
 _expected_image_digest: str | None = None
+_expected_image_digests: dict[str, str] | None = None
 
 
 class _Record(BaseModel):
@@ -37,7 +39,7 @@ class _Record(BaseModel):
 
 class Profile(_Record):
     schema_version: Literal[1]
-    profile_id: Literal["prof.worker-base@py3.14.7"]
+    profile_id: Literal["prof.worker-base@py3.14.7", "prof.csv-stdlib@py3.14.7"]
     version: Literal["1"]
     label: str = Field(min_length=1, max_length=200)
     purpose: str = Field(min_length=1, max_length=1000)
@@ -63,7 +65,7 @@ class ScanProof(_Record):
     high: Annotated[StrictInt, Field(ge=0, le=0)]
     critical: Annotated[StrictInt, Field(ge=0, le=0)]
     os_packages: Positive
-    python_packages: Positive
+    python_packages: Annotated[StrictInt, Field(ge=0, le=10000)]
 
 
 class ContainmentProof(_Record):
@@ -98,6 +100,7 @@ class BuildProof(_Record):
     built_at: datetime
     checked_at: datetime
     source_manifest_sha256: Digest
+    recipe_manifest_sha256: Digest | None = None
     build_network: Literal["none"]
     compatibility_checks: list[str] = Field(max_length=20)
     scan: ScanProof
@@ -121,34 +124,45 @@ def _bytes(value) -> bytes:
 
 
 def load_profiles(root: Path = ROOT) -> dict[str, Profile]:
-    """Read the sole reviewed profile and locks; no installation or discovery."""
+    """Read the two reviewed profile locks; no installation or discovery."""
     try:
-        path = root / "runtime/profiles/worker-base.json"
-        if any(part.is_symlink() for part in (path, path.parent, root / "runtime")) or path.stat().st_size > 65536:
-            raise ValueError("unsafe profile")
-        raw = json.loads(path.read_bytes())
-        if not isinstance(raw, dict) or "manifest_sha256" in raw:
-            raise ValueError("invalid manifest")
-        profile = Profile.model_validate({**raw, "manifest_sha256": sha256(_bytes(raw)).hexdigest()})
-        skills = root / "runtime/skills-manifest.json"
-        if skills.is_symlink() or not skills.is_file() or skills.stat().st_size > 16777216:
-            raise ValueError("unsafe bundle manifest")
-        if sha256(skills.read_bytes()).hexdigest() != profile.skills_manifest_sha256:
-            raise ValueError("bundle manifest drift")
-        if set(profile.lock_sha256) != {"runtime/requirements.lock"}:
-            raise ValueError("unreviewed locks")
-        for relative, expected in profile.lock_sha256.items():
-            parts = PurePosixPath(relative).parts
-            if not parts or any(part in {".", ".."} for part in parts):
-                raise ValueError("invalid lock")
-            target = root
-            for part in parts:
-                target /= part
-                if target.is_symlink():
-                    raise ValueError("unsafe lock")
-            if not target.is_file() or target.stat().st_size > 1048576 or sha256(target.read_bytes()).hexdigest() != expected:
-                raise ValueError("lock drift")
-        return {profile.profile_id: profile}
+        profiles: dict[str, Profile] = {}
+        for filename, profile_id in (
+            ("worker-base.json", PROFILE_ID),
+            ("csv-stdlib.json", COMPUTE_PROFILE_ID),
+        ):
+            path = root / "runtime/profiles" / filename
+            if any(part.is_symlink() for part in (path, path.parent, root / "runtime")) or path.stat().st_size > 65536:
+                raise ValueError("unsafe profile")
+            raw = json.loads(path.read_bytes())
+            if not isinstance(raw, dict) or "manifest_sha256" in raw:
+                raise ValueError("invalid manifest")
+            profile = Profile.model_validate({**raw, "manifest_sha256": sha256(_bytes(raw)).hexdigest()})
+            if profile.profile_id != profile_id:
+                raise ValueError("profile filename mismatch")
+            if profile_id == PROFILE_ID:
+                skills = root / "runtime/skills-manifest.json"
+                if skills.is_symlink() or not skills.is_file() or skills.stat().st_size > 16777216:
+                    raise ValueError("unsafe bundle manifest")
+                if sha256(skills.read_bytes()).hexdigest() != profile.skills_manifest_sha256:
+                    raise ValueError("bundle manifest drift")
+                if set(profile.lock_sha256) != {"runtime/requirements.lock"}:
+                    raise ValueError("unreviewed locks")
+            elif profile.lock_sha256:
+                raise ValueError("stdlib profile must not declare package locks")
+            for relative, expected in profile.lock_sha256.items():
+                parts = PurePosixPath(relative).parts
+                if not parts or any(part in {".", ".."} for part in parts):
+                    raise ValueError("invalid lock")
+                target = root
+                for part in parts:
+                    target /= part
+                    if target.is_symlink():
+                        raise ValueError("unsafe lock")
+                if not target.is_file() or target.stat().st_size > 1048576 or sha256(target.read_bytes()).hexdigest() != expected:
+                    raise ValueError("lock drift")
+            profiles[profile.profile_id] = profile
+        return profiles
     except (OSError, ValueError, TypeError) as exc:
         raise DomainError("profile_configuration_unavailable", 503) from exc
 
@@ -165,6 +179,7 @@ def configure_builder(
     callback: Callable[[Profile, UUID], dict] | None,
     *,
     expected_image_digest: str | None = None,
+    expected_image_digests: Mapping[str, str] | None = None,
     evidence_key: bytes | None = None,
 ) -> None:
     """Trusted host only. Reuse a private host key; never accept it through owner APIs.
@@ -173,7 +188,19 @@ def configure_builder(
     build/scan/SBOM/license/isolation files before returning their proof summaries.
     No callback is configured by imports or by a setup/read/preparation request.
     """
-    global _builder, _expected_image_digest
+    global _builder, _expected_image_digest, _expected_image_digests
+    if expected_image_digest is not None and expected_image_digests is not None:
+        raise ValueError("conflicting image pin configuration")
+    image_digests = None
+    if expected_image_digests is not None:
+        if (not isinstance(expected_image_digests, Mapping)
+                or PROFILE_ID not in expected_image_digests
+                or set(expected_image_digests) - {PROFILE_ID, COMPUTE_PROFILE_ID}):
+            raise ValueError("profile image digests are invalid")
+        image_digests = dict(expected_image_digests)
+        if any(not isinstance(value, str) or _IMAGE_DIGEST.fullmatch(value) is None
+               for value in image_digests.values()):
+            raise ValueError("profile image digest is invalid")
     if callback is not None and (not callable(callback) or evidence_key is None):
         raise ValueError("trusted builder requires evidence authentication")
     if expected_image_digest is not None and (
@@ -185,7 +212,8 @@ def configure_builder(
         raise ValueError("preparation evidence key is invalid")
     configure_evidence_key(evidence_key)
     _builder = callback
-    _expected_image_digest = expected_image_digest
+    _expected_image_digest = expected_image_digest if image_digests is None else None
+    _expected_image_digests = image_digests
 
 
 def _owner_project(db: Session, owner: Principal, project_id: UUID) -> None:
@@ -221,6 +249,11 @@ def _validate_proof(raw: dict, profile: Profile, job_id: UUID) -> BuildProof:
             and proof.scan.database_updated_at <= proof.scan.scanned_at < proof.scan.database_next_update
             and proof.scan.database_next_update > now):
         raise ValueError("evidence is stale")
+    if profile.profile_id == COMPUTE_PROFILE_ID:
+        if proof.scan.python_packages != 0 or proof.recipe_manifest_sha256 is None:
+            raise ValueError("compute proof must bind its stdlib recipe")
+    elif proof.scan.python_packages == 0 or proof.recipe_manifest_sha256 is not None:
+        raise ValueError("worker proof package count is invalid")
     containment = proof.containment
     if (not proof.license_approved or not all(getattr(containment, name) for name in (
             "read_only", "cap_drop_all", "docker_socket_absent", "unrelated_host_mounts_absent",
@@ -239,7 +272,15 @@ def _signature(proof: dict) -> str:
 
 def _verified(row, *, expected_image_digest: str | None = None) -> BuildProof | None:
     try:
-        expected = _expected_image_digest if expected_image_digest is None else expected_image_digest
+        profile = _profile(row.profile_id, row.version, row.manifest_sha256.strip())
+        if _expected_image_digests is not None:
+            expected = _expected_image_digests.get(profile.profile_id)
+            if expected is None or (expected_image_digest is not None and expected_image_digest != expected):
+                return None
+        elif profile.profile_id == PROFILE_ID:
+            expected = _expected_image_digest if expected_image_digest is None else expected_image_digest
+        else:
+            return None
         if not isinstance(expected, str) or _IMAGE_DIGEST.fullmatch(expected) is None:
             return None
         envelope = row.evidence
@@ -247,9 +288,7 @@ def _verified(row, *, expected_image_digest: str | None = None) -> BuildProof | 
             return None
         if not hmac.compare_digest(_signature(envelope["proof"]), envelope["signature"]):
             return None
-        proof = _validate_proof(
-            envelope["proof"], _profile(row.profile_id, row.version, row.manifest_sha256.strip()), row.id
-        )
+        proof = _validate_proof(envelope["proof"], profile, row.id)
         if proof.image_digest != expected:
             return None
         return proof
@@ -422,6 +461,8 @@ def get_readiness(db: Session, owner: Principal, run_id: UUID) -> RunReadinessVi
                     state="blocked", reason="profile_not_configured", action="request_approval"))
                 continue
             state, reason = _state(_latest(db, owner, profile), expected_image_digest=image_digest)
+            if profile_id == COMPUTE_PROFILE_ID and state == "missing":
+                state, reason = "blocked", "environment_not_prepared"
             if state == "ready" and not isinstance(binding, ScientificBindingV2):
                 try:
                     validate_binding_for_run(db, run.project_id, binding, owner=owner)
@@ -473,6 +514,9 @@ def process_next_job(db: Session, *, owner_identity: UUID | None = None) -> UUID
     if _builder is not None and _evidence_key is not None:
         try:
             profile = _profile(row.profile_id, row.version, row.manifest_sha256.strip())
+            if (_expected_image_digests is not None and profile.profile_id not in _expected_image_digests
+                    or _expected_image_digests is None and profile.profile_id != PROFILE_ID):
+                raise BuildFailure("profile image pin is unavailable")
             raw = _builder(profile, row.id)
         except BuildFailure:
             state, stage, error = "failed", "image", "preparation_failed"
@@ -480,7 +524,13 @@ def process_next_job(db: Session, *, owner_identity: UUID | None = None) -> UUID
             state, stage, error = "unknown", "owner_decision", "preparation_outcome_unknown"
         else:
             try:
-                proof = _validate_proof(raw, profile, row.id).model_dump(mode="json")
+                validated = _validate_proof(raw, profile, row.id)
+                expected = (_expected_image_digests.get(profile.profile_id)
+                            if _expected_image_digests is not None
+                            else _expected_image_digest if profile.profile_id == PROFILE_ID else None)
+                if expected is None:
+                    raise ValueError("image pin is unavailable")
+                proof = validated.model_dump(mode="json")
                 evidence = {"proof": proof, "signature": _signature(proof)}
                 state, stage, error = "ready", "complete", None
             except (ValueError, TypeError):
