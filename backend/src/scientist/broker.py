@@ -726,9 +726,10 @@ def _validate_scope(db: Session, project_id: UUID, plan: PlanSpec, request: Oper
         except (TypeError, ValueError) as exc:
             raise DomainError("forbidden", 400) from exc
         recipient = "https://api.crossref.org/works"
-        if approved is None or query != approved or recipient not in plan.data_recipients:
+        if approved is None or query != approved:
             raise DomainError("forbidden", 403)
-        _approved_recipient(plan, recipient)
+        # Scientific plans authorize HTTPS origins; the Crossref path remains fixed here.
+        _validate_url(recipient, plan.data_recipients)
         from scientist.scholarly_retrieval import build_crossref_url
         return DispatchTarget("search", build_crossref_url(approved), tuple(plan.data_recipients))
     if request.kind == "compute":

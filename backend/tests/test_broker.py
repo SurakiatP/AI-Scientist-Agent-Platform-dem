@@ -1571,13 +1571,19 @@ def test_scientific_scope_requires_exact_approved_crossref_and_compute_bindings(
     )
     plan = plan.model_copy(update={
         "scientific": binding, "allowed_ops": ["search", "compute"],
-        "data_recipients": ["https://api.crossref.org/works"],
+        "data_recipients": ["https://api.crossref.org"],
     })
 
     search = request(run_id, "approved-crossref", reserve_tokens=0).model_copy(update={
         "kind": "search", "payload": {"request_id": "request-1", "query": query.model_dump(mode="json")},
     })
     assert broker._validate_scope(db, project_id, plan, search).url == crossref_url
+    with pytest.raises(DomainError, match="forbidden"):
+        broker._validate_scope(
+            db, project_id,
+            plan.model_copy(update={"data_recipients": ["https://attacker.example"]}),
+            search,
+        )
     forged_search = search.model_copy(update={"payload": {"request_id": "request-1", "query": {**query.model_dump(mode="json"), "doi": "10.1234/forged"}}})
     with pytest.raises(DomainError, match="forbidden"):
         broker._validate_scope(db, project_id, plan, forged_search)
