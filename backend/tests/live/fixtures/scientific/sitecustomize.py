@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import socket
 import sys
 import time
 from pathlib import Path
@@ -178,6 +180,16 @@ def _diagnose(status, code, response=None, *, controller_called=None, observed_d
 
 
 def _synthetic_model(request, target):
+    _stall_targeted_operation(request)
+    tools = request.payload.get("tools") if isinstance(request.payload, dict) else None
+    names = {
+        item.get("function", {}).get("name")
+        for item in tools or []
+        if isinstance(item, dict) and isinstance(item.get("function"), dict)
+    }
+    if _W2_TOOL_NAMES <= names:
+        stage, message, finish = _w2_stage(request, target)
+        return _w2_response(request, stage, message, finish)
     stage = _stage(request, target)
     from sqlalchemy import text
     from scientist import db
@@ -193,6 +205,34 @@ def _synthetic_model(request, target):
     if inserted != 1:
         raise RuntimeError("scientific fixture rejected a repeated stage identity")
     return _response(stage)
+
+
+def _stall_targeted_operation(request):
+    from sqlalchemy import text
+    from scientist import db
+
+    with db.session() as session:
+        target_table = session.execute(text("SELECT to_regclass('w2_fixture_stall_targets')")).scalar_one()
+        if target_table is None:
+            return
+        targeted = session.execute(
+            text("SELECT 1 FROM w2_fixture_stall_targets WHERE run_id=:run FOR UPDATE"),
+            {"run": request.run_id},
+        ).scalar_one_or_none()
+        if targeted is None:
+            return
+        session.execute(text("""CREATE TABLE IF NOT EXISTS w2_fixture_stalls (
+            run_id uuid PRIMARY KEY, operation_id text NOT NULL,
+            started_at timestamptz NOT NULL DEFAULT clock_timestamp())"""))
+        inserted = session.execute(text("""INSERT INTO w2_fixture_stalls(run_id, operation_id)
+            VALUES (:run, :operation) ON CONFLICT (run_id) DO NOTHING"""),
+            {"run": request.run_id, "operation": request.operation_id},
+        ).rowcount
+        session.commit()
+        if inserted != 1:
+            raise RuntimeError("W2 fixture stall target was already consumed")
+    time.sleep(120)
+    raise TimeoutError("W2 fixture stopped before the provider response")
 
 
 class _BoundaryAckBarrier:
@@ -288,9 +328,14 @@ class _BoundaryAckBarrier:
 
 
 def _synthetic_resolver(host, port):
-    if type(host) is not str or host != "research.example" or type(port) is not int or port != 443:
+    if type(host) is not str or type(port) is not int or port != 443:
         raise OSError("scientific fixture resolver rejects target")
-    return ["93.184.216.34"]
+    if host == "research.example":
+        return ["93.184.216.34"]
+    if host == "api.crossref.org":
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        return list(dict.fromkeys(item[4][0] for item in addresses))
+    raise OSError("scientific fixture resolver rejects target")
 
 
 def _with_fixture(app, *args, **kwargs):
@@ -348,8 +393,9 @@ def _with_fixture(app, *args, **kwargs):
                                       file=sys.stderr, flush=True)
                             except Exception:
                                 pass
-                        raise
 
+
+                        raise
                 controller.boundary = observed_boundary
                 if controller.boundary is not observed_boundary:
                     controller.boundary = original
@@ -369,3 +415,177 @@ def _with_fixture(app, *args, **kwargs):
 
 
 uvicorn.run = _with_fixture
+
+_W2_TOOL_NAMES = {"scientific_search", "scientific_csv_describe"}
+_W2_INSTRUCTION = "instruction_view"
+_W2_ALL_TOOL_NAMES = _W2_TOOL_NAMES | {_W2_INSTRUCTION}
+_W2_INSTRUCTION_CAPABILITIES = ["paper-lookup", "exploratory-data-analysis"]
+_W2_MIN_INSTRUCTION_CHARS = 256
+
+
+def _w2_tool_ids(request):
+    """Require both V2 tools in the bytes sent to the synthetic provider."""
+    payload = request.payload
+    tools = payload.get("tools") if isinstance(payload, dict) else None
+    if not isinstance(tools, list):
+        raise RuntimeError("W2 fixture expected serialized native tools")
+    definitions = {}
+    for item in tools:
+        if not isinstance(item, dict) or item.get("type") != "function":
+            continue
+        function = item.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            definitions[function["name"]] = function
+    if not _W2_ALL_TOOL_NAMES <= set(definitions):
+        raise RuntimeError("W2 serialized native or instruction tools are incomplete")
+    expected = {
+        "instruction_view": ("capability_id", _W2_INSTRUCTION_CAPABILITIES),
+        "scientific_search": ("request_id", ["crossref"]),
+        "scientific_csv_describe": ("grant_id", ["csv_describe"]),
+    }
+    for name, (argument, identifiers) in expected.items():
+        schema = definitions[name].get("parameters")
+        if (
+            not isinstance(schema, dict)
+            or schema.get("type") != "object"
+            or schema.get("additionalProperties") is not False
+            or schema.get("required") != [argument]
+            or schema.get("properties") != {argument: {"type": "string", "enum": identifiers}}
+        ):
+            raise RuntimeError("W2 serialized native tool schema differs approved binding")
+    return definitions
+
+
+def _w2_stage(request, target):
+    if (
+        request.kind != "llm"
+        or target.url != "https://research.example"
+        or request.payload.get("model") != "fixture"
+    ):
+        raise RuntimeError("W2 fixture rejected an unexpected provider operation")
+    _w2_tool_ids(request)
+    messages = request.payload.get("messages")
+    if not isinstance(messages, list):
+        raise RuntimeError("W2 fixture expected serialized native message history")
+    calls = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls", []):
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            if name in _W2_ALL_TOOL_NAMES:
+                calls.append((call.get("id"), name))
+    tool_messages = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
+    tool_ids = [m.get("tool_call_id") for m in tool_messages]
+    if len(tool_ids) != len(set(tool_ids)) or any(not isinstance(item, str) for item in tool_ids):
+        raise RuntimeError("W2 fixture rejected invalid native tool response identities")
+    run_id = str(request.run_id)
+    instruction_id = f"call_w2_instruction_{run_id.replace('-', '')}"
+    search_id = f"call_w2_search_{run_id.replace('-', '')}"
+    compute_id = f"call_w2_compute_{run_id.replace('-', '')}"
+    all_tool_ids = [item for item in tool_ids if item in {instruction_id, search_id, compute_id}]
+    if instruction_id in all_tool_ids:
+        instruction = next((m.get("content") for m in tool_messages if m.get("tool_call_id") == instruction_id), None)
+        if not isinstance(instruction, str) or len(instruction.strip()) < _W2_MIN_INSTRUCTION_CHARS:
+            raise RuntimeError("W2 fixture did not receive the selected EDA instruction text")
+    if not calls:
+        stage = "instruction"
+        message = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": instruction_id, "type": "function",
+                "function": {
+                    "name": "instruction_view",
+                    "arguments": '{"capability_id":"exploratory-data-analysis"}',
+                },
+            }],
+        }
+        finish = "tool_calls"
+    elif calls == [(instruction_id, _W2_INSTRUCTION)] and all_tool_ids == [instruction_id]:
+        stage = "search"
+        message = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": search_id, "type": "function",
+                "function": {"name": "scientific_search", "arguments": '{"request_id":"crossref"}'},
+            }],
+        }
+        finish = "tool_calls"
+    elif (
+        calls == [(instruction_id, _W2_INSTRUCTION), (search_id, "scientific_search")]
+        and all_tool_ids == [instruction_id, search_id]
+    ):
+        stage = "compute"
+        message = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": compute_id, "type": "function",
+                "function": {"name": "scientific_csv_describe", "arguments": '{"grant_id":"csv_describe"}'},
+            }],
+        }
+        finish = "tool_calls"
+    elif (
+        calls == [
+            (instruction_id, _W2_INSTRUCTION),
+            (search_id, "scientific_search"),
+            (compute_id, "scientific_csv_describe"),
+        ]
+        and all_tool_ids == [instruction_id, search_id, compute_id]
+    ):
+        stage = "final"
+        message = {
+            "role": "assistant",
+            "content": "Crossref metadata and the approved CSV summary are ready for review.",
+        }
+        finish = "stop"
+    else:
+        raise RuntimeError("W2 fixture rejected duplicate or out-of-order bridge calls")
+    return stage, message, finish
+
+
+def _w2_response(request, stage, message, finish):
+    from scientist.db import session
+    from sqlalchemy import text
+
+    descriptors = _w2_tool_ids(request)
+    descriptor_names = sorted(_W2_TOOL_NAMES & set(descriptors))
+    tool_digest = hashlib.sha256(json.dumps(
+        [{"name": name, "parameters": descriptors[name].get("parameters")}
+         for name in descriptor_names], sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    with session() as db:
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS w2_scientific_fixture_attempts (
+                run_id uuid NOT NULL,
+                stage text NOT NULL,
+                operation_id text NOT NULL,
+                native_tools_sha256 char(64) NOT NULL,
+                attempted_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (run_id, stage)
+            )
+        """))
+        inserted = db.execute(text("""
+            INSERT INTO w2_scientific_fixture_attempts
+                (run_id, stage, operation_id, native_tools_sha256)
+            VALUES (:run, :stage, :operation, :tools_hash)
+            ON CONFLICT DO NOTHING
+        """), {
+            "run": request.run_id,
+            "stage": stage,
+            "operation": request.operation_id,
+            "tools_hash": tool_digest,
+        }).rowcount
+        db.commit()
+    if inserted != 1:
+        raise RuntimeError("W2 fixture refused a repeated provider stage")
+    return json.dumps({
+        "id": f"w2-{stage}-{str(request.run_id).replace('-', '')}",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "fixture",
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }, separators=(",", ":")).encode(), 2

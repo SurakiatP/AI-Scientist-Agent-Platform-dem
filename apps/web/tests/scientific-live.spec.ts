@@ -9,9 +9,8 @@ const proofFile = process.env.SCIENTIFIC_W1_PROOF;
 const evidenceFile = process.env.SCIENTIFIC_W1_BROWSER_EVIDENCE;
 const enabled = Boolean(bootstrapFile && proofFile && evidenceFile && process.env.SCIENTIFIC_W1_API_ORIGIN && process.env.SCIENTIFIC_W1_PYTHON);
 
-test.skip(!enabled, 'NOT RUN: dedicated W1 owner bootstrap, host, and evidence paths are required');
-
 test('real owner browser completes and presents the approved resource measurement', async ({ page, baseURL }) => {
+  test.skip(!enabled, 'NOT RUN: dedicated W1 owner bootstrap, host, and evidence paths are required');
   test.setTimeout(600_000);
   const proof = JSON.parse(await readFile(proofFile!, 'utf8')) as {
     project_id: string; session_id: string; run_id: string;
@@ -163,4 +162,243 @@ test('real owner browser completes and presents the approved resource measuremen
     encoding: 'utf8', timeout: 60_000, env: process.env,
   });
   if (readback.error || readback.status !== 0) throw new Error('browser artifact DB/S3 readback failed');
+});
+
+const w2BootstrapFile = process.env.SCIENTIFIC_W2_OWNER_BOOTSTRAP_FILE;
+const w2ProofFile = process.env.SCIENTIFIC_W2_PROOF;
+const w2EvidenceFile = process.env.SCIENTIFIC_W2_BROWSER_EVIDENCE;
+const w2Origin = process.env.SCIENTIFIC_W2_API_ORIGIN;
+const w2Python = process.env.SCIENTIFIC_W2_PYTHON;
+const w2CsvFixture = process.env.SCIENTIFIC_W2_CSV_FIXTURE;
+const w2Enabled = Boolean(w2BootstrapFile && w2ProofFile && w2EvidenceFile && w2Origin && w2Python && w2CsvFixture);
+
+test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes four compute outputs', async ({ page }) => {
+  test.skip(!w2Enabled, 'NOT RUN: dedicated W2 owner bootstrap, host, and evidence paths are required');
+  test.setTimeout(600_000);
+  const proof = JSON.parse(await readFile(w2ProofFile!, 'utf8')) as {
+    project_id: string; session_id: string; compute_image_digest: string;
+    compute_recipe_manifest_sha256: string; source_hashes: { csv_fixture_sha256: string };
+  };
+  const csvBytes = await readFile(w2CsvFixture!);
+  const csvSha256 = createHash('sha256').update(csvBytes).digest('hex');
+  if (proof.source_hashes.csv_fixture_sha256 !== csvSha256) throw new Error('W2 CSV fixture differs its prepared hash');
+  const bootstrapUrl = (await readFile(w2BootstrapFile!, 'utf8')).trim();
+  const origin = new URL(w2Origin!).origin;
+  const gotoHost = (pathname: string) => page.goto(new URL(pathname, origin).toString());
+  const bootstrap = new URL(bootstrapUrl);
+  if (bootstrap.origin !== origin || !bootstrap.hash.startsWith('#bootstrap=')) {
+    throw new Error('fresh W2 owner bootstrap does not match the configured same-origin host');
+  }
+  try {
+    await page.goto(bootstrapUrl);
+    await expect.poll(() => page.evaluate(() => location.hash.length === 0), { timeout: 20_000 }).toBe(true);
+  } catch {
+    await page.goto(origin).catch(() => undefined);
+    throw new Error('W2 owner bootstrap did not complete and clear its fragment');
+  }
+  if (new URL(page.url()).origin !== origin) throw new Error('W2 owner bootstrap navigated away from the actual host');
+  await page.getByRole('button', { name: 'EN' }).click();
+
+  await gotoHost(`/projects/${encodeURIComponent(proof.project_id)}/library`);
+  await expect(page.getByRole('heading', { name: 'Sources & outputs' })).toBeVisible();
+  await page.locator('#library-upload').setInputFiles(w2CsvFixture!);
+  await expect.poll(async () => page.evaluate(async (projectId) => {
+    const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/files`, { credentials: 'same-origin' });
+    if (!response.ok) return null;
+    const files = await response.json() as Array<{ id: string; filename: string; content_type: string; state: string }>;
+    return files.find((file) => file.filename === 'w2_partial.csv') ?? null;
+  }, proof.project_id), { timeout: 60_000 }).toBeTruthy();
+  const file = await page.evaluate(async (projectId) => {
+    const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/files`, { credentials: 'same-origin' });
+    if (!response.ok) throw new Error('W2 uploaded file list could not be read');
+    const files = await response.json() as Array<{ id: string; filename: string; content_type: string; state: string }>;
+    return files.find((item) => item.filename === 'w2_partial.csv') ?? null;
+  }, proof.project_id) as { id: string; filename: string; content_type: string; state: string } | null;
+  if (!file || file.content_type.split(';')[0].trim().toLowerCase() !== 'text/csv') {
+    throw new Error('W2 upload did not create the expected text/csv input');
+  }
+  await expect.poll(async () => page.evaluate(async ({ projectId, fileId }) => {
+    const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/files`, { credentials: 'same-origin' });
+    if (!response.ok) return false;
+    const files = await response.json() as Array<{ id: string; state: string }>;
+    return files.find((item) => item.id === fileId)?.state === 'ready';
+  }, { projectId: proof.project_id, fileId: file.id }), { timeout: 60_000 }).toBe(true);
+
+  await gotoHost(`/projects/${encodeURIComponent(proof.project_id)}/sessions/${encodeURIComponent(proof.session_id)}`);
+  await expect(page.getByRole('heading', { name: 'Research chat' })).toBeVisible();
+  await page.getByLabel('Research question').fill('Compare Crossref records about coastal nitrate monitoring with the selected CSV measurements.');
+  await page.getByLabel('Research workflow').selectOption('crossref_csv');
+  await page.getByLabel('Crossref query').fill('coastal nitrate monitoring');
+  await page.getByLabel('CSV input file').selectOption(file.id);
+  await page.getByLabel('Numeric columns').fill('temperature_c,nitrate_mg_l');
+  await page.getByRole('button', { name: 'Add to question: w2_partial.csv' }).click();
+  await page.getByRole('button', { name: 'Review plan' }).click();
+  const planRegion = page.getByRole('region', { name: 'Plan review' });
+  await expect(planRegion).toBeVisible({ timeout: 30_000 });
+  const runId = new URL(page.url()).searchParams.get('run');
+  if (!runId) throw new Error('W2 UI did not create a run after plan review');
+  await planRegion.getByRole('button', { name: 'Prepare plan', exact: true }).click({ timeout: 30_000 });
+
+  await expect.poll(async () => page.evaluate(async (id) => {
+    const [planResponse, readinessResponse] = await Promise.all([
+      fetch(`/api/v1/runs/${encodeURIComponent(id)}/plan`, { credentials: 'same-origin' }),
+      fetch(`/api/v1/runs/${encodeURIComponent(id)}/readiness`, { credentials: 'same-origin' }),
+    ]);
+    if (!planResponse.ok || !readinessResponse.ok) return false;
+    const currentPlan = await planResponse.json() as {
+      run_id: string; revision: number; plan_digest: string;
+      plan: { scientific?: {
+        capability_ids: string[];
+        approved_crossref_queries: { crossref?: { query: string | null } };
+        csv_describe_grants: { csv_describe?: {
+          numeric_columns: string[]; input_ref: { key: string; size: number };
+          input_sha256: string; recipe_manifest_sha256: string; image_digest: string;
+        } };
+        required_compute_profiles: Array<{ profile_id: string; image_digest: string }>;
+      } | null };
+    };
+    const readiness = await readinessResponse.json() as {
+      run_id: string; revision: number; plan_digest: string; state: string;
+      requirements: Array<{ id: string; state: string }>;
+    };
+    const scientific = currentPlan.plan.scientific;
+    return currentPlan.run_id === id && Boolean(scientific) &&
+      scientific!.capability_ids.includes('paper-lookup') &&
+      scientific!.capability_ids.includes('exploratory-data-analysis') &&
+      scientific!.approved_crossref_queries.crossref?.query === 'coastal nitrate monitoring' &&
+      JSON.stringify(scientific!.csv_describe_grants.csv_describe?.numeric_columns) === JSON.stringify(['temperature_c', 'nitrate_mg_l']) &&
+      scientific!.csv_describe_grants.csv_describe?.input_sha256 === csvSha256 &&
+      scientific!.csv_describe_grants.csv_describe?.input_ref.size === csvBytes.byteLength &&
+      scientific!.csv_describe_grants.csv_describe?.recipe_manifest_sha256 === proof.compute_recipe_manifest_sha256 &&
+      scientific!.csv_describe_grants.csv_describe?.image_digest === proof.compute_image_digest &&
+      scientific!.required_compute_profiles.some((profile) => profile.profile_id === 'prof.csv-stdlib@py3.14.7' && profile.image_digest === proof.compute_image_digest) &&
+      readiness.run_id === id &&
+      readiness.revision === currentPlan.revision && readiness.plan_digest === currentPlan.plan_digest;
+  }, runId), { timeout: 180_000 }).toBe(true);
+
+    const setupQuery = new URLSearchParams({ session: proof.session_id, run: runId });
+    await gotoHost(`/projects/${encodeURIComponent(proof.project_id)}/research-setup?${setupQuery}`);
+    await expect(page.getByRole('heading', { name: 'Research Setup', exact: true })).toBeVisible();
+    for (const [profileId, label] of [
+      ['prof.worker-base@py3.14.7', 'Resource measurement environment'],
+      ['prof.csv-stdlib@py3.14.7', 'CSV descriptive statistics'],
+    ] as const) {
+      const profileCard = page.locator('.setup-profile').filter({ has: page.getByRole('heading', { name: label, exact: true }) });
+      await expect(profileCard).toBeVisible({ timeout: 30_000 });
+      const prepareButton = profileCard.getByRole('button', { name: 'Prepare environment', exact: true });
+      if (await prepareButton.isVisible().catch(() => false)) await prepareButton.click({ timeout: 30_000 });
+      await expect.poll(async () => page.evaluate(async ({ projectId, profileId }) => {
+        const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/research-setup`, { credentials: 'same-origin' });
+        if (!response.ok) return false;
+        const setup = await response.json() as {
+          project_id: string;
+          profiles: Array<{ profile_id: string; version: string; manifest_sha256: string }>;
+          preparations: Array<{ project_id: string; profile_id: string; version: string; manifest_sha256: string; state: string; stage: string; evidence_verified: boolean }>;
+        };
+        const profile = setup.profiles.find((item) => item.profile_id === profileId);
+        return setup.project_id === projectId && !!profile && setup.preparations.some((job) =>
+          job.project_id === projectId && job.profile_id === profile.profile_id && job.version === profile.version &&
+          job.manifest_sha256 === profile.manifest_sha256 && job.state === 'ready' && job.stage === 'complete' && job.evidence_verified === true);
+      }, { projectId: proof.project_id, profileId }), { timeout: 300_000, intervals: [1_000, 2_000, 5_000] }).toBe(true);
+      await expect(profileCard.getByText('Environment ready', { exact: true })).toBeVisible({ timeout: 30_000 });
+    }
+    await page.getByRole('link', { name: 'Return to plan', exact: true }).click();
+    await expect(planRegion).toBeVisible({ timeout: 30_000 });
+  await planRegion.getByLabel('Token limit').fill('20000');
+  await planRegion.getByLabel('Time limit (seconds)').fill('600');
+  await planRegion.getByRole('button', { name: 'Save edits', exact: true }).click();
+  await expect(planRegion.getByLabel('Token limit')).toHaveValue('20000');
+  await expect(planRegion.getByLabel('Time limit (seconds)')).toHaveValue('600');
+
+  await planRegion.getByRole('button', { name: 'Refresh readiness', exact: true }).click().catch(() => undefined);
+  const refreshed = await page.evaluate(async (id) => {
+    const [planResponse, readinessResponse] = await Promise.all([
+      fetch(`/api/v1/runs/${encodeURIComponent(id)}/plan`, { credentials: 'same-origin' }),
+      fetch(`/api/v1/runs/${encodeURIComponent(id)}/readiness`, { credentials: 'same-origin' }),
+    ]);
+    return { plan: await planResponse.json(), readiness: await readinessResponse.json() };
+  }, runId);
+  if (refreshed.plan.run_id !== runId || refreshed.readiness.run_id !== runId ||
+      refreshed.plan.revision !== refreshed.readiness.revision ||
+      refreshed.plan.plan_digest !== refreshed.readiness.plan_digest ||
+      refreshed.plan.plan.token_limit !== 20_000 || refreshed.plan.plan.elapsed_limit_ms !== 600_000 ||
+      refreshed.readiness.state !== 'ready') {
+    throw new Error('W2 plan and readiness did not refresh to the same revision');
+  }
+  await expect(planRegion.getByRole('button', { name: 'Approve plan', exact: true })).toBeEnabled({ timeout: 30_000 });
+  await planRegion.getByRole('button', { name: 'Approve plan', exact: true }).click();
+  await expect.poll(async () => page.evaluate(async (id) => {
+    const response = await fetch(`/api/v1/runs/${encodeURIComponent(id)}`, { credentials: 'same-origin' });
+    if (!response.ok) return false;
+    const run = await response.json() as { state: string; artifacts: Array<{ title: string; partial: boolean }> };
+    return run.state === 'completed' && run.artifacts.length === 4 && run.artifacts.every((item) => !item.partial);
+  }, runId), { timeout: 300_000 }).toBe(true);
+
+  const expected = ['summary.json', 'summary.csv', 'chart.svg', 'report.md'];
+  const outputs = page.getByRole('region', { name: 'Outputs' });
+  for (const name of expected) {
+    const card = outputs.getByRole('article', { name, exact: true });
+    await expect(card).toBeVisible({ timeout: 30_000 });
+    await expect(card.getByText('Partial output')).toHaveCount(0);
+  }
+  const chartCard = outputs.getByRole('article', { name: 'chart.svg', exact: true });
+  await chartCard.getByRole('button', { name: 'Expand visual: chart.svg', exact: true }).click();
+  const chartViewer = page.getByRole('dialog', { name: 'chart.svg' });
+  await expect(chartViewer).toBeVisible();
+  const chartImage = chartViewer.locator('img');
+  await expect(chartImage).toBeVisible();
+  await expect.poll(() => chartImage.evaluate((image) => {
+    const element = image as HTMLImageElement;
+    return element.complete && element.naturalWidth > 0 && element.naturalHeight > 0;
+  })).toBe(true);
+  await chartViewer.getByRole('button', { name: 'Close', exact: true }).click();
+  await page.reload();
+  if (new URL(page.url()).origin !== origin) throw new Error('W2 artifact refresh left the actual host');
+  await expect(page.getByRole('region', { name: 'Outputs' })).toBeVisible({ timeout: 30_000 });
+
+  const run = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/v1/runs/${encodeURIComponent(id)}`, { credentials: 'same-origin' });
+    if (!response.ok) throw new Error('W2 run read failed after refresh');
+    return await response.json() as { artifacts: Array<{
+      artifact_id: string; title: string; partial: boolean; sha256: string; size: number;
+    }> };
+  }, runId);
+  const artifacts = Object.fromEntries(run.artifacts.map((item) => [item.title, item]));
+  if (Object.keys(artifacts).sort().join(',') !== [...expected].sort().join(',')) {
+    throw new Error('W2 run does not expose the four expected output artifacts');
+  }
+  const outputEvidence: Record<string, { artifact_id: string; sha256: string; size: number }> = {};
+  for (const name of expected) {
+    const artifact = artifacts[name];
+    if (artifact.partial) throw new Error(`W2 output is partial: ${name}`);
+    const card = outputs.getByRole('article', { name, exact: true });
+    const downloadPromise = page.waitForEvent('download');
+    await card.getByRole('link', { name: 'Download output', exact: true }).click();
+    const download = await downloadPromise;
+    const stream = await download.createReadStream();
+    if (!stream) throw new Error(`W2 download stream unavailable: ${name}`);
+    const digest = createHash('sha256');
+    let size = 0;
+    for await (const chunk of stream) {
+      size += chunk.length;
+      digest.update(chunk);
+    }
+    const sha256 = digest.digest('hex');
+    if (sha256 !== artifact.sha256 || size !== artifact.size) {
+      throw new Error(`W2 downloaded bytes differ from artifact metadata: ${name}`);
+    }
+    outputEvidence[name] = { artifact_id: artifact.artifact_id, sha256, size };
+  }
+  await mkdir(path.dirname(w2EvidenceFile!), { recursive: true, mode: 0o700 });
+  await writeFile(w2EvidenceFile!, JSON.stringify({
+    status: 'PASS', project_id: proof.project_id, session_id: proof.session_id, run_id: runId,
+    query: 'coastal nitrate monitoring', csv_columns: ['temperature_c', 'nitrate_mg_l'],
+    outputs: outputEvidence, owner_bootstrap_fragment_cleared: true, setup_refresh: true,
+  }) + '\n', { mode: 0o600 });
+  await chmod(w2EvidenceFile!, 0o600);
+  const checker = path.resolve(process.cwd(), '../../backend/tests/live/w2_scientific_acceptance.py');
+  const readback = spawnSync(w2Python!, [checker, '--verify-browser-run'], {
+    encoding: 'utf8', timeout: 60_000, env: process.env,
+  });
+  if (readback.error || readback.status !== 0) throw new Error('W2 native PostgreSQL/S3/output readback failed');
 });

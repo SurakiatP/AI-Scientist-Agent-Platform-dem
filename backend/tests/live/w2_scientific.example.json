@@ -1,0 +1,16 @@
+{
+  "b5_live_config": ".local/w2-scientific-20261007/b5-live.json",
+  "evidence_dir": ".local/w2-scientific-20261007/evidence",
+  "postgres_container_id": "<owned 64-hex container id>",
+  "minio_container_id": "<owned 64-hex container id>",
+  "egress_network_id": "<owned 64-hex network id>",
+  "scientific_bucket": "scientist-w2-20261007",
+  "scientific_fixture_image": "scientist-server-scientific@sha256:<reviewed-64-hex-image-digest>",
+  "scientific_bundle_dir": ".local/w2-scientific-20261007/namespace/bundle",
+  "sealed_profile_evidence_dir": ".local/w2-scientific-20261007/namespace/state/profiles",
+  "sealed_compute_profile_evidence_dir": ".local/w2-scientific-20261007/namespace/state/compute-profiles",
+  "compute_evidence": ".local/w2-compute-profile-20261007/accepted",
+  "web_dist_dir": "apps/web/dist",
+  "compute_image": "scientist-worker@sha256:<reviewed-64-hex-image-digest>",
+  "compute_recipe_manifest_sha256": "<reviewed-64-hex-recipe-manifest>"
+}
