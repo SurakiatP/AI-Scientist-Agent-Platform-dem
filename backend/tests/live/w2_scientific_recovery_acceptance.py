@@ -189,11 +189,11 @@ def _create_project_run(api, common, host_http, *, workflow: str, provider_id: u
     plan = host_http.call(api, "GET", f"/api/v1/runs/{run_id}/plan")
     updated = host_http.call(api, "PATCH", f"/api/v1/runs/{run_id}/plan", json={
         "expected_revision": plan["revision"],
-        "plan": {**plan["plan"], "token_limit": 20_000, "elapsed_limit_ms": 600_000},
+        "plan": {**plan["plan"], "token_limit": 200_000, "elapsed_limit_ms": 600_000},
     })
     plan = host_http.call(api, "GET", f"/api/v1/runs/{run_id}/plan")
     readiness = host_http.call(api, "GET", f"/api/v1/runs/{run_id}/readiness")
-    need(updated["revision"] == plan["revision"] and plan["plan"]["token_limit"] == 20_000
+    need(updated["revision"] == plan["revision"] and plan["plan"]["token_limit"] == 200_000
          and plan["plan"]["elapsed_limit_ms"] == 600_000, "approved budget was not persisted")
     need(readiness["state"] == "ready" and readiness["revision"] == plan["revision"]
          and readiness["plan_digest"] == plan["plan_digest"], "scientific plan readiness is stale")

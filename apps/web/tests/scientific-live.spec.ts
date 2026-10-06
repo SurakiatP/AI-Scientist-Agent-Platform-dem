@@ -301,10 +301,10 @@ test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes
     }
     await page.getByRole('link', { name: 'Return to plan', exact: true }).click();
     await expect(planRegion).toBeVisible({ timeout: 30_000 });
-  await planRegion.getByLabel('Token limit').fill('20000');
+  await planRegion.getByLabel('Token limit').fill('200000');
   await planRegion.getByLabel('Time limit (seconds)').fill('600');
   await planRegion.getByRole('button', { name: 'Save edits', exact: true }).click();
-  await expect(planRegion.getByLabel('Token limit')).toHaveValue('20000');
+  await expect(planRegion.getByLabel('Token limit')).toHaveValue('200000');
   await expect(planRegion.getByLabel('Time limit (seconds)')).toHaveValue('600');
 
   await planRegion.getByRole('button', { name: 'Refresh readiness', exact: true }).click().catch(() => undefined);
@@ -318,7 +318,7 @@ test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes
   if (refreshed.plan.run_id !== runId || refreshed.readiness.run_id !== runId ||
       refreshed.plan.revision !== refreshed.readiness.revision ||
       refreshed.plan.plan_digest !== refreshed.readiness.plan_digest ||
-      refreshed.plan.plan.token_limit !== 20_000 || refreshed.plan.plan.elapsed_limit_ms !== 600_000 ||
+      refreshed.plan.plan.token_limit !== 200_000 || refreshed.plan.plan.elapsed_limit_ms !== 600_000 ||
       refreshed.readiness.state !== 'ready') {
     throw new Error('W2 plan and readiness did not refresh to the same revision');
   }
