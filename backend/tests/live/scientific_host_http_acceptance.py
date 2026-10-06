@@ -76,6 +76,10 @@ def self_check() -> None:
     assert not fixture._hold_boundary(500, True, True, True)
     assert not fixture._hold_boundary(200, True, False, True)  # persisted run-level claim prevents restart reactivation
     assert not fixture._hold_boundary(200, True, True, False)  # unrelated scientific runs pass through
+    absent = SimpleNamespace(q=lambda query: [{"relation": None}])
+    present = SimpleNamespace(q=lambda query: [{"relation": "w1_boundary_barriers"}])
+    assert not _boundary_barrier_table_ready(absent)
+    assert _boundary_barrier_table_ready(present)
     _self_check_b5_prerequisites()
     print(json.dumps({"status": "PASS", "check": "scientific-driver-prerequisites"}))
 
@@ -431,6 +435,8 @@ def run() -> None:
             "expected_revision": plan["revision"], "plan_digest": plan["plan_digest"]})
 
         phase = "committed_receipt_lost_ack_restart"
+        http.wait_for(lambda: "ready" if _boundary_barrier_table_ready(h) else None,
+                      "scientific fixture boundary table did not initialize", 30, 0.2)
         barrier = http.wait_for(lambda: h.q("SELECT generation,released FROM w1_boundary_barriers WHERE run_id=:run"),
                                 "committed scientific receipt did not reach the boundary barrier", 240, 0.2)
         if len(barrier) != 1 or barrier[0]["generation"] != 1 or barrier[0]["released"]:
@@ -606,6 +612,11 @@ def verify_browser_run(run_id: str) -> None:
 def httpx_client(api):
     import httpx
     return httpx.Client(base_url=api.base_url, headers=dict(api.headers), cookies=api.cookies, timeout=30)
+
+
+def _boundary_barrier_table_ready(h) -> bool:
+    rows = h.q("SELECT to_regclass('w1_boundary_barriers') AS relation")
+    return bool(rows and rows[0]["relation"])
 
 
 def counts(h) -> dict:
