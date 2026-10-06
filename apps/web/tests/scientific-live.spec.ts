@@ -59,6 +59,31 @@ test('real owner browser completes and presents the approved resource measuremen
   await page.getByRole('button', { name: 'Refresh setup' }).click();
   await page.getByRole('link', { name: 'Return plan' }).click();
   await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
+
+  await page.getByLabel('Token limit').fill('20000');
+  await page.getByLabel('Time limit (seconds)').fill('600');
+  await page.getByRole('button', { name: 'Save edits', exact: true }).click();
+  await expect(plan.getByLabel('Token limit')).toHaveValue('20000');
+  await expect(plan.getByLabel('Time limit (seconds)')).toHaveValue('600');
+  await expect(plan.getByText('20000 tokens · 600 s')).toBeVisible();
+  await expect.poll(async () => page.evaluate(async (id: string) => {
+    const [planResponse, readinessResponse] = await Promise.all([
+      fetch(`/api/v1/runs/${encodeURIComponent(id)}/plan`, { credentials: 'same-origin' }),
+      fetch(`/api/v1/runs/${encodeURIComponent(id)}/readiness`, { credentials: 'same-origin' }),
+    ]);
+    if (!planResponse.ok || !readinessResponse.ok) return false;
+    const currentPlan = await planResponse.json() as {
+      revision: number; plan_digest: string; plan: { token_limit: number; elapsed_limit_ms: number };
+    };
+    const readiness = await readinessResponse.json() as {
+      revision: number; plan_digest: string; state: string; binding_sha256: string | null;
+    };
+    return currentPlan.plan.token_limit === 20_000 && currentPlan.plan.elapsed_limit_ms === 600_000 &&
+      readiness.state === 'ready' && readiness.binding_sha256 !== null &&
+      readiness.revision === currentPlan.revision && readiness.plan_digest === currentPlan.plan_digest;
+  }, runId), { timeout: 30_000 }).toBe(true);
+  await expect(plan.getByText('Current plan requirements are ready.')).toBeVisible();
+  await expect(plan.getByRole('button', { name: 'Approve plan', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Approve plan' }).click();
 
   await expect.poll(async () => page.evaluate(async (id: string) => {

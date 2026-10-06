@@ -418,13 +418,26 @@ def run() -> None:
         revised = http.call(api, "POST", f"/api/v1/runs/{run_id}/prepare-plan", json={
             "expected_revision": plan0["revision"], "workflow": "resources", "search_terms": []})
         plan = http.call(api, "GET", f"/api/v1/runs/{run_id}/plan")
+        if (plan["revision"] != revised["revision"]
+                or plan["plan"]["scientific"]["capability_ids"] != ["get-available-resources"]):
+            raise RuntimeError("resource plan does not carry the expected scientific binding")
+        budgeted = http.call(api, "PATCH", f"/api/v1/runs/{run_id}/plan", json={
+            "expected_revision": plan["revision"],
+            "plan": {**plan["plan"], "token_limit": 20_000, "elapsed_limit_ms": 600_000},
+        })
+        plan = http.call(api, "GET", f"/api/v1/runs/{run_id}/plan")
         readiness = http.call(api, "GET", f"/api/v1/runs/{run_id}/readiness")
         current = http.call(api, "GET", f"/api/v1/runs/{run_id}")
-        if (current["revision"] != plan["revision"] or plan["revision"] != revised["revision"]
+        if (current["revision"] != plan["revision"] or plan["revision"] != budgeted["revision"]
+                or plan["revision"] <= revised["revision"]
+                or plan["plan"]["token_limit"] != 20_000
+                or plan["plan"]["elapsed_limit_ms"] != 600_000
                 or plan["plan"]["scientific"]["capability_ids"] != ["get-available-resources"]):
-            raise RuntimeError("resource plan does not carry the current approved scientific binding")
-        if readiness["state"] != "ready" or readiness["binding_sha256"] is None:
-            raise RuntimeError("resource plan readiness is not backed by the accepted profile")
+            raise RuntimeError("budgeted resource plan is not the current scientific plan")
+        if (readiness["state"] != "ready" or readiness["binding_sha256"] is None
+                or readiness["revision"] != plan["revision"]
+                or readiness["plan_digest"] != plan["plan_digest"]):
+            raise RuntimeError("budgeted resource plan readiness is not current and profile-backed")
         with c.session() as db:
             db.execute(text("""CREATE TABLE IF NOT EXISTS w1_boundary_fault_targets (
                 run_id uuid PRIMARY KEY, armed_at timestamptz NOT NULL DEFAULT now())"""))
