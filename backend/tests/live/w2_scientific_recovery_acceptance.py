@@ -91,7 +91,8 @@ def _load_runtime():
          "owned W2 Crossref egress network identity or policy differs")
     for image in (raw["scientific_fixture_image"], raw["compute_image"], common.CFG.worker_image,
                   common.CFG.server_image, common.CFG.postgres_image, common.CFG.minio_image):
-        engine.docker("image", "--format", "{{.Id}}", image.split("@", 1)[1])
+        need(engine.docker("image", "inspect", "--format", "{{.Id}}", image).strip()
+             == image.split("@", 1)[1], "owned W2 image identity differs")
     source_map = w2._read_json(common.CFG.server_source_hashes, "W2 server source hash map")
     for relative, expected in source_map.get("files", source_map).items():
         if relative.startswith(("backend/src/", "runtime/")):
