@@ -83,8 +83,9 @@ export function Library() {
     const controller = new AbortController(); mutationRef.current = controller;
     setUploading(true); setUploadMessage(text(language, 'Sending file…', 'กำลังส่งไฟล์…'));
     try {
-      const body = new FormData(); body.append('file', file);
-      const result = await request<FileView>(`/api/v1/projects/${targetProject}/files`, { method: 'POST', body, signal: controller.signal });
+      const result = await request<FileView>(`/api/v1/projects/${targetProject}/files?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST', body: file, headers: { 'Content-Type': type }, signal: controller.signal,
+      });
       if (controller.signal.aborted || activeProjectRef.current !== targetProject) return;
       setFiles((items) => [result, ...items.filter((item) => item.id !== result.id)]);
       setPollCount(0);

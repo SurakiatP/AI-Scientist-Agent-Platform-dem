@@ -270,6 +270,10 @@ async def upload_file(request: Request, project_id: UUID, filename: str = Query(
                     if exc.code == "storage_unavailable":
                         db.commit()  # keep the failed attempt record
                     raise
+                # The stored CSV is already typed and UTF-8 validated by attach;
+                # its approved compute recipe consumes original bytes, with no extraction.
+                db.execute(text("""UPDATE file_versions SET state = 'ready'
+                    WHERE id = :id AND state = 'preparing' AND content_type = 'text/csv'"""), {"id": file_id})
                 db.commit()
                 return next(f for f in domain.list_files(db, principal, project_id) if f.id == file_id)
 

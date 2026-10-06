@@ -1,6 +1,7 @@
 import json
 import uuid
 from io import BytesIO
+from hashlib import sha256
 from secrets import token_urlsafe
 from uuid import uuid4
 
@@ -72,10 +73,13 @@ def ready_file(client, db, project_id, name="data.txt", body=b"hello"):
     r = client.post(f"/api/v1/projects/{project_id}/files", params={"filename": name}, content=body)
     assert r.status_code == 201, r.text
     view = r.json()
-    assert view["state"] == "preparing"
-    ref = objects.put(db, project_id=uuid.UUID(project_id), content=BytesIO(body), content_type="text/plain")
-    files.mark_prepared(db, uuid.UUID(view["id"]), ref, "ready")
-    db.commit()
+    if name.lower().endswith(".csv"):
+        assert view["state"] == "ready"
+    else:
+        assert view["state"] == "preparing"
+        ref = objects.put(db, project_id=uuid.UUID(project_id), content=BytesIO(body), content_type="text/plain")
+        files.mark_prepared(db, uuid.UUID(view["id"]), ref, "ready")
+        db.commit()
     return view["id"]
 
 
@@ -246,6 +250,25 @@ def domain_run(db, project_id, session_id):
                             token_urlsafe(6), "q", [], uuid4(), "fixture")
     db.commit()
     return run.run_id
+
+
+def test_raw_csv_upload_is_immediately_usable_and_preserves_content(client, db):
+    pid = new_project(client)["id"]
+    body = b"x,y\n1,2\n3,\n5,6\n"
+    response = client.post(f"/api/v1/projects/{pid}/files", params={"filename": "partial.csv"},
+                           content=body, headers={"content-type": "text/csv"})
+    assert response.status_code == 201
+    file = response.json()
+    assert (file["filename"], file["state"], file["size"], file["content_type"]) == (
+        "partial.csv", "ready", len(body), "text/csv")
+    listed = client.get(f"/api/v1/projects/{pid}/files").json()
+    assert next(item for item in listed if item["id"] == file["id"]) == file
+    content = client.get(f"/api/v1/projects/{pid}/files/{file['id']}/content")
+    assert content.status_code == 200 and content.content == body
+    row = db.execute(text("SELECT state,sha256,extracted_artifact_id FROM file_versions WHERE id=:id"),
+                     {"id": uuid.UUID(file["id"])}).one()
+    assert row.state == "ready" and row.sha256.strip() == sha256(body).hexdigest()
+    assert row.extracted_artifact_id is None  # CSV input needs no invented text extraction.
 
 
 def test_upload_is_bounded_and_typed(client, monkeypatch):
