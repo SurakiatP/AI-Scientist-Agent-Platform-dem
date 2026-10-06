@@ -11,7 +11,6 @@ import selectors
 import stat
 import subprocess
 import tarfile
-import tempfile
 import time
 import xml.etree.ElementTree as ET
 import csv
@@ -41,9 +40,24 @@ _OUTPUT_TYPES = {
 _MAX_INPUT_BYTES = 1_048_576
 _MAX_PARAMS_BYTES = 16_384
 _MAX_ARCHIVE_BYTES = 512 * 1024
+_MAX_ARCHIVE_STDERR_BYTES = 16 * 1024
 _WALL_SECONDS = 30
 _DOCKER_CONTEXT = "colima-scientist-platform-test"
 _DOCKER_TIMEOUT = 5
+_OUTPUT_ARCHIVE_PRODUCER = r'''import os,stat,sys,tarfile
+root=sys.argv[1]
+if not stat.S_ISDIR(os.lstat(root).st_mode):
+    raise SystemExit("output path is not a directory")
+with os.scandir(root) as scan:
+    entries=sorted(scan,key=lambda item:item.name)
+for entry in entries:
+    metadata=entry.stat(follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit("output entry is not an unlinked regular file")
+with tarfile.open(fileobj=sys.stdout.buffer,mode="w|") as archive:
+    for entry in entries:
+        archive.add(entry.path,arcname=entry.name,recursive=False)
+'''
 
 
 def _run_docker(engine: Any, *args: str, input: bytes | None = None) -> str:
@@ -319,43 +333,73 @@ def poll_compute(engine: Any, executor: ExecutorRef, *, expected_image_digest: s
     return code
 
 
+def _container_archive_command(engine: Any, container_id: str) -> list[str]:
+    """Build the single fixed in-container archive command for the bound CID."""
+    if getattr(engine, "context", None) != _DOCKER_CONTEXT:
+        raise RuntimeError("compute runtime only permits the owned Docker context")
+    if not re.fullmatch(r"[a-f0-9]{64}", container_id or ""):
+        raise RuntimeError("compute output read requires a full bound container ID")
+    return [
+        "docker", "--context", engine.context, "exec", container_id,
+        "python3.14", "-I", "-S", "-c", _OUTPUT_ARCHIVE_PRODUCER, "/work/outputs",
+    ]
+
+
 def _container_archive(engine: Any, container_id: str) -> bytes:
-    """Read Docker's tar stream with a hard cap before retaining it in memory."""
-    stderr = tempfile.TemporaryFile()
-    process = subprocess.Popen(
-        ["docker", "--context", engine.context, "cp", f"{container_id}:/work/outputs/.", "-"],
-        stdout=subprocess.PIPE,
-        stderr=stderr,
-    )
-    assert process.stdout is not None
-    chunks: list[bytes] = []
-    total = 0
+    """Stream a trusted stdlib tar producer from the exact live guest namespace."""
     deadline = time.monotonic() + _DOCKER_TIMEOUT
+    process = subprocess.Popen(
+        _container_archive_command(engine, container_id),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    stdout_total = stderr_total = 0
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
     try:
-        while True:
+        while selector.get_map():
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not selector.select(remaining):
+            events = selector.select(remaining) if remaining > 0 else []
+            if not events:
                 process.kill()
                 raise RuntimeError("compute output archive read timed out")
-            chunk = os.read(process.stdout.fileno(), 16 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > _MAX_ARCHIVE_BYTES:
-                process.kill()
-                raise RuntimeError("compute output archive exceeds its bounded read")
-            chunks.append(chunk)
-        if process.wait(timeout=max(0.1, deadline - time.monotonic())) != 0:
-            raise RuntimeError("Docker could not read compute outputs")
+            for key, _ in events:
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 16 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                if key.data == "stdout":
+                    stdout_total += len(chunk)
+                    if stdout_total > _MAX_ARCHIVE_BYTES:
+                        process.kill()
+                        raise RuntimeError("compute output archive exceeds its bounded read")
+                    chunks.append(chunk)
+                else:
+                    stderr_total += len(chunk)
+                    if stderr_total > _MAX_ARCHIVE_STDERR_BYTES:
+                        process.kill()
+                        raise RuntimeError("compute output archive stderr exceeds its bounded read")
+                    stderr_chunks.append(chunk)
+        return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        if return_code != 0:
+            detail = b"".join(stderr_chunks).decode("utf-8", "replace")[:1000]
+            raise RuntimeError("Docker could not read compute outputs" + (f": {detail}" if detail else ""))
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        raise RuntimeError("compute output archive read timed out") from exc
     finally:
         selector.close()
         process.stdout.close()
+        process.stderr.close()
         if process.poll() is None:
             process.kill()
             process.wait()
-        stderr.close()
     return b"".join(chunks)
 
 
@@ -447,7 +491,11 @@ def _parse_archive(raw: bytes) -> dict[str, bytes]:
         sizes = 0
         by_name: dict[str, tarfile.TarInfo] = {}
         for member in members:
-            if member.name not in _OUTPUT_TYPES or member.name in by_name or not member.isfile():
+            if (
+                member.name not in _OUTPUT_TYPES
+                or member.name in by_name
+                or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+            ):
                 raise ValueError("compute output archive contains an unknown or non-regular entry")
             if member.size < 0:
                 raise ValueError("compute output archive contains an invalid size")

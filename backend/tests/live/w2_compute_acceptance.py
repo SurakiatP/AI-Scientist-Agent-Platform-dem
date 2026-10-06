@@ -230,6 +230,41 @@ def _stop_exact(
     return True
 
 
+def _capture_failure_diagnostics(
+    engine: DockerWorkerEngine,
+    refs: list[ExecutorRef],
+    phase: str,
+    error: Exception,
+) -> dict[str, Any]:
+    """Capture bounded state and stdout/stderr for only the exact synthetic CIDs."""
+    result: dict[str, Any] = {
+        "phase": phase,
+        "error_type": type(error).__name__,
+        "error_message": str(error)[:1200],
+        "containers": [],
+    }
+    for ref in refs:
+        if not ref.container_id:
+            continue
+        item: dict[str, Any] = {"cid": ref.container_id}
+        try:
+            raw_state = compute_runtime._run_docker(
+                engine, "inspect", "--format", "{{json .State}}", ref.container_id,
+            )
+            item["state"] = json.loads(raw_state)
+        except Exception as diagnostic_error:
+            item["state_error_type"] = type(diagnostic_error).__name__
+        try:
+            # The fixed guest reads only the public synthetic fixture. Never inspect
+            # Config.Env or list containers to collect diagnostics.
+            logs = compute_runtime._run_docker(engine, "logs", "--tail", "60", ref.container_id)
+            item["log_tail"] = logs[-8000:]
+        except Exception as diagnostic_error:
+            item["log_error_type"] = type(diagnostic_error).__name__
+        result["containers"].append(item)
+    return result
+
+
 def _create_bound(
     engine: DockerWorkerEngine,
     unbound: ExecutorRef,
@@ -439,25 +474,34 @@ def run_acceptance(
     }
     refs: list[ExecutorRef] = []
     attempted_stops: set[str] = set()
+    phase = "normal_create"
     base["normal_case"] = {"status": "IN PROGRESS"}
     base["guest_alarm_case"] = {"status": "NOT STARTED"}
     try:
         # Normal compute: exact pre-start callback, strict wrong-pin rejects,
         # known values and output hashes, then exact physical stop.
+        phase = "normal_create"
         normal = _new_ref(engine_id)
         bound = _create_bound(engine, normal, spec)
         refs.append(bound)
+        phase = "normal_pre_start_gate"
         normal_containment = before_start_gate(engine, bound, spec)
         base["normal_case"] = {"cid": bound.container_id, "containment": normal_containment}
+        phase = "normal_wrong_pin_rejections"
         wrong_pin = _reject_wrong_pin(engine, bound, image_digest)
         base["normal_case"]["wrong_pin_rejections"] = wrong_pin
         normal_started = time.monotonic()
+        phase = "normal_start"
         start_compute(engine, bound, expected_image_digest=image_digest)
+        phase = "normal_poll_ready"
         ready_status, _ = _run_ready_with_pin(engine, bound, image_digest)
         _require(ready_status == 0, "normal compute did not publish its ready result")
+        phase = "normal_read_outputs"
         normal_outputs = read_compute_outputs(engine, bound, expected_image_digest=image_digest)
+        phase = "normal_validate_outputs"
         normal_hashes = _validate_outputs(normal_outputs, expected_input_hash)
         normal_elapsed = time.monotonic() - normal_started
+        phase = "normal_exact_stop"
         normal_stopped = _stop_exact(engine, bound, image_digest, attempted_stops)
         refs.remove(bound)
         base["normal_case"].update({
@@ -471,18 +515,24 @@ def run_acceptance(
         # Alarm probe: same immutable source and fixture. Observe readiness, then
         # make no guest/host control call for >30 seconds so PID 1's original
         # SIGALRM, rather than the host poll timeout, ends the process.
+        phase = "alarm_create"
         alarm_unbound = _new_ref(engine_id)
         alarm_ref = _create_bound(engine, alarm_unbound, spec)
         refs.append(alarm_ref)
+        phase = "alarm_pre_start_gate"
         alarm_containment = before_start_gate(engine, alarm_ref, spec)
         base["guest_alarm_case"] = {"cid": alarm_ref.container_id, "containment": alarm_containment}
         alarm_started = time.monotonic()
+        phase = "alarm_start"
         start_compute(engine, alarm_ref, expected_image_digest=image_digest)
+        phase = "alarm_poll_ready"
         ready_status, ready_elapsed = _run_ready_with_pin(engine, alarm_ref, image_digest)
         _require(ready_status == 0, "alarm probe did not reach result-ready before SIGALRM")
+        phase = "alarm_wait_guest_sigalrm"
         state, alarm_elapsed = _wait_for_guest_alarm(engine, alarm_ref, alarm_started)
         exit_code = state.get("ExitCode")
         _require(exit_code == 142, "guest did not exit with SIGALRM status 142")
+        phase = "alarm_exact_stop"
         alarm_stopped = _stop_exact(engine, alarm_ref, image_digest, attempted_stops)
         refs.remove(alarm_ref)
         base["guest_alarm_case"].update({
@@ -505,6 +555,7 @@ def run_acceptance(
                  "guest alarm exited before the 30-second boundary")
         return base
     except Exception as exc:
+        base["failure"] = _capture_failure_diagnostics(engine, refs, phase, exc)
         cleanup_errors = []
         for ref in reversed(refs):
             try:
@@ -513,7 +564,6 @@ def run_acceptance(
             except Exception as cleanup_error:
                 cleanup_errors.append(type(cleanup_error).__name__)
         base["status"] = "FAIL"
-        base["failure_type"] = type(exc).__name__
         base["cleanup_errors"] = cleanup_errors
         base["fixture_staging_retained"] = input_dir.exists()
         return base
