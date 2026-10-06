@@ -415,7 +415,7 @@ def run_guest(args):
     from scientist.capability_registry import load_registry
     from scientist.contracts import ScientificBinding
     from scientist.instruction_loader import load_instruction_bundle, load_instruction_pins, validate_scientific_binding
-    from scientist.runtime_adapter import RuntimeAdapter, RuntimeAdapterError, build_native_agent
+    from scientist.runtime_adapter import RuntimeAdapter, RuntimeAdapterError, build_native_agent, _wire_messages
     from scientist.runtime_contracts import RUNTIME_COMMIT, RuntimeContextV1
     import scientist.resource_recipe as recipe
     import httpx
@@ -488,7 +488,14 @@ def run_guest(args):
                     resumed = RuntimeAdapter(restored.model_copy(update={"generation": 2}), broker_url=adapter.broker_url, capability="explicit-synthetic-fixture", workspace_dir=resumed_workspace, broker_client=client, checkpoint_revision=2)
                     resumed.scientific_instruction_bundle = bundle
                     resumed_agent = build_native_agent(resumed, workspace_dir=resumed_workspace)
-                    require(canonical(resumed.native_history()) == canonical(adapter.native_history()), "restored transcript changed")
+                    # The production DTO constructor expands unset optional fields to
+                    # explicit null defaults. Compare every typed raw value, the actual
+                    # wire projection, and timestamps; never erase real transcript data.
+                    require(canonical([item.model_dump(mode="json") for item in resumed.context.messages]) == canonical([item.model_dump(mode="json") for item in adapter.context.messages]), "restored raw message values changed")
+                    require(canonical([item.model_dump(mode="json") for item in resumed.context.native_message_metadata]) == canonical([item.model_dump(mode="json") for item in adapter.context.native_message_metadata]), "restored native message metadata changed")
+                    resumed_history, original_history = resumed.native_history(), adapter.native_history()
+                    require(canonical(_wire_messages(resumed_history)) == canonical(_wire_messages(original_history)), "restored transcript changed")
+                    require(canonical([(index, item["timestamp"]) for index, item in enumerate(resumed_history) if "timestamp" in item]) == canonical([(index, item["timestamp"]) for index, item in enumerate(original_history) if "timestamp" in item]), "restored native timestamps changed")
                     try:
                         resumed_agent._execute_tool_calls(assistant, resumed.native_history(), str(context.run_id), 0)
                     except RuntimeAdapterError:
@@ -549,7 +556,8 @@ def self_check():
     checks = inventory_self_check()
     import httpx
     from scientist.contracts import ScientificBinding
-    from scientist.runtime_adapter import RuntimeAdapter
+    from scientist.runtime_adapter import RuntimeAdapter, _wire_messages
+    from scientist.runtime_contracts import RuntimeContextV1
 
     binding = ScientificBinding(catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298", registry_sha256="a" * 64, capability_ids=["get-available-resources"], instruction_fingerprint="b" * 64, profile_id="prof.worker-base@py3.14.7", image_digest="sha256:" + "c" * 64, input_snapshot_digest="d" * 64, max_result_bytes=1048576, timeout_ms=30000, memory_limit_bytes=1073741824, workspace_limit_bytes=67108864)
     context = make_context(binding, binding.image_digest, "e" * 64)
@@ -559,6 +567,17 @@ def self_check():
         adapter = RuntimeAdapter(context, broker_url="http://172.30.0.1:9010", capability="explicit-synthetic-fixture", workspace_dir=Path(directory), broker_client=client)
         adapter._checkpoint("model_committed")
         require(adapter.checkpoint_revision == 1 and len(recorder.boundaries) == 1, "recording acknowledgement invalid")
+        # Reproduce the sparse native wire -> DTO restore seam without importing Hermes.
+        wire_context = context.model_dump(mode="json")
+        wire_context["messages"] = _wire_messages(adapter.native_history())
+        wire_context["native_message_metadata"] = [{"message_index": 0, "timestamp": 1234.5}]
+        sparse = RuntimeAdapter(wire_context, broker_url=adapter.broker_url, capability="explicit-synthetic-fixture", workspace_dir=Path(directory), broker_client=client)
+        replayed = RuntimeAdapter(RuntimeContextV1.model_validate(wire_context), broker_url=adapter.broker_url, capability="explicit-synthetic-fixture", workspace_dir=Path(directory), broker_client=client)
+        require(sparse.native_history() != replayed.native_history(), "sparse restore source regression was not reproduced")
+        require([item.model_dump(mode="json") for item in sparse.context.messages] == [item.model_dump(mode="json") for item in replayed.context.messages], "sparse restore changed raw message values")
+        require(_wire_messages(sparse.native_history()) == _wire_messages(replayed.native_history()), "sparse restore changed native wire projection")
+        require(sparse.native_history()[0]["timestamp"] == replayed.native_history()[0]["timestamp"] == 1234.5, "sparse restore changed timestamp")
+        checks.append("sparse transcript DTO/default-null recovery")
         try:
             client.post("http://172.30.0.1:9010/effects", json={})
         except FixtureError:
