@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -68,9 +69,16 @@ class _DB:
         if "FROM runtime_executors" in sql and "SELECT" in sql:
             return _Rows(dict(_STATE["executor"]))
         if "UPDATE runtime_executors SET state='starting'" in sql:
-            _STATE["executor"]["state"] = "starting"
-            _STATE.setdefault("events", []).append("executor-requalified")
-            return _Rows(rowcount=1)
+            executor = _STATE["executor"]
+            matches = (
+                executor["state"] == "unknown"
+                and executor["container_id"] in (None, params["container"])
+                and executor["engine_id"] in (None, params["engine"])
+            )
+            if matches:
+                executor["state"] = "starting"
+                _STATE.setdefault("events", []).append("executor-requalified")
+            return _Rows(rowcount=int(matches))
         if "FROM operations" in sql and "SELECT" in sql:
             return _Rows({"id": _STATE["journal_id"], "result": _STATE["result"]})
         if "UPDATE operations SET result" in sql:
@@ -353,6 +361,30 @@ def test_exactly_rediscovered_executor_requalifies_and_starts_without_create(
     assert _STATE["executor"]["state"] == "inactive"
     if initial_state == "unknown":
         assert _STATE["events"].index("executor-requalified") < _STATE["events"].index("journal-commit")
+
+
+def test_bound_unknown_executor_rejects_different_rediscovered_cid_without_requalifying(
+    monkeypatch, tmp_path
+):
+    request, _grant_obj, _unbound, bound, _output = _configure(monkeypatch, tmp_path, is_new=False)
+    _STATE["executor"].update(container_id=bound.container_id, state="unknown")
+    wrong = replace(bound, container_id="c" * 64)
+    monkeypatch.setattr(compute_runtime, "find_compute", lambda *_args, **_kwargs: wrong)
+    monkeypatch.setattr(
+        supervisor, "start_compute_executor",
+        lambda *_args, **_kwargs: pytest.fail("mismatched CID must not start"),
+    )
+    monkeypatch.setattr(
+        compute_runtime, "create_compute",
+        lambda *_args, **_kwargs: pytest.fail("mismatched CID must not recreate"),
+    )
+
+    with pytest.raises(RuntimeError, match="could not be requalified"):
+        host._run_compute_operation(request)
+
+    assert _STATE["executor"]["state"] == "unknown"
+    assert _STATE["executor"]["container_id"] == bound.container_id
+    assert "executor-requalified" not in _STATE["events"]
 
 
 def test_stale_generation_or_approval_prevents_launch_intent(monkeypatch, tmp_path):
