@@ -38,7 +38,12 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _exit_on_alarm(signum: int, _frame: Any) -> None:
+    os._exit(128 + signum)
+
+
 def main() -> None:
+    signal.signal(signal.SIGALRM, _exit_on_alarm)
     signal.alarm(30)
     data = _read_fixed(Path("/inputs/data.csv"), _MAX_INPUT)
     raw_params = _read_fixed(Path("/inputs/params.json"), _MAX_PARAMS)

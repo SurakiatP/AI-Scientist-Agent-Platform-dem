@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import importlib.util
 import signal
+import subprocess
 import sys
 import tarfile
 from dataclasses import replace
@@ -329,6 +330,7 @@ def test_guest_entrypoint_reads_fixed_inputs_and_writes_only_four_outputs(
             return LocalPath(value)
 
     alarms: list[int] = []
+    alarm_events: list[tuple[object, ...]] = []
 
     def describe_csv(data: bytes, params: dict[str, object]) -> dict[str, object]:
         assert alarms == [30]
@@ -344,7 +346,11 @@ def test_guest_entrypoint_reads_fixed_inputs_and_writes_only_four_outputs(
     monkeypatch.setitem(sys.modules, "scientific_render", renderer)
     monkeypatch.setattr(sys, "path", sys.path.copy())
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
-    monkeypatch.setattr(signal, "alarm", lambda seconds: alarms.append(seconds) or 0)
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: alarm_events.append(("signal", signum, handler)))
+    monkeypatch.setattr(
+        signal, "alarm",
+        lambda seconds: (alarms.append(seconds), alarm_events.append(("alarm", seconds)), 0)[-1],
+    )
     entrypoint = LocalPath(__file__).resolve().parents[2] / "runtime/compute_entrypoint.py"
     spec = importlib.util.spec_from_file_location("compute_entrypoint_test", entrypoint)
     assert spec is not None and spec.loader is not None
@@ -369,5 +375,34 @@ def test_guest_entrypoint_reads_fixed_inputs_and_writes_only_four_outputs(
     assert {path.name for path in (work / "outputs").iterdir()} == set(OUTPUTS)
     assert (work / "result-ready").read_bytes() == b"ready\n"
     assert alarms == [30]
+    assert alarm_events[0][0] == "signal", "guest must install its fatal alarm handler before arming the timer"
+    assert alarm_events[0][1] == signal.SIGALRM
+    assert callable(alarm_events[0][2])
+    assert alarm_events[1:] == [("alarm", 30)]
     assert paused == [True]
     assert not (tmp_path / "parent-staging").exists()
+
+
+def test_guest_alarm_handler_exits_142_in_a_controlled_child() -> None:
+    entrypoint = LocalPath(__file__).resolve().parents[2] / "runtime/compute_entrypoint.py"
+    child = f"""
+import importlib.util, signal, sys, types
+sys.modules["cpu_recipes"] = types.ModuleType("cpu_recipes")
+sys.modules["cpu_recipes"].describe_csv = lambda *_: None
+sys.modules["scientific_render"] = types.ModuleType("scientific_render")
+sys.modules["scientific_render"].render_outputs = lambda *_: None
+spec = importlib.util.spec_from_file_location("alarm_entrypoint", {str(entrypoint)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+signal.signal(signal.SIGALRM, module._exit_on_alarm)
+signal.alarm(1)
+signal.pause()
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", child],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=3,
+    )
+    assert result.returncode == 142, result.stderr.decode("utf-8", "replace")
