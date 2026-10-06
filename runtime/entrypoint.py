@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from scientist.contracts import RuntimePins, ScientificBindingV2
 from scientist.runtime_contracts import (
     BootstrapMetadata,
     RuntimeContextV1,
@@ -226,12 +227,21 @@ def _load_scientific_bundle(context: RuntimeContextV1):
         return None
     try:
         pins = load_instruction_pins(_SCIENTIFIC_MANIFEST)
+        expected_runtime_pins = None
+        if isinstance(binding, ScientificBindingV2):
+            expected_runtime_pins = RuntimePins(
+                runtime_commit=context.runtime_commit,
+                image_digest=context.image_digest,
+                skills_digest=context.skills_digest,
+                environment_digest=context.environment_digest,
+            )
         return validate_scientific_binding(
             binding,
             registry_path=_SCIENTIFIC_REGISTRY,
             bundle_root=_SCIENTIFIC_BUNDLE_ROOT,
             pinned_hashes=pins,
             expected_image_digest=context.image_digest,
+            expected_runtime_pins=expected_runtime_pins,
         )
     except (InstructionLoadError, OSError, ValueError, TypeError) as exc:
         raise BootstrapError("scientific authority failed worker bootstrap validation") from exc

@@ -12,7 +12,7 @@ import pytest
 from types import SimpleNamespace
 
 from scientist.capability_registry import load_registry
-from scientist.contracts import ScientificBinding
+from scientist.contracts import RUNTIME_COMMIT, RuntimePins, ScientificBinding, ScientificBindingV2
 from scientist.instruction_loader import (
     InstructionLoadError,
 )
@@ -180,6 +180,32 @@ def test_worker_bootstrap_revalidates_scientific_binding_against_static_files(tm
     monkeypatch.setattr(entrypoint, "_SCIENTIFIC_BUNDLE_ROOT", bundle_root)
     context = SimpleNamespace(plan=SimpleNamespace(scientific=binding), image_digest=binding.image_digest)
     assert entrypoint._load_scientific_bundle(context).capability_ids == ("get-available-resources",)
+
+    runtime_pins = RuntimePins(
+        runtime_commit=RUNTIME_COMMIT,
+        image_digest=binding.image_digest,
+        skills_digest="e" * 64,
+        environment_digest="f" * 64,
+    )
+    binding_v2 = ScientificBindingV2(
+        binding_version=2,
+        catalog_commit=binding.catalog_commit,
+        registry_sha256=binding.registry_sha256,
+        capability_ids=binding.capability_ids,
+        instruction_fingerprint=binding.instruction_fingerprint,
+        agent_runtime_pins=runtime_pins,
+        input_snapshot_digest="d" * 64,
+    )
+    context_v2 = SimpleNamespace(
+        plan=SimpleNamespace(scientific=binding_v2),
+        runtime_commit=runtime_pins.runtime_commit,
+        image_digest=runtime_pins.image_digest,
+        skills_digest=runtime_pins.skills_digest,
+        environment_digest=runtime_pins.environment_digest,
+    )
+    assert entrypoint._load_scientific_bundle(context_v2).capability_ids == ("get-available-resources",)
+    with pytest.raises(entrypoint.BootstrapError):
+        entrypoint._load_scientific_bundle(SimpleNamespace(**(vars(context_v2) | {"skills_digest": "a" * 64})))
 
 
 def test_worker_bootstrap_preserves_legacy_plans_without_scientific_authority():
