@@ -109,14 +109,26 @@ test('real owner browser completes and presents the approved resource measuremen
   const card = outputs.getByRole('article', { name: 'Resource measurements' });
   await expect(card).toBeVisible({ timeout: 300_000 });
   await expect(card.getByText('Partial output')).toHaveCount(0);
-  await card.getByRole('button', { name: 'Expand visual: Resource measurements' }).click();
+  await card.getByRole('button', { name: 'Expand visual: Resource measurements' }).click({ timeout: 30_000 });
   await expect(page.getByRole('region', { name: 'Resource measurement' })).toBeVisible();
   await expect(page.getByRole('row', { name: /Available CPU cores/ })).toBeVisible();
-  await page.getByRole('button', { name: 'TH' }).click();
+
+  const viewer = page.getByRole('dialog', { name: 'Resource measurements' });
+  await viewer.getByRole('button', { name: 'Close', exact: true }).click({ timeout: 30_000 });
+  await expect(viewer).toBeHidden({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'TH', exact: true }).click({ timeout: 30_000 });
+  const thaiCard = page.getByRole('region', { name: 'ผลลัพธ์', exact: true }).getByRole('article', { name: 'Resource measurements', exact: true });
+  await thaiCard.getByRole('button', { name: 'ขยายภาพ: Resource measurements', exact: true }).click({ timeout: 30_000 });
   await expect(page.getByRole('region', { name: 'ข้อมูลทรัพยากร' })).toBeVisible();
   await expect(page.getByRole('row', { name: /แกนประมวลผลที่ใช้ได้/ })).toBeVisible();
-  await page.getByRole('button', { name: 'EN' }).click();
+  await viewer.getByRole('button', { name: 'ปิด', exact: true }).click({ timeout: 30_000 });
+  await expect(viewer).toBeHidden({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'EN', exact: true }).click({ timeout: 30_000 });
+  await card.getByRole('button', { name: 'Expand visual: Resource measurements', exact: true }).click({ timeout: 30_000 });
   await expect(page.getByRole('region', { name: 'Resource measurement' })).toBeVisible();
+  await expect(page.getByRole('row', { name: /Available CPU cores/ })).toBeVisible();
+  await viewer.getByRole('button', { name: 'Close', exact: true }).click({ timeout: 30_000 });
+  await expect(viewer).toBeHidden({ timeout: 30_000 });
 
   const run = await page.evaluate(async (id: string) => {
     const response = await fetch(`/api/v1/runs/${encodeURIComponent(id)}`, { credentials: 'same-origin' });
