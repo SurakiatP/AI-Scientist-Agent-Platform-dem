@@ -222,6 +222,21 @@ def _wire_messages(messages: Any) -> list[dict[str, Any]]:
             for key in allowed
             if key in value and (key == "content" or value[key] is not None)
         }
+        if isinstance(wire.get("tool_calls"), list):
+            native_calls = []
+            for raw_call in wire["tool_calls"]:
+                call = _model_mapping(raw_call)
+                if isinstance(call, dict):
+                    call = dict(call)
+                    for key in ("call_id", "response_item_id"):
+                        if key in call:
+                            identifier = call.pop(key)
+                            if not isinstance(identifier, str) or not identifier.strip():
+                                raise RuntimeAdapterError(
+                                    "native tool-call metadata identifier is invalid"
+                                )
+                native_calls.append(call)
+            wire["tool_calls"] = native_calls
         if wire.get("role") == "assistant" and "content" not in wire:
             wire["content"] = None
         try:

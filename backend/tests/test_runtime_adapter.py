@@ -651,6 +651,92 @@ def test_native_wire_projection_keeps_message_name_and_strips_native_timestamps(
     ]
 
 
+def test_native_wire_projection_strips_only_hermes_tool_call_alias_metadata() -> None:
+    # Pinned Hermes builds native assistant history rows with both the OpenAI
+    # `id` and Codex Responses `call_id` / `response_item_id` aliases. The
+    # strict platform ChatMessage accepts the canonical `id` only.
+    native_message = {
+        "role": "assistant",
+        "content": None,
+        "timestamp": 1791030896.125,
+        "tool_calls": [
+            {
+                "id": "call_native_1",
+                "call_id": "call_native_1",
+                "response_item_id": "fc_native_1",
+                "type": "function",
+                "function": {"name": "todo_list", "arguments": '{"todos":[]}'},
+            },
+            {
+                "id": "call_native_2",
+                "call_id": "call_native_2",
+                "response_item_id": "fc_native_2",
+                "type": "function",
+                "function": {"name": "todo_list", "arguments": '{"todos":[]}'},
+            },
+        ],
+    }
+
+    projected = _wire_messages([native_message])
+
+    assert projected == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_native_1",
+                    "type": "function",
+                    "function": {"name": "todo_list", "arguments": '{"todos":[]}'},
+                },
+                {
+                    "id": "call_native_2",
+                    "type": "function",
+                    "function": {"name": "todo_list", "arguments": '{"todos":[]}'},
+                },
+            ],
+        }
+    ]
+    assert native_message["tool_calls"][0]["call_id"] == "call_native_1"
+    assert native_message["tool_calls"][0]["response_item_id"] == "fc_native_1"
+
+    with pytest.raises(RuntimeAdapterError, match="wire profile"):
+        _wire_messages(
+            [
+                {
+                    **native_message,
+                    "tool_calls": [
+                        {**native_message["tool_calls"][0], "unreviewed": "metadata"}
+                    ],
+                }
+            ]
+        )
+
+    with pytest.raises(RuntimeAdapterError, match="identifier"):
+        _wire_messages(
+            [
+                {
+                    **native_message,
+                    "tool_calls": [
+                        {**native_message["tool_calls"][0], "call_id": " "}
+                    ],
+                }
+            ]
+        )
+
+    with pytest.raises(RuntimeAdapterError, match="wire profile"):
+        _wire_messages(
+            [
+                {
+                    **native_message,
+                    "tool_calls": [
+                        {**native_message["tool_calls"][0], "id": 7}
+                    ],
+                }
+            ]
+        )
+
+
 def test_saved_turn_continuation_reuses_primary_history_without_admitting_a_user_row(
     tmp_path: Path,
     context_data: dict,
