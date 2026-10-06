@@ -207,6 +207,32 @@ def _synthetic_model(request, target):
     return _response(stage)
 
 
+def _install_fixture_transport(broker, identity):
+    from scientist.dispatch_authority import BoundDispatchTransport
+
+    bound = broker._transport
+    if (
+        not isinstance(bound, BoundDispatchTransport)
+        or bound.executor_id != identity.executor_id
+        or bound.incarnation != identity.process_incarnation
+        or not callable(bound.transport)
+    ):
+        raise RuntimeError("scientific fixture requires the exact bound dispatch transport")
+    original = bound.transport
+
+    def fixture_transport(request, target):
+        if request.kind == "llm":
+            return _synthetic_model(request, target)
+        return original(request, target)
+
+    bound.transport = fixture_transport
+
+    def restore():
+        bound.transport = original
+
+    return bound, restore
+
+
 def _stall_targeted_operation(request):
     from sqlalchemy import text
     from scientist import db
@@ -340,12 +366,11 @@ def _synthetic_resolver(host, port):
 
 def _with_fixture(app, *args, **kwargs):
     from scientist import broker
-    from scientist.dispatch_authority import BoundDispatchTransport
     from scientist.dispatch_runtime import parse_dispatch_config
 
     identity = parse_dispatch_config(Path("/run/scientist/dispatch/config.json").read_bytes())
     original_resolver = broker._resolver
-    broker._transport = BoundDispatchTransport(identity.executor_id, identity.process_incarnation, _synthetic_model)
+    _, restore_transport = _install_fixture_transport(broker, identity)
     broker._resolver = _synthetic_resolver
     boundary_state = {"calls": 0, "observed": 0}
     controller, original = None, None
@@ -411,6 +436,7 @@ def _with_fixture(app, *args, **kwargs):
     finally:
         if controller is not None:
             controller.boundary = original
+        restore_transport()
         broker._resolver = original_resolver
 
 

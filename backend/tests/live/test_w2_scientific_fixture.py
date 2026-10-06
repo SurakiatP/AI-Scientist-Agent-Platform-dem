@@ -222,3 +222,80 @@ def test_targeted_stop_stall_records_operation_then_times_out(monkeypatch):
     assert events[-2:] == [("commit",), ("sleep", 120)]
     marker = next(item for item in events if item[0] == "execute" and item[1].startswith("INSERT INTO w2_fixture_stalls"))
     assert marker[2] == {"run": request.run_id, "operation": request.operation_id}
+
+
+def test_fixture_transport_preserves_bound_dispatch_and_delegates_crossref_to_native_get(monkeypatch):
+    fixture = _load_fixture()
+    from scientist import broker
+    from scientist.contracts import CrossrefQueryV1, OperationRequest
+    from scientist.scholarly_retrieval import build_crossref_url
+
+    query = CrossrefQueryV1(
+        source_id="crossref", version=1, access_mode="public_read",
+        query="fixture query", doi=None, limit=5,
+    )
+    request = OperationRequest(
+        run_id=UUID("c5f6b6a7-7f53-4a40-9c38-1151bc6eb7d8"),
+        generation=1,
+        operation_id="synthetic-crossref-get",
+        kind="search",
+        payload={"request_id": "crossref", "query": query.model_dump(mode="json")},
+        reserve_tokens=0,
+    )
+    target = broker.DispatchTarget(
+        kind="search",
+        url=build_crossref_url(query),
+        approved_recipients=("https://api.crossref.org",),
+    )
+    events = []
+
+    class Response:
+        status = 200
+
+        def getheader(self, _name):
+            return None
+
+        def read(self, _limit):
+            return b'{"status":"ok","message-type":"work-list","message":{"items":[]}}'
+
+    class Connection:
+        def __init__(self, host, ip, port, _timeout):
+            events.append(("connect", host, ip, port))
+
+        def request(self, method, path, *, body, headers):
+            events.append(("request", method, path, body, headers))
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            events.append(("close",))
+
+    resolved = []
+    monkeypatch.setattr(broker, "_resolver", lambda host, port: resolved.append((host, port)) or ["8.8.8.8"])
+    monkeypatch.setattr(broker, "_PinnedHTTPSConnection", Connection)
+    synthetic_result = (b'{"synthetic":true}', 2)
+    monkeypatch.setattr(fixture, "_synthetic_model", lambda _request, _target: synthetic_result)
+    from scientist.dispatch_authority import BoundDispatchTransport
+
+    identity = SimpleNamespace(executor_id=UUID("3dc75415-5c6b-4ad9-a80f-b9b63c0a1f11"), process_incarnation=UUID("7fffa5f1-9197-4e7c-b204-10a4710e168e"))
+    bound = BoundDispatchTransport(identity.executor_id, identity.process_incarnation, broker.http_transport)
+    monkeypatch.setattr(broker, "_transport", bound)
+    installed, restore = fixture._install_fixture_transport(broker, identity)
+    try:
+        assert installed is bound and broker._transport is bound
+        assert bound.executor_id == identity.executor_id
+        assert bound.incarnation == identity.process_incarnation
+        assert bound.transport(SimpleNamespace(kind="llm"), target) == synthetic_result
+        assert events == [] and resolved == []
+        result, usage = bound.transport(request, target)
+        assert usage == 0
+        assert b'"records":[]' in result
+        assert resolved == [("api.crossref.org", 443)]
+        assert [event for event in events if event[0] == "request"] == [
+            ("request", "GET", "/works?query=fixture+query&rows=5", None, {"Host": "api.crossref.org"}),
+        ]
+        assert sum(event[0] == "connect" for event in events) == 1
+    finally:
+        restore()
+    assert broker._transport is bound and bound.transport is broker.http_transport
