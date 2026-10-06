@@ -1,4 +1,5 @@
 import Settings from './Settings';
+import ResearchSetup from './ResearchSetup';
 import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, NavLink, Outlet, Route, Routes, useLocation, useNavigationType } from 'react-router-dom';
 import Projects from './Projects';
@@ -22,14 +23,17 @@ function PageFocus() {
   const location = useLocation();
   const navigationType = useNavigationType();
   const scroll = useRef(new Map<string, number>());
-  const previous = useRef<{ key: string; top: number } | null>(null);
+  const previous = useRef<{ key: string; top: number; pathname: string } | null>(null);
   useLayoutEffect(() => {
     if (previous.current) scroll.current.set(previous.current.key, window.scrollY);
-    const top = navigationType === 'POP' ? scroll.current.get(location.key) ?? 0 : 0;
-    window.scrollTo(0, top);
-    requestAnimationFrame(() => document.querySelector<HTMLElement>('main h1')?.focus({ preventScroll: true }));
-    previous.current = { key: location.key, top };
-  }, [location.key, navigationType]);
+    const samePage = previous.current?.pathname === location.pathname;
+    const top = samePage ? window.scrollY : navigationType === 'POP' ? scroll.current.get(location.key) ?? 0 : 0;
+    if (!samePage) {
+      window.scrollTo(0, top);
+      requestAnimationFrame(() => document.querySelector<HTMLElement>('main h1')?.focus({ preventScroll: true }));
+    }
+    previous.current = { key: location.key, top, pathname: location.pathname };
+  }, [location.key, location.pathname, navigationType]);
   return null;
 }
 
@@ -41,6 +45,7 @@ export default function App() {
     <Route path="projects/:projectId/library" element={<Library />} />
     <Route path="projects/:projectId/sessions/:sessionId" element={<Chat />} />
     <Route path="projects/:projectId/runs" element={<RunHistory />} />
+    <Route path="projects/:projectId/research-setup" element={<ResearchSetup />} />
     <Route path="sources" element={<Library />} />
     <Route path="history" element={<RunHistory />} />
     <Route path="settings" element={<Settings />} />

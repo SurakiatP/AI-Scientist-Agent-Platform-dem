@@ -47,32 +47,31 @@ async function publishChatEvents(page: Page, fixture: { pushEvents: (...items: R
   for (const item of items) await emitChatEvent(page, index, item);
 }
 
-test('expanded artifact preserves controls and focus', async ({ page }) => {
+test('expanded artifact preserves fetched values and focus', async ({ page }) => {
   await installResearchFixtureRoutes(page);
   await page.goto(SESSION_URL);
-  await page.getByLabel('Diffusion').fill('0.7');
+  await expect(page.getByRole('cell', { name: '8.25' })).toBeVisible();
   const expand = page.getByRole('button', { name: 'Expand visual: Concentration profile' });
   await expand.click();
   const dialog = page.getByRole('dialog');
-  await expect(dialog.getByLabel('Diffusion')).toHaveValue('0.7');
-  await expect(dialog.getByText('Position (mm)')).toBeVisible();
-  await expect(dialog.getByText('Illustrative model profile')).toBeVisible();
-  await dialog.getByRole('button', { name: 'Play' }).click();
+  await expect(dialog.getByRole('cell', { name: '8.25' })).toBeVisible();
+  await expect(dialog.getByRole('columnheader', { name: 'measured concentration' })).toBeVisible();
+  await expect(dialog.getByRole('link', { name: 'Download output' })).toHaveAttribute('href', /\/artifacts\/.*\/content$/);
   await page.keyboard.press('Escape');
   await expect(dialog).toHaveCount(0);
   await expect(expand).toBeFocused();
-  await expect(page.getByLabel('Diffusion')).toHaveValue('0.7');
-  await expect(page.getByRole('button', { name: 'Pause' })).toBeVisible();
+  await expect(page.getByRole('cell', { name: '8.25' })).toBeVisible();
+  await expect(page.getByLabel('Diffusion')).toHaveCount(0);
 });
 
-test('language change keeps the question, chart value and messages', async ({ page }) => {
+test('language change keeps the question, fetched values and messages', async ({ page }) => {
   await installResearchFixtureRoutes(page);
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Does temperature change diffusion?');
-  await page.getByLabel('Diffusion').fill('0.7');
+  await expect(page.getByRole('cell', { name: '8.25' })).toBeVisible();
   await page.getByRole('button', { name: 'TH', exact: true }).click();
   await expect(page.getByLabel('คำถามวิจัย')).toHaveValue('Does temperature change diffusion?');
-  await expect(page.getByLabel('การแพร่')).toHaveValue('0.7');
+  await expect(page.getByRole('cell', { name: '8.25' })).toBeVisible();
   await expect(page.getByText('Original question about diffusion')).toBeVisible();
   await page.getByRole('button', { name: 'EN', exact: true }).click();
   await expect(page.getByLabel('Research question')).toHaveValue('Does temperature change diffusion?');
@@ -108,7 +107,7 @@ test('revision conflict refreshes the plan instead of approving it', async ({ pa
   await expect(page.getByText('The plan changed')).toBeVisible();
   await expect(page.getByLabel('Research stages (one per line)')).toHaveValue('search_literature');
   await page.getByRole('button', { name: 'Approve plan' }).click();
-  expect(fixture.writes.filter((w) => w.path.endsWith('/approve')).at(-1)!.body.expected_revision).toBe(3);
+  await expect.poll(() => fixture.writes.filter((w) => w.path.endsWith('/approve')).at(-1)!.body.expected_revision).toBe(3);
 });
 
 test('run states render distinctly with confirmed stage counts only', async ({ page }) => {

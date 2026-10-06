@@ -2,6 +2,7 @@ import { useEffect, useState, type CSSProperties, type Dispatch, type FormEvent,
 import { ApiError, apiErrorMessage, request } from './api';
 import { useAppPreferences } from './App';
 import { AppearanceSettings } from './preferences';
+import { Link, useSearchParams } from 'react-router-dom';
 
 type Language = 'en' | 'th';
 type ErrorLabel = 'load' | 'connection_save' | 'connection_remove' | 'peer_save' | 'peer_update' | 'peer_revoke' | 'token_create' | 'token_revoke';
@@ -83,6 +84,12 @@ function formatDate(value: string | null, language: Language) {
 
 export default function Settings() {
   const { language, ...preferences } = useAppPreferences();
+  const [search] = useSearchParams();
+  const setupProject = search.get('setup_project');
+  const setupQuery = new URLSearchParams();
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuid.test(search.get('setup_session') ?? '')) setupQuery.set('session', search.get('setup_session')!);
+  if (uuid.test(search.get('setup_run') ?? '')) setupQuery.set('run', search.get('setup_run')!);
   const tx = (english: string, thai: string) => language === 'th' ? thai : english;
   const [projects, setProjects] = useState<Resource<Project[]>>(empty());
   const [connections, setConnections] = useState<Resource<Connection[]>>(empty());
@@ -274,6 +281,14 @@ export default function Settings() {
       <h2>{tx('Appearance and language', 'รูปลักษณ์และภาษา')}</h2>
       <AppearanceSettings language={language} {...preferences} />
     </div>
+
+    <section className="settings-group settings-section" style={panelStyle} aria-labelledby="research-setup-title">
+      <h2 id="research-setup-title">{tx('Research Setup', 'ความพร้อมของงาน')}</h2>
+      <p>{tx('Review requirements and prepare a reviewed environment for a project. Saving a connection or preparing an environment does not approve a research plan.', 'ตรวจสอบข้อกำหนดและเตรียมสภาพแวดล้อมของโครงการ การบันทึกการเชื่อมต่อหรือเตรียมสภาพแวดล้อมไม่ได้อนุมัติแผนวิจัย')}</p>
+      <ResourceMessage resource={projects} loading={tx('Loading projects…', 'กำลังโหลดโครงการ…')} emptyText={tx('Create a project to review its research setup.', 'สร้างโครงการเพื่อดูความพร้อมของงาน')} language={language} />
+      {projectOptions.map((project) => <p key={project.id}><span>{project.name} · </span><Link to={`/projects/${encodeURIComponent(project.id)}/research-setup${project.id === setupProject && setupQuery.size ? `?${setupQuery}` : ''}`}>{tx('Research Setup', 'ความพร้อมของงาน')}</Link></p>)}
+      {setupProject && uuid.test(setupProject) && projectOptions.some((project) => project.id === setupProject) && <Link className="button button-quiet button-small" to={`/projects/${setupProject}/research-setup${setupQuery.size ? `?${setupQuery}` : ''}`}>{tx('Return to Research Setup', 'กลับไปยังความพร้อมของงาน')}</Link>}
+    </section>
 
     <section className="settings-group settings-section" style={panelStyle} aria-labelledby="connections-title">
       <h2 id="connections-title">{tx('Connections', 'การเชื่อมต่อ')}</h2>

@@ -1,20 +1,43 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ArtifactView } from '../../../contracts/api-types';
-import { requestBlob } from './api';
+import { apiErrorMessage, requestBlob } from './api';
 import { Markdown } from './Markdown';
 
 type Language = 'th' | 'en';
 const text = (language: Language, en: string, th: string) => language === 'th' ? th : en;
 
-export type VisualState = { diffusion: number; paused: boolean; time: number };
-export const INITIAL_VISUAL_STATE: VisualState = { diffusion: 0.45, paused: true, time: 0 };
 
-function profile(state: VisualState): string {
-  const variance = 2 * (0.1 + state.diffusion) * (1 + state.time / 4);
-  return Array.from({ length: 41 }, (_, i) => {
-    const x = -10 + i * 0.5;
-    return `${(150 + x * 13).toFixed(1)},${(130 - 100 * Math.exp(-(x * x) / (2 * variance * 4))).toFixed(1)}`;
-  }).join(' ');
+type Content = { type: string; body: string | null; url: string | null; truncated?: boolean };
+const MAX_TEXT_BYTES = 1024 * 1024;
+const MAX_ROWS = 100;
+const MAX_COLUMNS = 30;
+
+function csvRows(source: string): { rows: string[][]; truncated: boolean } {
+  const rows: string[][] = [];
+  let row: string[] = [], cell = '', quoted = false, truncated = false;
+  const addCell = () => { if (row.length < MAX_COLUMNS) row.push(cell.slice(0, 4096)); else truncated = true; cell = ''; };
+  const addRow = () => { addCell(); rows.push(row); row = []; };
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === '"') {
+      if (quoted && source[index + 1] === '"') { if (cell.length < 4096) cell += '"'; index += 1; }
+      else quoted = !quoted;
+    } else if (char === ',' && !quoted) addCell();
+    else if ((char === '\n' || char === '\r') && !quoted) {
+      if (char === '\r' && source[index + 1] === '\n') index += 1;
+      addRow();
+      if (rows.length > MAX_ROWS) { truncated = index < source.length - 1; break; }
+    } else if (cell.length < 4096) cell += char;
+    else truncated = true;
+  }
+  if (rows.length <= MAX_ROWS && (cell || row.length)) addRow();
+  if (quoted) throw new Error('Invalid table content.');
+  return { rows, truncated };
+}
+
+function Table({ body, language }: { body: string; language: Language }) {
+  const { rows, truncated } = csvRows(body);
+  return <>{truncated && <p>{text(language, 'Preview limited to 100 rows and 30 columns. Download the complete file.', 'ตัวอย่างแสดงไม่เกิน 100 แถวและ 30 คอลัมน์ ดาวน์โหลดไฟล์ฉบับเต็ม')}</p>}<div className="table-scroll" role="region" aria-label={text(language, 'Output table', 'ตารางผลลัพธ์')} tabIndex={0}><table><thead><tr>{rows[0]?.map((cell, index) => <th scope="col" key={index}>{cell}</th>)}</tr></thead><tbody>{rows.slice(1, MAX_ROWS + 1).map((row, index) => <tr key={index}>{row.map((cell, column) => <td key={column}>{cell}</td>)}</tr>)}</tbody></table></div></>;
 }
 
 function Provenance({ artifact, language }: { artifact: ArtifactView; language: Language }) {
@@ -22,56 +45,56 @@ function Provenance({ artifact, language }: { artifact: ArtifactView; language: 
 }
 
 function Report({ artifact, language }: { artifact: ArtifactView; language: Language }) {
-  const [body, setBody] = useState<string | null>(null);
-  const [failed, setFailed] = useState(false);
+  const [content, setContent] = useState<Content | null>(null);
+  const [error, setError] = useState<unknown>(null);
   useEffect(() => {
     const controller = new AbortController();
-    requestBlob(`/api/v1/artifacts/${artifact.artifact_id}/content`, controller.signal)
-      .then(({ blob }) => blob.text()).then((value) => { if (!controller.signal.aborted) setBody(value); })
-      .catch(() => { if (!controller.signal.aborted) setFailed(true); });
-    return () => controller.abort();
-  }, [artifact.project_id, artifact.artifact_id]);
-  if (failed) return <p role="alert">{text(language, 'This output could not be loaded.', 'ไม่สามารถโหลดผลลัพธ์นี้ได้')}</p>;
-  return body === null ? <p role="status">{text(language, 'Loading output…', 'กำลังโหลดผลลัพธ์…')}</p> : <Markdown source={body} language={language} />;
+    let objectUrl: string | null = null;
+    setContent(null); setError(null);
+    void requestBlob(`/api/v1/artifacts/${encodeURIComponent(artifact.artifact_id)}/content`, controller.signal).then(async ({ blob, contentType }) => {
+      if (controller.signal.aborted) return;
+      const media = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf'].includes(contentType);
+      const readable = ['text/plain', 'text/markdown', 'text/csv', 'application/json'].includes(contentType);
+      if (media) {
+        objectUrl = URL.createObjectURL(blob);
+        setContent({ type: contentType, body: null, url: objectUrl });
+      } else if (readable && blob.size <= MAX_TEXT_BYTES) {
+        let body = await blob.text();
+        if (controller.signal.aborted) return;
+        if (contentType === 'application/json') body = JSON.stringify(JSON.parse(body), null, 2);
+        if (contentType === 'text/csv') csvRows(body);
+        setContent({ type: contentType, body, url: null });
+      } else setContent({ type: 'unsupported', body: null, url: null, truncated: readable });
+    }).catch((reason) => { if (!controller.signal.aborted) setError(reason); });
+    return () => { controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [artifact.project_id, artifact.artifact_id, artifact.sha256]);
+  if (error !== null) return <p role="alert">{apiErrorMessage(error, language)}</p>;
+  if (!content) return <p role="status">{text(language, 'Loading output…', 'กำลังโหลดผลลัพธ์…')}</p>;
+  if (content.type.startsWith('image/') && content.url) return <img className="artifact-image" src={content.url} alt={artifact.title} />;
+  if (content.type === 'application/pdf' && content.url) return <iframe className="artifact-document" src={content.url} title={artifact.title} sandbox="" />;
+  if (content.type === 'text/csv' && content.body !== null) return <Table body={content.body} language={language} />;
+  if (content.type === 'text/markdown' && content.body !== null) return <Markdown source={content.body} language={language} />;
+  if (content.body !== null) return <pre className="artifact-text" tabIndex={0}>{content.body}</pre>;
+  return <p>{content.truncated ? text(language, 'This file is too large to preview. Download the complete file.', 'ไฟล์นี้ใหญ่เกินกว่าจะแสดงตัวอย่าง ดาวน์โหลดไฟล์ฉบับเต็ม') : text(language, 'Preview unavailable for this file type.', 'ไม่สามารถแสดงตัวอย่างไฟล์ประเภทนี้ได้')}</p>;
 }
 
-export function ArtifactBody({ artifact, state, onStateChange, language }: { artifact: ArtifactView; state: VisualState; onStateChange: (state: VisualState) => void; language: Language }) {
-  const id = useId();
-  if (artifact.kind === 'report') return <><Provenance artifact={artifact} language={language} /><Report artifact={artifact} language={language} /></>;
-  if (artifact.kind !== 'plot') return <Provenance artifact={artifact} language={language} />;
-  const label = text(language, 'Diffusion', 'การแพร่');
-  const description = text(language, 'Concentration profile broadens as the setting increases.', 'โปรไฟล์ความเข้มข้นกว้างขึ้นเมื่อเพิ่มค่าตั้งต้น');
-  return <div className="artifact-visual">
-    <Provenance artifact={artifact} language={language} />
-    <svg viewBox="0 0 300 170" role="img" aria-label={description}>
-      <path d="M20 130H290M150 20V130" stroke="var(--line)" />
-      <polyline points={profile(state)} fill="none" stroke="var(--accent)" strokeWidth="2" />
-      <text x="290" y="148" textAnchor="end" fontSize="9" fill="var(--muted)">{text(language, 'Position (mm)', 'ตำแหน่ง (มม.)')}</text>
-      <text x="24" y="16" fontSize="9" fill="var(--muted)">{text(language, 'Concentration (a.u.)', 'ความเข้มข้น (หน่วยสัมพัทธ์)')}</text>
-    </svg>
-    <p className="artifact-legend"><span aria-hidden="true" className="legend-swatch" /> {text(language, 'Illustrative model profile', 'โปรไฟล์จากแบบจำลองเพื่อประกอบความเข้าใจ')}</p>
-    <label htmlFor={`${id}-d`}>{label} <output htmlFor={`${id}-d`}>{state.diffusion.toFixed(2)}</output></label>
-    <input id={`${id}-d`} type="range" min="0" max="1" step="0.05" value={state.diffusion} onChange={(event) => onStateChange({ ...state, diffusion: Number(event.target.value) })} />
-    <div className="lab-actions">
-      <button type="button" className="button button-small" onClick={() => onStateChange({ ...state, paused: !state.paused })}>{state.paused ? text(language, 'Play', 'เล่น') : text(language, 'Pause', 'หยุดชั่วคราว')}</button>
-      <button type="button" className="button button-quiet button-small" onClick={() => onStateChange({ ...INITIAL_VISUAL_STATE })}>{text(language, 'Reset', 'เริ่มใหม่')}</button>
-    </div>
-  </div>;
+export function ArtifactBody({ artifact, language }: { artifact: ArtifactView; language: Language }) {
+  return <div className="artifact-content"><Provenance artifact={artifact} language={language} /><Report artifact={artifact} language={language} /><a className="button button-quiet button-small" href={`/api/v1/artifacts/${encodeURIComponent(artifact.artifact_id)}/content`} download={artifact.title}>{text(language, 'Download output', 'ดาวน์โหลดผลลัพธ์')}</a></div>;
 }
 
-export function ArtifactCard({ artifact, state, onStateChange, onExpand, language }: { artifact: ArtifactView; state: VisualState; onStateChange: (state: VisualState) => void; onExpand: (opener: HTMLElement) => void; language: Language }) {
+export function ArtifactCard({ artifact, onExpand, language }: { artifact: ArtifactView; onExpand: (opener: HTMLElement) => void; language: Language }) {
   return <article className="artifact-card" aria-label={artifact.title}>
     <h3>{artifact.title}</h3>
-    <ArtifactBody artifact={artifact} state={state} onStateChange={onStateChange} language={language} />
+    <ArtifactBody artifact={artifact} language={language} />
     <button type="button" className="button button-quiet button-small" aria-label={`${text(language, 'Expand visual', 'ขยายภาพ')}: ${artifact.title}`} onClick={(event) => onExpand(event.currentTarget)}>{text(language, 'Expand visual', 'ขยายภาพ')}</button>
   </article>;
 }
 
-export function ArtifactViewer({ artifact, state, onStateChange, onClose, language }: { artifact: ArtifactView; state: VisualState; onStateChange: (state: VisualState) => void; onClose: () => void; language: Language }) {
+export function ArtifactViewer({ artifact, onClose, language }: { artifact: ArtifactView; onClose: () => void; language: Language }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => { const node = dialog.current; if (node && !node.open) node.showModal(); }, []);
   return <dialog ref={dialog} className="artifact-dialog" aria-labelledby="artifact-dialog-title" onCancel={(event) => { event.preventDefault(); onClose(); }} onClose={onClose}>
     <div className="drawer-head"><h2 id="artifact-dialog-title">{artifact.title}</h2><button type="button" className="button button-quiet button-small" onClick={onClose}>{text(language, 'Close', 'ปิด')}</button></div>
-    <ArtifactBody artifact={artifact} state={state} onStateChange={onStateChange} language={language} />
+    <ArtifactBody artifact={artifact} language={language} />
   </dialog>;
 }

@@ -1,3 +1,29 @@
+import type { PlanView, PreparationJobView, RunReadinessView, RunView } from '../../../contracts/api-types';
+
+export type ResearchWorkflow = 'literature' | 'resources';
+export const preparePlan = (runId: string, expectedRevision: number, searchTerms: string[], workflow: ResearchWorkflow = 'literature') => request<RunView>(`/api/v1/runs/${encodeURIComponent(runId)}/prepare-plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_revision: expectedRevision, workflow, search_terms: searchTerms }) });
+export const getPreparation = (projectId: string, jobId: string, signal?: AbortSignal) => request<PreparationJobView>(`/api/v1/projects/${encodeURIComponent(projectId)}/preparations/${encodeURIComponent(jobId)}`, { signal });
+
+const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+export const validUuid = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+const digest = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+const integer = (value: unknown, minimum = 0): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum;
+const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === 'string');
+const optionalString = (value: unknown) => value === undefined || value === null || typeof value === 'string';
+
+export function strictPlanView(value: unknown, currentRun: RunView): value is PlanView {
+  if (!record(value) || !validUuid(value.run_id) || value.run_id !== currentRun.run_id || !integer(value.revision, 1) || !integer(currentRun.revision, 1) || value.revision !== currentRun.revision || !digest(value.plan_digest) || !record(value.plan)) return false;
+  const plan = value.plan;
+  if (!digest(plan.input_snapshot_digest) || !validUuid(plan.provider_id) || typeof plan.model !== 'string' || !plan.model || !strings(plan.stages) || !strings(plan.allowed_ops) || !strings(plan.data_recipients) || !integer(plan.token_limit) || !integer(plan.elapsed_limit_ms) || !Array.isArray(plan.packages) || !plan.packages.every((item) => record(item) && typeof item.name === 'string' && typeof item.version === 'string' && typeof item.source === 'string' && digest(item.sha256)) || (plan.peer_releases !== undefined && (!Array.isArray(plan.peer_releases) || !plan.peer_releases.every(record)))) return false;
+  if (plan.scientific === undefined || plan.scientific === null) return true;
+  const binding = plan.scientific;
+  return record(binding) && binding.catalog_commit === '154988403bb5a18e9d3c0ce4e6d5e2e4b184a298' && digest(binding.registry_sha256) && strings(binding.capability_ids) && binding.capability_ids.length > 0 && digest(binding.instruction_fingerprint) && typeof binding.profile_id === 'string' && binding.profile_id.length > 0 && (binding.profile_version === undefined || binding.profile_version === '1') && (binding.tool_version === undefined || binding.tool_version === '1') && typeof binding.image_digest === 'string' && /^sha256:[0-9a-f]{64}$/.test(binding.image_digest) && binding.input_snapshot_digest === plan.input_snapshot_digest && (binding.parameters === undefined || record(binding.parameters)) && integer(binding.max_result_bytes, 1) && integer(binding.timeout_ms, 1) && integer(binding.memory_limit_bytes, 1) && integer(binding.workspace_limit_bytes, 1);
+}
+
+export function strictReadiness(value: unknown, currentRun: RunView): value is RunReadinessView {
+  return record(value) && validUuid(value.run_id) && value.run_id === currentRun.run_id && integer(value.revision, 1) && integer(currentRun.revision, 1) && value.revision === currentRun.revision && digest(value.plan_digest) && (value.binding_sha256 === undefined || value.binding_sha256 === null || digest(value.binding_sha256)) && typeof value.state === 'string' && ['ready', 'missing', 'preparing', 'blocked', 'failed'].includes(value.state) && Array.isArray(value.requirements) && value.requirements.every((item) => record(item) && typeof item.id === 'string' && typeof item.label === 'string' && typeof item.purpose === 'string' && typeof item.state === 'string' && ['ready', 'missing', 'preparing', 'blocked', 'failed'].includes(item.state) && typeof item.action === 'string' && ['none', 'configure_connection', 'prepare_environment', 'request_approval', 'provide_hardware'].includes(item.action) && optionalString(item.reason));
+}
+
 export class ApiError extends Error {
   readonly code: string;
   readonly status: number;
@@ -101,13 +127,44 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
   return body as T;
 }
 
-export async function requestBlob(path: string, signal?: AbortSignal): Promise<{ blob: Blob; contentType: string }> {
-  const response = await fetch(safePath(path), { credentials: 'same-origin', redirect: 'error', headers: { Accept: 'application/pdf, text/plain, text/markdown, text/csv' }, signal });
+export async function requestBlob(path: string, signal?: AbortSignal, maxBytes = 8 * 1024 * 1024): Promise<{ blob: Blob; contentType: string }> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new TypeError('Invalid content limit.');
+  const response = await fetch(safePath(path), { credentials: 'same-origin', redirect: 'error', headers: { Accept: 'application/pdf, text/plain, text/markdown, text/csv, application/json, image/png, image/jpeg, image/webp, image/gif' }, signal });
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
     throw toApiError(response.status, body);
   }
-  return { blob: await response.blob(), contentType: response.headers.get('content-type')?.split(';')[0] ?? 'application/octet-stream' };
+  const contentType = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() ?? 'application/octet-stream';
+  const declared = response.headers.get('content-length');
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maxBytes)) {
+    await response.body?.cancel();
+    throw new ApiError('request_too_large', 413, '');
+  }
+  if (!response.body) return { blob: new Blob([], { type: contentType }), contentType };
+  const reader = response.body.getReader();
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel();
+        throw new ApiError('request_too_large', 413, '');
+      }
+      chunks.push(new Uint8Array(value));
+    }
+  } finally { reader.releaseLock(); }
+  return { blob: new Blob(chunks, { type: contentType }), contentType };
+}
+
+export function newRequestId(): string {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 export function resetApiSessionForTests() {

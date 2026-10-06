@@ -5,6 +5,18 @@
 .connection-badge.is-offline { color: var(--warning); border: 1px solid var(--warning); }
 .artifact-dialog { width: min(1180px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow: auto; padding: 20px; border: 1px solid var(--line); border-radius: var(--radius-dialog); background: var(--surface); color: var(--ink); }
 .artifact-visual svg { width: 100%; max-width: 640px; height: auto; }
+.research-setup { max-width: 1000px; }
+.setup-panel, .setup-profile, .plan-readiness { min-width: 0; padding: 16px; margin: 16px 0; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface); overflow-wrap: anywhere; }
+.setup-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.setup-panel ul { padding-left: 20px; }
+.setup-profile dl { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 12px; }
+.setup-profile dd { margin: 0; }
+.artifact-image { display: block; max-width: 100%; max-height: 70vh; width: auto; height: auto; object-fit: contain; }
+.artifact-document { display: block; width: 100%; min-height: 440px; border: 1px solid var(--line); }
+.artifact-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 70vh; overflow: auto; }
+.artifact-content { min-width: 0; }
+.artifact-content .button { margin-top: 12px; }
+.artifact-content .table-scroll { max-height: 70vh; }
 .legend-swatch { display: inline-block; width: 18px; height: 3px; background: var(--accent); vertical-align: middle; }
 .report-text { max-width: 72ch; line-height: 1.7; }
 .report-text pre, .table-scroll { overflow-x: auto; }

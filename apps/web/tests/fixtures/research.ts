@@ -16,6 +16,7 @@ export const DECISION_UNKNOWN = 'aaaaaaaa-0000-4000-8000-000000000002';
 export const READY_FILE = 'f1111111-1111-4111-8111-111111111111';
 export const BAD_FILE = 'f2222222-2222-4222-8222-222222222222';
 export const REPORT_MARKDOWN = 'Findings summary.\n\n$$E = mc^2$$\n\n```python\nprint("diffusion")\n```\n';
+export const PLOT_CSV = 'sample,measured concentration\ncontrol,8.25\ntreated,3.75\n';
 
 const artifact = (id: string, kind: ArtifactView['kind'], title: string, partial = false): ArtifactView => ({ artifact_id: id, project_id: PROJECT_ID, run_id: RUN_ID, title, kind, sha256: 'a'.repeat(64), size: 100, content_type: kind === 'report' ? 'text/markdown' : 'application/json', partial });
 export const plot = artifact(PLOT_ID, 'plot', 'Concentration profile');
@@ -80,6 +81,7 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
     if (method === 'POST' && path === `/projects/${PROJECT_ID}/files`) { uploaded = { id: 'f3333333-3333-4333-8333-333333333333', project_id: PROJECT_ID, filename: 'uploaded.csv', size: 5, content_type: 'text/csv', state: 'preparing' }; fileListCount = 0; return json(uploaded, 201); }
     if (method === 'DELETE') { deletes.push(path); return json({}); }
     if (method === 'GET' && path === `/artifacts/${REPORT_ID}/content`) return route.fulfill({ status: 200, contentType: 'text/markdown', body: options.reportMarkdown ?? REPORT_MARKDOWN });
+    if (method === 'GET' && path === `/artifacts/${PLOT_ID}/content`) return route.fulfill({ status: 200, contentType: 'text/csv', body: PLOT_CSV });
     if (method === 'POST' && path === `/sessions/${SESSION_ID}/runs`) {
       const unknown = Object.keys(body ?? {}).filter((k) => !SUBMIT_FIELDS.includes(k));
       if (unknown.length || SUBMIT_FIELDS.some((k) => !(k in (body ?? {})))) return json({ detail: [{ type: 'extra_forbidden', loc: ['body'], msg: 'Extra inputs are not permitted' }] }, 422);
@@ -104,10 +106,11 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
         const size = options.pageSize ?? 100; const latest = events.at(-1)?.sequence ?? 0;
         return json({ events: events.filter((e) => e.sequence > after).slice(0, size), latest_cursor: latest });
       }
-      if (method === 'GET' && sub === '/plan') return json(plan);
+      if (method === 'GET' && sub === '/plan') return json({ ...plan, run_id: runMatch[1] });
+      if (method === 'GET' && sub === '/readiness') return json({ run_id: runMatch[1], revision: plan.revision, plan_digest: plan.plan_digest, state: 'ready', requirements: [] });
       if (method === 'PATCH' && sub === '/plan') { plan = makePlan(plan.revision + 1, body.plan.stages); run = { ...run!, revision: run!.revision + 1 }; return json(run); }
       if (method === 'POST' && sub === '/approve') {
-        if (options.conflictOnApprove && body.expected_revision === 1) { plan = makePlan(3, ['search_literature']); return err('revision_conflict', 409); }
+        if (options.conflictOnApprove && body.expected_revision === 1) { plan = makePlan(3, ['search_literature']); run = { ...run!, revision: 3 }; return err('revision_conflict', 409); }
         run = makeRun({ run_id: NEW_RUN_ID, state: 'queued', artifacts: [] }); return json(run);
       }
       if (method === 'POST' && sub === '/stop') { run = { ...run!, state: 'stopping' }; return json(run); }
