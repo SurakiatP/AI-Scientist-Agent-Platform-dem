@@ -18,8 +18,14 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import ValidationError
 
-from scientist.contracts import OperationRequest, OperationResult
-from scientist.contracts import ScientificBinding
+from scientist.contracts import (
+    CsvDescribeGrantV1,
+    CrossrefQueryV1,
+    OperationRequest,
+    OperationResult,
+    ScientificBinding,
+    ScientificBindingV2,
+)
 from scientist.instruction_loader import InstructionBundle
 from scientist.model_payload import (
     ChatMessage,
@@ -31,6 +37,7 @@ from scientist.runtime_contracts import (
     AppliedToolId,
     BoundaryAck,
     BoundaryRequest,
+    ComputeResultEnvelopeV2,
     CompactedContext,
     MicroCompactionState,
     OperationMapping,
@@ -41,6 +48,8 @@ from scientist.runtime_contracts import (
     WorkspaceFile,
     WorkspaceEntry,
     ScientificResultReceipt,
+    ScientificOutputReceiptV2,
+    ScientificResultReceiptV2,
     canonical_bytes,
     operation_fingerprint,
     validate_workspace_path,
@@ -52,7 +61,12 @@ _DEFAULT_MODEL_OUTPUT_TOKENS = 2048
 _COMPRESSION_MAX_OUTPUT_TOKENS = 2048
 _REVIEWED_NATIVE_TODO_TOOL_NAMES = frozenset({"todo_list", "todo"})
 _REVIEWED_NATIVE_TODO_BRIDGE = "tool_call"
-_REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES = frozenset({"instruction_view", "scientific_resources"})
+_REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES = frozenset({
+    "instruction_view",
+    "scientific_resources",
+    "scientific_search",
+    "scientific_csv_describe",
+})
 _NATIVE_TOOL_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "scientist_native_tool_call_id", default=None
 )
@@ -159,16 +173,104 @@ def _native_tool_call_mapping(value: Any) -> dict[str, Any]:
 def _validate_native_tool_arguments(name: str, arguments: Any, binding: ScientificBinding | None) -> None:
     if not isinstance(arguments, dict):
         raise RuntimeAdapterError("native tool arguments must be an object")
-    if name == "scientific_resources":
+    if name == "scientific_search":
+        requests = getattr(binding, "approved_crossref_queries", None)
+        request_id = arguments.get("request_id")
+        if (
+            binding is None
+            or set(arguments) != {"request_id"}
+            or not isinstance(requests, dict)
+            or not isinstance(request_id, str)
+            or request_id not in requests
+        ):
+            raise RuntimeAdapterError("Crossref request outside approved authority")
+    elif name == "scientific_csv_describe":
+        grants = getattr(binding, "csv_describe_grants", None)
+        grant_id = arguments.get("grant_id")
+        if (
+            binding is None
+            or set(arguments) != {"grant_id"}
+            or not isinstance(grants, dict)
+            or not isinstance(grant_id, str)
+            or grant_id not in grants
+        ):
+            raise RuntimeAdapterError("CSV grant outside approved authority")
+    elif name == "scientific_resources":
         if arguments or binding is None or "get-available-resources" not in binding.capability_ids:
-            raise RuntimeAdapterError("scientific resource request is outside approved authority")
+            raise RuntimeAdapterError("scientific resource request outside approved authority")
     elif name == "instruction_view":
         if (
             binding is None
             or set(arguments) != {"capability_id"}
             or arguments.get("capability_id") not in binding.capability_ids
         ):
-            raise RuntimeAdapterError("instruction request is outside approved authority")
+            raise RuntimeAdapterError("instruction request outside approved authority")
+    else:
+        raise RuntimeAdapterError("native tool outside reviewed scientific surface")
+
+
+def _native_scientific_tool_definitions(
+    binding: ScientificBinding | ScientificBindingV2 | None,
+) -> list[dict[str, Any]]:
+    if binding is None:
+        return []
+    definitions = [
+        {
+            "name": "instruction_view",
+            "description": "Read selected approved scientific instruction untrusted reference text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "capability_id": {"type": "string", "enum": list(binding.capability_ids)}
+                },
+                "required": ["capability_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "scientific_resources",
+            "description": "Measure bounded CPU memory limits inside this approved worker.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    ]
+    if isinstance(binding, ScientificBindingV2):
+        definitions.extend([
+            {
+                "name": "scientific_search",
+                "description": "Search Crossref using one owner-approved request.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "request_id": {
+                            "type": "string",
+                            "enum": list(binding.approved_crossref_queries),
+                        }
+                    },
+                    "required": ["request_id"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "scientific_csv_describe",
+                "description": "Describe an approved CSV with the pinned bounded recipe.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "grant_id": {
+                            "type": "string",
+                            "enum": list(binding.csv_describe_grants),
+                        }
+                    },
+                    "required": ["grant_id"],
+                    "additionalProperties": False,
+                },
+            },
+        ])
+    return definitions
 
 
 def _validate_native_todo_call(agent: Any, call: Any) -> tuple[str, dict[str, Any]]:
@@ -296,6 +398,82 @@ def _wire_messages(messages: Any) -> list[dict[str, Any]]:
         projected.append(parsed.model_dump(mode="json", exclude_unset=True))
     return projected
 
+
+
+def _write_or_verify_scientific_result(workspace_dir: Path, path: str, content: bytes) -> None:
+    try:
+        _write_scientific_result(workspace_dir, path, content)
+        return
+    except RuntimeAdapterError as exc:
+        original_error = exc
+    relative = validate_workspace_path(path)
+    root_info = workspace_dir.lstat()
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise RuntimeAdapterError("scientific workspace root is unsafe") from original_error
+    target = workspace_dir / relative
+    current = workspace_dir
+    for part in PurePosixPath(relative).parts[:-1]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise RuntimeAdapterError("existing scientific result path is unsafe") from exc
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise RuntimeAdapterError("existing scientific result parent is unsafe") from original_error
+    try:
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise RuntimeAdapterError("existing scientific result is unavailable") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size != len(content)
+            or info.st_size > 256 * 1024
+        ):
+            raise RuntimeAdapterError("existing scientific result differs from its verified output")
+        chunks = bytearray()
+        while len(chunks) <= len(content):
+            block = os.read(descriptor, min(65536, len(content) + 1 - len(chunks)))
+            if not block:
+                break
+            chunks.extend(block)
+        if bytes(chunks) != content:
+            raise RuntimeAdapterError("existing scientific result differs from its verified output")
+    finally:
+        os.close(descriptor)
+
+
+def _collect_native_v2_receipts(
+    outputs: dict[str, dict[str, Any]],
+    applied_to_raw: dict[str, str],
+    completed_raw_ids: set[str],
+) -> tuple[list[ScientificResultReceiptV2], list[WorkspaceEntry]]:
+    receipts: list[ScientificResultReceiptV2] = []
+    workspace: list[WorkspaceEntry] = []
+    for applied_id, output in outputs.items():
+        receipt = output.get("receipt_v2")
+        if receipt is None:
+            continue
+        raw_id = applied_to_raw.get(applied_id)
+        entries = output.get("workspace_entries_v2")
+        if (
+            not isinstance(receipt, ScientificResultReceiptV2)
+            or not isinstance(raw_id, str)
+            or raw_id not in completed_raw_ids
+            or not isinstance(entries, list)
+            or len(entries) != 4
+            or any(not isinstance(entry, WorkspaceEntry) for entry in entries)
+        ):
+            raise RuntimeAdapterError("V2 scientific receipt is not bound to a completed native call")
+        if [(item.path, item.sha256, item.size) for item in receipt.outputs] != [
+            (entry.path, entry.sha256, entry.size) for entry in entries
+        ]:
+            raise RuntimeAdapterError("V2 scientific receipt differs from its workspace outputs")
+        receipts.append(receipt.model_copy(update={"tool_call_id": raw_id}))
+        workspace.extend(entries)
+    return receipts, workspace
 
 def _native_message_metadata(messages: list[Any]) -> list[NativeMessageMetadata]:
     """Keep native transcript timestamps outside the strict provider message schema."""
@@ -500,7 +678,8 @@ class RuntimeAdapter:
         context = context.model_copy(
             update={
                 "workspace_manifest": [
-                    {"path": item.path, "sha256": item.sha256, "size": item.size} for item in workspace
+                    WorkspaceEntry(path=item.path, sha256=item.sha256, size=item.size)
+                    for item in workspace
                 ]
             }
         )
@@ -601,6 +780,253 @@ class RuntimeAdapter:
         self._charges[operation_id] = reserve_tokens
         self.context = RuntimeContextV1.model_validate(self.context.model_dump(mode="json"))
         return request, mapping
+
+    def _next_tool_operation(
+        self,
+        *,
+        kind: Literal["search", "compute"],
+        tool_call_id: str,
+        payload: dict[str, Any],
+    ) -> tuple[OperationRequest, OperationMapping]:
+        if not tool_call_id or tool_call_id.strip() != tool_call_id or "|" in tool_call_id:
+            raise RuntimeAdapterError("invalid raw tool-call identity")
+        if kind not in {"search", "compute"}:
+            raise RuntimeAdapterError("unreviewed scientific operation")
+        for mapping in reversed(self.context.operation_mappings):
+            if (
+                mapping.turn_id == self.context.turn_id
+                and mapping.purpose == "tool"
+                and mapping.tool_call_id == tool_call_id
+            ):
+                request = mapping.request.model_copy(update={"generation": self.context.generation})
+                if (
+                    request.kind != kind
+                    or request.payload != payload
+                    or request.reserve_tokens != 0
+                    or operation_fingerprint(request) != mapping.payload_hash
+                ):
+                    raise RuntimeAdapterError("replayed scientific operation fingerprint changed")
+                return request, mapping
+        operation_id = str(
+            uuid.uuid5(self.context.run_id, f"{self.context.turn_id}:tool:{tool_call_id}")
+        )
+        request = OperationRequest(
+            run_id=self.context.run_id,
+            generation=self.context.generation,
+            operation_id=operation_id,
+            kind=kind,
+            payload=payload,
+            reserve_tokens=0,
+        )
+        mapping = OperationMapping(
+            operation_id=operation_id,
+            turn_id=self.context.turn_id,
+            purpose="tool",
+            model_sequence=None,
+            tool_call_id=tool_call_id,
+            request=request,
+            payload_hash=operation_fingerprint(request),
+        )
+        self.context = RuntimeContextV1.model_validate(
+            self.context.model_copy(
+                update={"operation_mappings": [*self.context.operation_mappings, mapping]}
+            ).model_dump(mode="json")
+        )
+        return request, mapping
+
+    def _execute_tool_effect(self, request: OperationRequest) -> bytes:
+        self._checkpoint("before_tool")
+        self.unresolved_effects.add(request.operation_id)
+        try:
+            posted = self._broker.post(
+                f"{self.broker_url}/effects",
+                content=canonical_bytes(request.model_dump(mode="json")),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Worker-Capability": self._capability,
+                },
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise EffectUnresolved(
+                "scientific operation outcome unknown; controller reconciliation required"
+            ) from exc
+        if len(posted.content) > _MAX_BROKER_RESPONSE:
+            raise RuntimeAdapterError("scientific operation response exceeds its limit")
+        if posted.status_code == 409:
+            try:
+                code = posted.json()["detail"]["code"]
+            except (ValueError, KeyError, TypeError):
+                code = None
+            if code == "budget_exhausted":
+                self.unresolved_effects.discard(request.operation_id)
+                self.budget_exhausted = True
+                raise BudgetExhausted("broker refused scientific operation under the approved budget")
+        try:
+            posted.raise_for_status()
+            result = OperationResult.model_validate_json(posted.content)
+        except (httpx.HTTPStatusError, ValidationError) as exc:
+            raise RuntimeAdapterError("scientific operation was not acknowledged") from exc
+        if result.operation_id != request.operation_id:
+            raise RuntimeAdapterError("scientific operation identity mismatch")
+        if result.state == "unknown":
+            raise EffectUnresolved("scientific operation outcome unknown; controller reconciliation required")
+        if result.state == "denied":
+            self.unresolved_effects.discard(request.operation_id)
+            raise EffectDenied("broker denied scientific operation")
+        if result.state != "committed" or result.result is None:
+            raise RuntimeAdapterError("committed scientific operation has no result reference")
+        if (
+            result.result.project_id != self.context.project_id
+            or result.result.content_type != "application/octet-stream"
+        ):
+            raise RuntimeAdapterError("scientific result reference outside the approved project")
+        self.unresolved_effects.discard(request.operation_id)
+        try:
+            fetched = self._broker.get(
+                f"{self.broker_url}/effects/{request.operation_id}/result",
+                headers={"X-Worker-Capability": self._capability},
+            )
+            fetched.raise_for_status()
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+            raise EffectUnresolved("committed scientific result is not yet available") from exc
+        if (
+            len(fetched.content) > _MAX_BROKER_RESPONSE
+            or len(fetched.content) != result.result.size
+            or hashlib.sha256(fetched.content).hexdigest() != result.result.sha256.lower()
+        ):
+            raise RuntimeAdapterError("scientific result bytes differ from the committed reference")
+        return fetched.content
+
+    def _run_approved_search(self, request_id: str, tool_call_id: str) -> dict[str, Any]:
+        binding = self.context.plan.scientific
+        if not isinstance(binding, ScientificBindingV2):
+            raise RuntimeAdapterError("approved Crossref binding is unavailable")
+        _validate_native_tool_arguments("scientific_search", {"request_id": request_id}, binding)
+        query = binding.approved_crossref_queries[request_id]
+        request, mapping = self._next_tool_operation(
+            kind="search",
+            tool_call_id=tool_call_id,
+            payload={"request_id": request_id, "query": query.model_dump(mode="json")},
+        )
+        try:
+            result = json.loads(self._execute_tool_effect(request))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeAdapterError("invalid Crossref result JSON") from exc
+        expected_request = {"query": query.query, "doi": query.doi, "limit": query.limit}
+        provenance = result.get("provenance") if isinstance(result, dict) else None
+        records = result.get("records") if isinstance(result, dict) else None
+        if (
+            not isinstance(result, dict)
+            or result.get("source_id") != "crossref"
+            or result.get("access_mode") != "public_read"
+            or not isinstance(provenance, dict)
+            or provenance.get("source_id") != "crossref"
+            or provenance.get("access_mode") != "public_read"
+            or provenance.get("request") != expected_request
+            or not isinstance(records, list)
+            or len(records) > query.limit
+            or result.get("record_count") != len(records)
+        ):
+            raise RuntimeAdapterError("Crossref result provenance differs from its approved request")
+        return result
+
+    def _run_approved_csv_describe(
+        self,
+        grant_id: str,
+        tool_call_id: str,
+    ) -> tuple[str, ScientificResultReceiptV2, list[WorkspaceEntry]]:
+        binding = self.context.plan.scientific
+        if not isinstance(binding, ScientificBindingV2):
+            raise RuntimeAdapterError("approved CSV grant is unavailable")
+        _validate_native_tool_arguments("scientific_csv_describe", {"grant_id": grant_id}, binding)
+        grant = binding.csv_describe_grants[grant_id]
+        request, _mapping = self._next_tool_operation(
+            kind="compute",
+            tool_call_id=tool_call_id,
+            payload={"grant_id": grant_id, "grant": grant.model_dump(mode="json")},
+        )
+        raw = self._execute_tool_effect(request)
+        if len(raw) > 2 * 1024 * 1024:
+            raise RuntimeAdapterError("CSV compute envelope exceeds its limit")
+        try:
+            envelope = ComputeResultEnvelopeV2.model_validate_json(raw)
+        except ValidationError as exc:
+            raise RuntimeAdapterError("invalid CSV compute result envelope") from exc
+        from scientist.runtime_contracts import compute_input_manifest_sha256
+
+        binding_sha256 = hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest()
+        if (
+            canonical_bytes(envelope.model_dump(mode="json")) != raw
+            or envelope.binding_sha256 != binding_sha256
+            or envelope.grant_id != grant_id
+            or envelope.recipe_manifest_sha256 != grant.recipe_manifest_sha256
+            or envelope.profile_id != grant.profile_id
+            or envelope.profile_version != grant.profile_version
+            or envelope.image_digest != grant.image_digest
+            or envelope.input_manifest_sha256 != compute_input_manifest_sha256(grant)
+            or envelope.input_ref != grant.input_ref
+            or envelope.input_sha256 != grant.input_sha256
+            or any(output.object_ref.project_id != self.context.project_id for output in envelope.outputs)
+        ):
+            raise RuntimeAdapterError("CSV compute result differs from its approved grant")
+        result_outputs: list[ScientificOutputReceiptV2] = []
+        workspace_entries: list[WorkspaceEntry] = []
+        decoded_outputs: list[bytes] = []
+        for output in envelope.outputs:
+            try:
+                data = base64.b64decode(output.data_base64, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise RuntimeAdapterError("invalid CSV compute output encoding") from exc
+            if (
+                len(data) != output.object_ref.size
+                or hashlib.sha256(data).hexdigest() != output.object_ref.sha256.lower()
+                or output.object_ref.content_type != "application/octet-stream"
+            ):
+                raise RuntimeAdapterError("CSV compute output differs from its durable reference")
+            path = f"outputs/{output.name}"
+            _write_or_verify_scientific_result(self.workspace_dir, path, data)
+            result_outputs.append(
+                ScientificOutputReceiptV2(
+                    index=output.index,
+                    name=output.name,
+                    content_type=output.content_type,
+                    path=path,
+                    sha256=output.object_ref.sha256,
+                    size=len(data),
+                    object_ref=output.object_ref,
+                )
+            )
+            workspace_entries.append(
+                WorkspaceEntry(path=path, sha256=output.object_ref.sha256, size=len(data))
+            )
+            decoded_outputs.append(data)
+        if (
+            sum(entry.size for entry in self.context.workspace_manifest)
+            + sum(entry.size for entry in workspace_entries)
+            > grant.workspace_limit_bytes
+        ):
+            raise RuntimeAdapterError("CSV compute outputs exceed the approved workspace limit")
+        receipt = ScientificResultReceiptV2(
+            receipt_version=2,
+            tool_call_id=tool_call_id,
+            grant_id=grant_id,
+            binding_sha256=binding_sha256,
+            operation_id=request.operation_id,
+            effective_operation_id=envelope.operation_id,
+            operation_fingerprint=envelope.operation_fingerprint,
+            input_manifest_sha256=compute_input_manifest_sha256(grant),
+            recipe_manifest_sha256=grant.recipe_manifest_sha256,
+            profile_id=grant.profile_id,
+            profile_version=grant.profile_version,
+            image_digest=grant.image_digest,
+            input_sha256=grant.input_sha256,
+            outputs=result_outputs,
+        )
+        try:
+            report = decoded_outputs[3].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeAdapterError("CSV compute report is not UTF-8") from exc
+        return report, receipt, workspace_entries
 
     def dispatch_chat_completion(
         self,
@@ -961,31 +1387,44 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
             adapter._native_scientific_outputs[call_id] = {"receipt": receipt, "workspace_entry": entry}
             return "Measured approved worker resource limits and saved outputs/resources.json."
 
-        for name, schema, handler in (
-            (
-                "instruction_view",
-                {
-                    "name": "instruction_view",
-                    "description": "Read the selected approved scientific instruction as untrusted reference text.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"capability_id": {"type": "string", "enum": list(binding.capability_ids)}},
-                        "required": ["capability_id"],
-                        "additionalProperties": False,
-                    },
-                },
-                instruction_view_handler,
-            ),
-            (
-                "scientific_resources",
-                {
-                    "name": "scientific_resources",
-                    "description": "Measure bounded CPU and memory limits inside this approved worker.",
-                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-                },
-                scientific_resources_handler,
-            ),
-        ):
+        def scientific_search_handler(arguments: dict[str, Any], **_kwargs: Any) -> str:
+            call_id = require_active_call("scientific_search", arguments)
+            if not isinstance(binding, ScientificBindingV2):
+                raise RuntimeAdapterError("approved Crossref binding is unavailable")
+            raw_call_id = adapter._native_active_tool_calls[call_id]
+            result = adapter._run_approved_search(arguments["request_id"], raw_call_id)
+            adapter._native_scientific_outputs[call_id] = {
+                "kind": "scientific_search",
+                "operation_id": next(
+                    item.operation_id for item in reversed(adapter.context.operation_mappings)
+                    if item.tool_call_id == raw_call_id and item.purpose == "tool"
+                ),
+            }
+            return json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+        def scientific_csv_describe_handler(arguments: dict[str, Any], **_kwargs: Any) -> str:
+            call_id = require_active_call("scientific_csv_describe", arguments)
+            if not isinstance(binding, ScientificBindingV2):
+                raise RuntimeAdapterError("approved CSV grant is unavailable")
+            raw_call_id = adapter._native_active_tool_calls[call_id]
+            report, receipt, workspace_entries = adapter._run_approved_csv_describe(
+                arguments["grant_id"], raw_call_id,
+            )
+            adapter._native_scientific_outputs[call_id] = {
+                "receipt_v2": receipt,
+                "workspace_entries_v2": workspace_entries,
+            }
+            return report
+
+        handlers = {
+            "instruction_view": instruction_view_handler,
+            "scientific_resources": scientific_resources_handler,
+            "scientific_search": scientific_search_handler,
+            "scientific_csv_describe": scientific_csv_describe_handler,
+        }
+        for schema in _native_scientific_tool_definitions(binding):
+            name = schema["name"]
+            handler = handlers[name]
             existing = model_tools.registry.get_entry(name)
             if existing is not None and not getattr(existing.handler, "_scientist_native_handler", False):
                 raise RuntimeAdapterError("scientific native tool name is already registered")
@@ -1168,15 +1607,19 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
                     raise RuntimeAdapterError("native tool suffix differs from its saved assistant call")
                 self._scientific_binding = binding
                 _validate_native_todo_call(self, live)
-            if sum(1 for item in suffix_calls if item.function.name == "scientific_resources") > 1:
-                raise RuntimeAdapterError("native tool batch repeats a scientific computation")
+                if sum(1 for item in suffix_calls if item.function.name in {"scientific_resources", "scientific_csv_describe"}) > 1:
+                    raise RuntimeAdapterError("native tool batch repeats scientific computation")
             if adapter.context.scientific_results and any(
                 item.function.name == "scientific_resources" for item in suffix_calls
             ):
-                raise RuntimeAdapterError("scientific computation already has a committed receipt")
+                raise RuntimeAdapterError("scientific computation already committed receipt")
+            if adapter.context.scientific_results_v2 and any(
+                item.function.name == "scientific_csv_describe" for item in suffix_calls
+            ):
+                raise RuntimeAdapterError("CSV computation already committed receipt")
             adapter.context = adapter.context.model_copy(
                 update={"boundary": "before_tool", "pending_assistant": pending}
-            )
+                )
             adapter._checkpoint("before_tool")
             adapter._native_active_tool_calls = {
                 item.applied_id: item.raw_id for item in applied[pending.next_tool_index :]
@@ -1220,6 +1663,11 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
                 receipt = output["receipt"].model_copy(update={"tool_call_id": raw_id})
                 new_receipts.append(receipt)
                 new_workspace.append(output["workspace_entry"])
+            new_receipts_v2, new_workspace_v2 = _collect_native_v2_receipts(
+                adapter._native_scientific_outputs,
+                reverse,
+                completed,
+            )
             for item in dumped:
                 if item.get("role") == "tool" and item.get("tool_call_id") in reverse:
                     item["tool_call_id"] = reverse[item["tool_call_id"]]
@@ -1249,7 +1697,12 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
                 "messages": [ChatMessage.model_validate(item) for item in _wire_messages(dumped)],
                 "native_message_metadata": _native_message_metadata(dumped),
                     "scientific_results": [*adapter.context.scientific_results, *new_receipts],
-                    "workspace_manifest": [*adapter.context.workspace_manifest, *new_workspace],
+                    "scientific_results_v2": [
+                        *adapter.context.scientific_results_v2, *new_receipts_v2,
+                    ],
+                    "workspace_manifest": [
+                        *adapter.context.workspace_manifest, *new_workspace, *new_workspace_v2,
+                    ],
                     "todo": todo,
                     "pending_assistant": (
                         None

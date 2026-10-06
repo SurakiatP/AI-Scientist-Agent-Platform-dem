@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 import base64
 import ast
 import importlib.util
@@ -1477,3 +1478,355 @@ def _pinned_hermes_attempt_count(max_retries: int) -> int:
 def test_pinned_hermes_conversation_loop_attempt_limit_semantics() -> None:
     assert _pinned_hermes_attempt_count(1) == 1
     assert _pinned_hermes_attempt_count(0) == 0
+
+
+def test_approved_search_operation_is_bound_to_raw_call_and_replayed_by_mapping(context_data, tmp_path):
+    from scientist.contracts import CrossrefQueryV1, RuntimePins, ScientificBindingV2
+
+    query = CrossrefQueryV1(
+        source_id="crossref", version=1, access_mode="public_read",
+        query="bounded synthetic query", doi=None, limit=2,
+    )
+    binding = ScientificBindingV2(
+        binding_version=2,
+        catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="a" * 64,
+        capability_ids=["paper-lookup"],
+        instruction_fingerprint="e" * 64,
+        agent_runtime_pins=RuntimePins(
+            image_digest=context_data["image_digest"],
+            skills_digest=context_data["skills_digest"],
+            environment_digest=context_data["environment_digest"],
+        ),
+        input_snapshot_digest=context_data["input_snapshot_digest"],
+        approved_crossref_queries={"search-1": query},
+    )
+    plan = PlanSpec.model_validate(context_data["plan"]).model_copy(
+        update={"allowed_ops": ["llm", "search"], "scientific": binding}
+    )
+    context_data["plan"] = plan.model_dump(mode="json")
+    context_data["plan_digest"] = hashlib.sha256(
+        json.dumps(plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    context_data["messages"] = [{
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "raw-search-call", "type": "function",
+            "function": {"name": "scientific_search", "arguments": '{"request_id":"search-1"}'},
+        }],
+    }]
+    context_data["pending_assistant"] = {
+        "turn_id": context_data["turn_id"], "message_index": 0, "next_tool_index": 0,
+        "applied_tool_ids": [{"raw_id": "raw-search-call", "applied_id": "applied-search-call"}],
+    }
+    context_data["boundary"] = "before_tool"
+    adapter = RuntimeAdapter(
+        context_data, broker_url="http://172.30.0.2:8000", capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500))),
+    )
+    payload = {"request_id": "search-1", "query": query.model_dump(mode="json")}
+
+    request, mapping = adapter._next_tool_operation(
+        kind="search", tool_call_id="raw-search-call", payload=payload,
+    )
+    replay, replay_mapping = adapter._next_tool_operation(
+        kind="search", tool_call_id="raw-search-call", payload=payload,
+    )
+
+    assert request.kind == replay.kind == "search"
+    assert request.operation_id == replay.operation_id == mapping.operation_id == replay_mapping.operation_id
+    assert mapping.purpose == "tool"
+    assert mapping.model_sequence is None
+    assert mapping.tool_call_id == "raw-search-call"
+    assert request.reserve_tokens == 0
+    assert len(adapter.context.operation_mappings) == 1
+
+
+def test_tool_effect_returns_only_the_committed_result_bytes(context_data, tmp_path):
+    result_bytes = b'{"synthetic":"result"}'
+    digest = hashlib.sha256(result_bytes).hexdigest()
+    calls = []
+
+    def broker(request):
+        path = request.url.path
+        calls.append((request.method, path))
+        if path == "/control/boundary":
+            return httpx.Response(200, json=_checkpoint_ack(json.loads(request.content)))
+        if path == "/effects":
+            body = json.loads(request.content)
+            return httpx.Response(200, json={
+                "operation_id": body["operation_id"], "state": "committed",
+                "result": {
+                    "project_id": context_data["project_id"], "key": "results/i2",
+                    "sha256": digest, "size": len(result_bytes),
+                    "content_type": "application/octet-stream",
+                }, "usage_tokens": None,
+            })
+        if path.endswith("/result"):
+            return httpx.Response(200, content=result_bytes)
+        raise AssertionError(path)
+
+    adapter = RuntimeAdapter(
+        context_data, broker_url="http://172.30.0.2:8000", capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=httpx.Client(transport=httpx.MockTransport(broker)),
+    )
+    request = OperationRequest(
+        run_id=context_data["run_id"], generation=1, operation_id="tool-operation",
+        kind="search", payload={"request_id": "approved-search", "query": {}}, reserve_tokens=0,
+    )
+
+    assert adapter._execute_tool_effect(request) == result_bytes
+    assert calls == [
+        ("POST", "/control/boundary"),
+        ("POST", "/effects"),
+        ("GET", "/effects/tool-operation/result"),
+    ]
+
+
+def test_approved_search_preserves_crossref_provenance_and_same_effect_identity(context_data, tmp_path):
+    from scientist.contracts import CrossrefQueryV1, RuntimePins, ScientificBindingV2
+
+    query = CrossrefQueryV1(
+        source_id="crossref", version=1, access_mode="public_read",
+        query="bounded synthetic query", doi=None, limit=2,
+    )
+    binding = ScientificBindingV2(
+        binding_version=2,
+        catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="a" * 64, capability_ids=["paper-lookup"],
+        instruction_fingerprint="e" * 64,
+        agent_runtime_pins=RuntimePins(
+            image_digest=context_data["image_digest"],
+            skills_digest=context_data["skills_digest"],
+            environment_digest=context_data["environment_digest"],
+        ),
+        input_snapshot_digest=context_data["input_snapshot_digest"],
+        approved_crossref_queries={"search-1": query},
+    )
+    plan = PlanSpec.model_validate(context_data["plan"]).model_copy(
+        update={"allowed_ops": ["llm", "search"], "scientific": binding}
+    )
+    context_data["plan"] = plan.model_dump(mode="json")
+    context_data["plan_digest"] = hashlib.sha256(
+        json.dumps(plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    context_data["messages"] = [{
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "id": "raw-search-call", "type": "function",
+            "function": {"name": "scientific_search", "arguments": '{"request_id":"search-1"}'},
+        }],
+    }]
+    context_data["pending_assistant"] = {
+        "turn_id": context_data["turn_id"], "message_index": 0, "next_tool_index": 0,
+        "applied_tool_ids": [{"raw_id": "raw-search-call", "applied_id": "applied-search-call"}],
+    }
+    context_data["boundary"] = "before_tool"
+    result = {
+        "source_id": "crossref", "access_mode": "public_read",
+        "provenance": {"source_id": "crossref", "access_mode": "public_read",
+                       "request": {"query": query.query, "doi": None, "limit": query.limit}},
+        "record_count": 1, "records": [{"title": "Fixture paper", "doi": "10.5555/fixture"}],
+    }
+    result_bytes = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    result_sha = hashlib.sha256(result_bytes).hexdigest()
+    operation_ids = []
+    dispatched = set()
+
+    def broker(request):
+        path = request.url.path
+        if path == "/control/boundary":
+            return httpx.Response(200, json=_checkpoint_ack(json.loads(request.content)))
+        if path == "/effects":
+            payload = json.loads(request.content)
+            operation_ids.append(payload["operation_id"])
+            dispatched.add(payload["operation_id"])
+            return httpx.Response(200, json={
+                "operation_id": payload["operation_id"], "state": "committed",
+                "result": {"project_id": context_data["project_id"], "key": "results/search",
+                           "sha256": result_sha, "size": len(result_bytes),
+                           "content_type": "application/octet-stream"}, "usage_tokens": None,
+            })
+        if path.endswith("/result"):
+            return httpx.Response(200, content=result_bytes)
+        raise AssertionError(path)
+
+    adapter = RuntimeAdapter(
+        context_data, broker_url="http://172.30.0.2:8000", capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=httpx.Client(transport=httpx.MockTransport(broker)),
+    )
+
+    first = adapter._run_approved_search("search-1", "raw-search-call")
+    replay = adapter._run_approved_search("search-1", "raw-search-call")
+
+    assert first == replay == result
+    assert first["provenance"]["request"] == {"query": query.query, "doi": None, "limit": 2}
+    assert len(set(operation_ids)) == 1
+    assert len(dispatched) == 1
+    assert len(adapter.context.operation_mappings) == 1
+
+
+@pytest.mark.parametrize("owner_retry", [False, True])
+def test_csv_compute_returns_four_verified_output_receipts_and_writes_workspace(context_data, tmp_path, owner_retry):
+    import base64
+    from scientist.contracts import (
+        ComputeProfilePin, CsvDescribeGrantV1, ObjectRef, RuntimePins, ScientificBindingV2,
+    )
+    from scientist.runtime_contracts import ComputeResultEnvelopeV2, ComputeOutputEntryV2
+
+    project_id = context_data["project_id"]
+    input_sha = "b" * 64
+    input_ref = ObjectRef(
+        project_id=project_id, key=str(project_id) + "/" + input_sha, sha256=input_sha,
+        size=20, content_type="application/octet-stream",
+    )
+    grant = CsvDescribeGrantV1(
+        recipe_id="csv.describe.v1", recipe_version="1", recipe_manifest_sha256="f" * 64,
+        profile_id="prof.csv-stdlib@py3.14.7", profile_version="1",
+        image_digest="sha256:" + "a" * 64, input_ref=input_ref, input_sha256=input_sha,
+        numeric_columns=["x"],
+    )
+    binding = ScientificBindingV2(
+        binding_version=2, catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="a" * 64, capability_ids=["exploratory-data-analysis"],
+        instruction_fingerprint="e" * 64,
+        agent_runtime_pins=RuntimePins(
+            image_digest=context_data["image_digest"], skills_digest=context_data["skills_digest"],
+            environment_digest=context_data["environment_digest"],
+        ), input_snapshot_digest=context_data["input_snapshot_digest"],
+        required_compute_profiles=[ComputeProfilePin(
+            profile_id=grant.profile_id, version=grant.profile_version, image_digest=grant.image_digest,
+        )], csv_describe_grants={"grant-1": grant},
+    )
+    plan = PlanSpec.model_validate(context_data["plan"]).model_copy(
+        update={"allowed_ops": ["llm", "compute"], "scientific": binding}
+    )
+    context_data["plan"] = plan.model_dump(mode="json")
+    context_data["plan_digest"] = hashlib.sha256(
+        json.dumps(plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    context_data["messages"] = [{
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "id": "raw-compute-call", "type": "function",
+            "function": {"name": "scientific_csv_describe", "arguments": '{"grant_id":"grant-1"}'},
+        }],
+    }]
+    context_data["pending_assistant"] = {
+        "turn_id": context_data["turn_id"], "message_index": 0, "next_tool_index": 0,
+        "applied_tool_ids": [{"raw_id": "raw-compute-call", "applied_id": "applied-compute-call"}],
+    }
+    context_data["boundary"] = "before_tool"
+    names = ["summary.json", "summary.csv", "chart.svg", "report.md"]
+    types = ["application/json", "text/csv", "image/svg+xml", "text/markdown"]
+    output_data = [b'{"rows":1}', b"x,count\n1,1\n", b'<svg xmlns="http://www.w3.org/2000/svg"></svg>', b"# Fixture report\n"]
+    effect_request = None
+    envelope_bytes = None
+    effect_ids = []
+
+    def broker(request):
+        nonlocal effect_request, envelope_bytes
+        path = request.url.path
+        if path == "/control/boundary":
+            return httpx.Response(200, json=_checkpoint_ack(json.loads(request.content)))
+        if path == "/effects":
+            from scientist.runtime_contracts import compute_input_manifest_sha256
+            from scientist.runtime_contracts import ComputeOutputEntryV2
+            from scientist.runtime_contracts import canonical_bytes, operation_fingerprint
+            from scientist.runtime_contracts import ScientificResultReceiptV2
+            effect_request = OperationRequest.model_validate_json(request.content)
+            effect_ids.append(effect_request.operation_id)
+            effective_request = effect_request
+            if owner_retry:
+                effective_request = effect_request.model_copy(update={
+                    "operation_id": "retry-csv-operation",
+                    "generation": effect_request.generation + 1,
+                })
+            binding_hash = hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest()
+            outputs = []
+            for index, (name, content_type, data) in enumerate(zip(names, types, output_data, strict=True)):
+                digest = hashlib.sha256(data).hexdigest()
+                ref = ObjectRef(
+                    project_id=project_id, key=str(project_id) + "/" + digest, sha256=digest,
+                    size=len(data), content_type="application/octet-stream",
+                )
+                outputs.append(ComputeOutputEntryV2(
+                    index=index, name=name, content_type=content_type, object_ref=ref,
+                    data_base64=base64.b64encode(data).decode(),
+                ))
+            envelope = ComputeResultEnvelopeV2(
+                schema_version=2, binding_sha256=binding_hash, grant_id="grant-1",
+                operation_id=effective_request.operation_id,
+                operation_fingerprint=operation_fingerprint(effective_request),
+                recipe_id=grant.recipe_id, recipe_version=grant.recipe_version,
+                recipe_manifest_sha256=grant.recipe_manifest_sha256,
+                profile_id=grant.profile_id, profile_version=grant.profile_version,
+                image_digest=grant.image_digest,
+                input_manifest_sha256=compute_input_manifest_sha256(grant),
+                input_ref=grant.input_ref, input_sha256=grant.input_sha256, outputs=outputs,
+            )
+            envelope_bytes = canonical_bytes(envelope.model_dump(mode="json"))
+            envelope_sha = hashlib.sha256(envelope_bytes).hexdigest()
+            return httpx.Response(200, json={
+                "operation_id": effect_request.operation_id, "state": "committed",
+                "result": {"project_id": project_id, "key": "results/compute",
+                           "sha256": envelope_sha, "size": len(envelope_bytes),
+                           "content_type": "application/octet-stream"}, "usage_tokens": None,
+            })
+        if path.endswith("/result"):
+            return httpx.Response(200, content=envelope_bytes)
+        raise AssertionError(path)
+
+    adapter = RuntimeAdapter(
+        context_data, broker_url="http://172.30.0.2:8000", capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=httpx.Client(transport=httpx.MockTransport(broker)),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        report, receipt, entries = adapter._run_approved_csv_describe(
+            "grant-1", "raw-compute-call"
+        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        replay_report, replay_receipt, replay_entries = adapter._run_approved_csv_describe(
+            "grant-1", "raw-compute-call"
+        )
+
+    assert report == "# Fixture report\n"
+    assert replay_report == report
+    assert [item.name for item in receipt.outputs] == names
+    assert [item.content_type for item in receipt.outputs] == types
+    assert [item.path for item in receipt.outputs] == ["outputs/" + name for name in names]
+    assert [item.path for item in entries] == ["outputs/" + name for name in names]
+    assert receipt.operation_id == effect_request.operation_id
+    expected_effective_request = effect_request
+    if owner_retry:
+        expected_effective_request = effect_request.model_copy(update={
+            "operation_id": "retry-csv-operation",
+            "generation": effect_request.generation + 1,
+        })
+    assert receipt.operation_fingerprint == operation_fingerprint(expected_effective_request)
+    assert receipt.effective_operation_id == (
+        "retry-csv-operation" if owner_retry else effect_request.operation_id
+    )
+    assert replay_receipt == receipt
+    assert replay_entries == entries
+    assert len(set(effect_ids)) == 1
+    from scientist.runtime_adapter import _collect_native_v2_receipts
+
+    collected, collected_entries = _collect_native_v2_receipts(
+        {"applied-compute-call": {
+            "receipt_v2": receipt,
+            "workspace_entries_v2": entries,
+        }},
+        {"applied-compute-call": "raw-compute-call"},
+        {"raw-compute-call"},
+    )
+    assert collected[0].tool_call_id == "raw-compute-call"
+    assert collected_entries == entries
+    assert [(tmp_path / item.path).read_bytes() for item in entries] == output_data

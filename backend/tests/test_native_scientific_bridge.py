@@ -5,6 +5,7 @@ import hashlib
 import ast
 import importlib.util
 import json
+from uuid import uuid4
 from pathlib import Path
 
 import pytest
@@ -197,6 +198,26 @@ def test_native_scientific_arguments_are_checked_after_handler_transform(tmp_pat
         _validate_native_tool_arguments("scientific_resources", {"command": "whoami"}, binding)
     with pytest.raises(RuntimeAdapterError):
         _validate_native_tool_arguments("instruction_view", {"capability_id": "paper-lookup"}, binding)
+
+
+def test_i2_search_and_compute_tools_accept_only_one_approved_identifier():
+    from scientist.runtime_adapter import RuntimeAdapterError, _validate_native_tool_arguments
+
+    binding = SimpleNamespace(
+        approved_crossref_queries={"approved-search": object()},
+        csv_describe_grants={"approved-grant": object()},
+    )
+    _validate_native_tool_arguments("scientific_search", {"request_id": "approved-search"}, binding)
+    _validate_native_tool_arguments("scientific_csv_describe", {"grant_id": "approved-grant"}, binding)
+
+    for name, arguments in (
+        ("scientific_search", {"request_id": "unapproved-search"}),
+        ("scientific_search", {"request_id": "approved-search", "query": "invented"}),
+        ("scientific_csv_describe", {"grant_id": "unapproved-grant"}),
+        ("scientific_csv_describe", {"grant_id": "approved-grant", "path": "/etc/passwd"}),
+    ):
+        with pytest.raises(RuntimeAdapterError):
+            _validate_native_tool_arguments(name, arguments, binding)
 
 
 def test_resource_result_validator_accepts_canonical_real_runtime_measurement():
@@ -566,3 +587,125 @@ def test_scientific_to_legacy_factory_rebind_keeps_current_adapter_scope():
             "scientific_resources", {}, "synthetic-task", tool_call_id="legacy-1"
         )
     assert runtime._NATIVE_TOOL_CALL_ID.get() is None
+
+
+def test_i2_native_schemas_expose_only_approved_ids_and_closed_arguments():
+    from scientist.runtime_adapter import _native_scientific_tool_definitions
+    from scientist.contracts import (
+        ComputeProfilePin,
+        CsvDescribeGrantV1,
+        CrossrefQueryV1,
+        ObjectRef,
+        RuntimePins,
+        ScientificBindingV2,
+    )
+
+    project_id = uuid4()
+    digest = "b" * 64
+    grant = CsvDescribeGrantV1(
+        recipe_id="csv.describe.v1",
+        recipe_version="1",
+        recipe_manifest_sha256="f" * 64,
+        profile_id="prof.csv-stdlib@py3.14.7",
+        profile_version="1",
+        image_digest="sha256:" + "a" * 64,
+        input_ref=ObjectRef(
+            project_id=project_id,
+            key=str(project_id) + "/" + digest,
+            sha256=digest,
+            size=100,
+            content_type="application/octet-stream",
+        ),
+        input_sha256=digest,
+        numeric_columns=["x"],
+    )
+    binding = ScientificBindingV2(
+        binding_version=2,
+        catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="a" * 64,
+        capability_ids=["paper-lookup", "exploratory-data-analysis"],
+        instruction_fingerprint="e" * 64,
+        agent_runtime_pins=RuntimePins(
+            image_digest="sha256:" + "c" * 64,
+            skills_digest="d" * 64,
+            environment_digest="9" * 64,
+        ),
+        input_snapshot_digest="8" * 64,
+        approved_crossref_queries={
+            "search-a": CrossrefQueryV1(
+                source_id="crossref", version=1, access_mode="public_read",
+                query="first", doi=None, limit=2,
+            ),
+            "search-b": CrossrefQueryV1(
+                source_id="crossref", version=1, access_mode="public_read",
+                query="second", doi=None, limit=2,
+            ),
+        },
+        required_compute_profiles=[ComputeProfilePin(
+            profile_id=grant.profile_id,
+            version=grant.profile_version,
+            image_digest=grant.image_digest,
+        )],
+        csv_describe_grants={"grant-a": grant},
+    )
+    definitions = {item["name"]: item for item in _native_scientific_tool_definitions(binding)}
+
+    assert definitions["scientific_search"]["parameters"] == {
+        "type": "object",
+        "properties": {"request_id": {"type": "string", "enum": ["search-a", "search-b"]}},
+        "required": ["request_id"],
+        "additionalProperties": False,
+    }
+    assert definitions["scientific_csv_describe"]["parameters"] == {
+        "type": "object",
+        "properties": {"grant_id": {"type": "string", "enum": ["grant-a"]}},
+        "required": ["grant_id"],
+        "additionalProperties": False,
+    }
+
+
+def test_native_builder_registers_scientific_schema_closures_on_todo_surface():
+    source_path = Path(__file__).resolve().parents[1] / "src" / "scientist" / "runtime_adapter.py"
+    module = ast.parse(source_path.read_text())
+    builder = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_native_agent"
+    )
+    handler_maps = [
+        node.value
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "handlers" for target in node.targets)
+        and isinstance(node.value, ast.Dict)
+    ]
+    registered_names = {
+        key.value
+        for handler_map in handler_maps
+        for key in handler_map.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    assert {"scientific_search", "scientific_csv_describe"} <= registered_names
+    schema_loop = any(
+        isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "schema"
+        and isinstance(node.iter, ast.Call)
+        and isinstance(node.iter.func, ast.Name)
+        and node.iter.func.id == "_native_scientific_tool_definitions"
+        for node in ast.walk(builder)
+    )
+    assert schema_loop
+    registrations = [
+        node for node in ast.walk(builder)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "register"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "registry"
+    ]
+    assert any(
+        {keyword.arg for keyword in call.keywords} >= {"schema", "handler"}
+        and any(keyword.arg == "schema" and isinstance(keyword.value, ast.Name) and keyword.value.id == "schema" for keyword in call.keywords)
+        and any(keyword.arg == "handler" and isinstance(keyword.value, ast.Name) and keyword.value.id == "handler" for keyword in call.keywords)
+        for call in registrations
+    )

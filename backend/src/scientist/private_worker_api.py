@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import tempfile
@@ -19,11 +20,11 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from scientist import broker, broker_api, limits, objects
 from scientist.auth import DomainError
-from scientist.contracts import ArtifactView, CheckpointManifest, ObjectRef, RuntimePins, ScientificBinding
+from scientist.contracts import ArtifactView, CheckpointManifest, ObjectRef, OperationRequest, RuntimePins, ScientificBinding, ScientificBindingV2
 from scientist.db import session
 from scientist.runtime_contracts import (
-    BoundaryAck, BoundaryRequest, MAX_BOUNDARY_BYTES, RUNTIME_COMMIT,
-    RuntimeContextV1, WorkspaceEntry, canonical_bytes, operation_fingerprint,
+    BoundaryAck, BoundaryRequest, ComputeResultEnvelopeV2, MAX_BOUNDARY_BYTES, RUNTIME_COMMIT,
+    RuntimeContextV1, WorkspaceEntry, canonical_bytes, compute_input_manifest_sha256, operation_fingerprint,
 )
 
 _MAX_RESULT_BYTES = 2 * 1024 * 1024
@@ -144,6 +145,159 @@ class WorkerController:
         self._context_authority(db, row, effective)
         return effective
 
+    def _validate_scientific_compute_results(self, db, row, context, files_by_path) -> None:
+        if not context.scientific_results_v2:
+            return
+        binding = context.plan.scientific
+        if not isinstance(binding, ScientificBindingV2):
+            raise DomainError("invalid_scientific_result", 422)
+        binding_sha256 = hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest()
+        mappings = {item.tool_call_id: item for item in context.operation_mappings}
+        for receipt in context.scientific_results_v2:
+            grant = binding.csv_describe_grants.get(receipt.grant_id)
+            mapping = mappings.get(receipt.tool_call_id)
+            if grant is None or mapping is None:
+                raise DomainError("invalid_scientific_result", 422)
+            request = mapping.request
+            if (
+                request.kind != "compute"
+                or request.reserve_tokens != 0
+                or request.operation_id != receipt.operation_id
+                or mapping.operation_id != receipt.operation_id
+                or mapping.payload_hash != operation_fingerprint(request)
+                or request.payload != {"grant_id": receipt.grant_id, "grant": grant.model_dump(mode="json")}
+            ):
+                raise DomainError("invalid_scientific_result", 422)
+            original = db.execute(
+                text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :operation"),
+                {"run": row.id, "operation": receipt.operation_id},
+            ).one_or_none()
+            if (
+                original is None
+                or original.generation != request.generation
+                or original.payload_hash.strip() != mapping.payload_hash
+            ):
+                raise DomainError("invalid_scientific_result", 422)
+            original_result = original.result or {}
+            if "request" in original_result:
+                try:
+                    stored_original = OperationRequest.model_validate(original_result["request"])
+                except (TypeError, ValueError, ValidationError) as exc:
+                    raise DomainError("invalid_scientific_result", 422) from exc
+                if stored_original != request:
+                    raise DomainError("invalid_scientific_result", 422)
+
+            # Resolve and independently validate every persisted owner-retry edge.
+            # The logical operation/fingerprint above remain stable; only the final
+            # committed row and envelope carry the effective retry identity.
+            lineage = original
+            seen = {receipt.operation_id}
+            while lineage.state == "unknown" and (lineage.result or {}).get("retry_identity"):
+                edge = lineage.result or {}
+                retry_id = edge["retry_identity"]
+                if not isinstance(retry_id, str) or retry_id in seen:
+                    raise DomainError("invalid_scientific_result", 422)
+                try:
+                    retry_request = OperationRequest.model_validate(edge["retry_request"])
+                except (KeyError, TypeError, ValueError, ValidationError) as exc:
+                    raise DomainError("invalid_scientific_result", 422) from exc
+                if (
+                    retry_request.run_id != request.run_id
+                    or retry_request.operation_id != retry_id
+                    or retry_request.kind != request.kind
+                    or retry_request.payload != request.payload
+                    or retry_request.reserve_tokens != request.reserve_tokens
+                ):
+                    raise DomainError("invalid_scientific_result", 422)
+                retry_row = db.execute(
+                    text("SELECT * FROM operations WHERE run_id = :run AND operation_id = :operation"),
+                    {"run": row.id, "operation": retry_id},
+                ).one_or_none()
+                if retry_row is None:
+                    raise DomainError("invalid_scientific_result", 422)
+                persisted_payload = (retry_row.result or {}).get("request")
+                persisted_request = None
+                if persisted_payload is not None:
+                    try:
+                        persisted_request = OperationRequest.model_validate(persisted_payload)
+                    except (TypeError, ValueError, ValidationError) as exc:
+                        raise DomainError("invalid_scientific_result", 422) from exc
+                if (
+                    retry_row.generation != retry_request.generation
+                    or (persisted_request is not None and persisted_request != retry_request)
+                    or retry_row.payload_hash.strip() != operation_fingerprint(retry_request)
+                ):
+                    raise DomainError("invalid_scientific_result", 422)
+                seen.add(retry_id)
+                lineage = retry_row
+
+            operation, pending_retry_id = broker.effective_operation(db, row.id, receipt.operation_id)
+            if operation is None or operation.state != "committed":
+                raise DomainError("result_unavailable", 409)
+            if (
+                operation.kind != "compute"
+                or operation.generation != lineage.generation
+                or operation.generation > row.generation
+                or operation.operation_id != lineage.operation_id
+                or operation.operation_id != receipt.effective_operation_id
+                or operation.payload_hash.strip() != receipt.operation_fingerprint
+                or pending_retry_id is not None
+            ):
+                raise DomainError("invalid_scientific_result", 422)
+            result_ref = broker._operation_result(operation).result
+            if (
+                result_ref is None
+                or result_ref.project_id != row.project_id
+                or result_ref.content_type != "application/octet-stream"
+                or result_ref.size > _MAX_RESULT_BYTES
+            ):
+                raise DomainError("storage_unavailable", 503)
+            try:
+                result_bytes = self.result_reader(result_ref)
+            except Exception as exc:
+                raise DomainError("storage_unavailable", 503) from exc
+            if len(result_bytes) != result_ref.size or hashlib.sha256(result_bytes).hexdigest() != result_ref.sha256:
+                raise DomainError("storage_unavailable", 503)
+            try:
+                envelope = ComputeResultEnvelopeV2.model_validate_json(result_bytes)
+            except ValidationError as exc:
+                raise DomainError("invalid_scientific_result", 422) from exc
+            if (
+                receipt.binding_sha256 != binding_sha256
+                or envelope.binding_sha256 != receipt.binding_sha256
+                or envelope.grant_id != receipt.grant_id
+                or envelope.operation_id != receipt.effective_operation_id
+                or envelope.operation_fingerprint != receipt.operation_fingerprint
+                or envelope.input_manifest_sha256 != receipt.input_manifest_sha256
+                or envelope.recipe_id != grant.recipe_id
+                or envelope.recipe_version != grant.recipe_version
+                or envelope.recipe_manifest_sha256 != receipt.recipe_manifest_sha256
+                or envelope.profile_id != receipt.profile_id
+                or envelope.profile_version != receipt.profile_version
+                or envelope.image_digest != receipt.image_digest
+                or envelope.input_ref != grant.input_ref
+                or envelope.input_sha256 != receipt.input_sha256
+                or compute_input_manifest_sha256(grant) != receipt.input_manifest_sha256
+            ):
+                raise DomainError("invalid_scientific_result", 422)
+            for output in receipt.outputs:
+                entry = files_by_path.get(output.path)
+                computed = envelope.outputs[output.index]
+                data = entry.decoded_data() if entry is not None else None
+                if (
+                    entry is None
+                    or entry.sha256 != output.sha256
+                    or entry.size != output.size
+                    or len(data) != output.size
+                    or hashlib.sha256(data).hexdigest() != output.sha256
+                    or computed.index != output.index
+                    or computed.name != output.name
+                    or computed.content_type != output.content_type
+                    or computed.object_ref != output.object_ref
+                    or base64.b64decode(computed.data_base64, validate=True) != data
+                ):
+                    raise DomainError("invalid_scientific_result", 422)
+
     def boundary(self, db: Session, capability: str, request: BoundaryRequest) -> BoundaryAck:
         # Revalidate even programmatically supplied model_copy values at the trust boundary.
         request = BoundaryRequest.model_validate_json(request.model_dump_json())
@@ -174,6 +328,7 @@ class WorkerController:
                                          max_bytes=binding.max_result_bytes)
             except (ValueError, TypeError, AttributeError) as exc:
                 raise DomainError("invalid_scientific_result", 422) from exc
+        self._validate_scientific_compute_results(db, row, request.context, files_by_path)
         authoritative_context = RuntimeContextV1.model_validate({
             **request.context.model_dump(mode="json"),
             "workspace_manifest":[WorkspaceEntry(path=entry.path, sha256=entry.sha256, size=entry.size).model_dump()
@@ -257,6 +412,94 @@ class WorkerController:
                                 title="Resource measurements", kind="file", sha256=receipt.sha256,
                                 size=receipt.size, content_type="application/json", partial=partial)
             _event(db, row.id, row.revision, "artifact.ready", {"artifact": view.model_dump(mode="json")})
+
+        self._register_scientific_results_v2(db, row, context, files, references, checkpoint_id)
+
+    def _register_scientific_results_v2(self, db, row, context, files, references, checkpoint_id):
+        from scientist.domain import _event
+
+        for receipt in context.scientific_results_v2:
+            digest = hashlib.sha256(canonical_bytes(receipt.model_dump(mode="json"))).hexdigest()
+            for output in receipt.outputs:
+                prior = db.execute(
+                    text(
+                        "SELECT artifact_id,receipt_sha256 FROM scientific_artifact_receipts "
+                        "WHERE run_id=:run AND tool_call_id=:call AND output_index=:index"
+                    ),
+                    {"run": row.id, "call": receipt.tool_call_id, "index": output.index},
+                ).one_or_none()
+                if prior is not None:
+                    if prior.receipt_sha256.strip() != digest:
+                        raise DomainError("revision_conflict", 409)
+                    if context.boundary == "final":
+                        changed = db.execute(
+                            text(
+                                "UPDATE artifacts SET partial=false WHERE id=:id "
+                                "AND project_id=:project AND run_id=:run AND partial=true"
+                            ),
+                            {"id": prior.artifact_id, "project": row.project_id, "run": row.id},
+                        ).rowcount
+                        if changed:
+                            view = ArtifactView(
+                                artifact_id=prior.artifact_id,
+                                project_id=row.project_id,
+                                run_id=row.id,
+                                title=output.name,
+                                kind="file",
+                                sha256=output.sha256,
+                                size=output.size,
+                                content_type=output.content_type,
+                                partial=False,
+                            )
+                            _event(db, row.id, row.revision, "artifact.ready", {"artifact": view.model_dump(mode="json")})
+                    continue
+                ref = references[output.path]
+                artifact_id = uuid4()
+                partial = context.boundary != "final"
+                db.execute(
+                    text(
+                        "INSERT INTO artifacts(id,project_id,run_id,title,kind,object_key,sha256,size,content_type,partial) "
+                        "VALUES(:id,:project,:run,:title,'file',:key,:sha,:size,:content_type,:partial)"
+                    ),
+                    {
+                        "id": artifact_id,
+                        "project": row.project_id,
+                        "run": row.id,
+                        "title": output.name,
+                        "key": ref.key,
+                        "sha": output.sha256,
+                        "size": output.size,
+                        "content_type": output.content_type,
+                        "partial": partial,
+                    },
+                )
+                db.execute(
+                    text(
+                        "INSERT INTO scientific_artifact_receipts(run_id,tool_call_id,project_id,checkpoint_id,artifact_id,receipt_sha256,output_index) "
+                        "VALUES(:run,:call,:project,:checkpoint,:artifact,:sha,:index)"
+                    ),
+                    {
+                        "run": row.id,
+                        "call": receipt.tool_call_id,
+                        "project": row.project_id,
+                        "checkpoint": checkpoint_id,
+                        "artifact": artifact_id,
+                        "sha": digest,
+                        "index": output.index,
+                    },
+                )
+                view = ArtifactView(
+                    artifact_id=artifact_id,
+                    project_id=row.project_id,
+                    run_id=row.id,
+                    title=output.name,
+                    kind="file",
+                    sha256=output.sha256,
+                    size=output.size,
+                    content_type=output.content_type,
+                    partial=partial,
+                )
+                _event(db, row.id, row.revision, "artifact.ready", {"artifact": view.model_dump(mode="json")})
 
     def result(self, db: Session, capability: str, operation_id: str) -> bytes:
         row = self._run(db, capability, lock=False)
