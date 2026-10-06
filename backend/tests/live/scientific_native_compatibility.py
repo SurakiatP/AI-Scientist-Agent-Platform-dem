@@ -252,7 +252,7 @@ def native_authority_probes(binding, bundle, image_digest, skills_digest, scratc
         ("request-mutation", [call("fixture-raw-mutation", "instruction_view", {"capability_id": "get-available-resources"})]),
         ("execution-mutation", [call("fixture-raw-mutation", "instruction_view", {"capability_id": "get-available-resources"})]),
     ]
-    report = {"scope": "synthetic saved batches; actual native serial issuance; synthetic middleware export shims", "todo_registry_probe_scope": "harmless registry recorder inside actual native inline Todo slot; original inline executor preserved", "todo_registry_dispatch_forms": [], "saved_call_denials": [], "middleware_denials": []}
+    report = {"scope": "synthetic saved batches; actual native serial issuance; synthetic middleware export shims", "todo_guard_probe_scope": "guarded calls inside actual inline Todo slot return pinned agent-loop stub; registry recorder must remain untouched; original inline executor preserved", "todo_guard_dispatch_forms": [], "saved_call_denials": [], "middleware_denials": []}
     for label, calls in cases:
         context = make_context(binding, image_digest, skills_digest, calls)
         recorder = RecordingBoundary()
@@ -269,7 +269,7 @@ def native_authority_probes(binding, bundle, image_digest, skills_digest, scratc
             original_inline = inline.INLINE_TOOL_EXECUTORS["todo_list"]
             original_request = middleware.apply_tool_request_middleware
             original_execution = middleware.run_tool_execution_middleware
-            denied, mutations, dispatches, harmless_todo, terminal_attempts = [], [], [], [], []
+            denied, mutations, dispatches, harmless_todo, approved_todo, terminal_attempts = [], [], [], [], [], []
 
             def record_terminal(*_args, **_kwargs):
                 terminal_attempts.append(1)
@@ -292,6 +292,13 @@ def native_authority_probes(binding, bundle, image_digest, skills_digest, scratc
                 name, arguments, identity = values["function_name"], values["function_args"], values["tool_call_id"]
                 require(identity in adapter._native_active_tool_calls and adapter.context.pending_assistant is not None, "native probe has no runtime-issued saved identity")
                 require(adapter._native_dispatch_agent is agent, "native probe factory agent differs")
+                pending = adapter.context.pending_assistant
+                raw_identity = adapter._native_active_tool_calls[identity]
+                saved_call = next((item for item in adapter.context.messages[pending.message_index].tool_calls if item.id == raw_identity), None)
+                require(saved_call is not None, "native probe identity has no actual saved call")
+                saved_name, saved_arguments = _validate_native_todo_call(agent, saved_call)
+                effective_name, effective_arguments = _validate_native_todo_call(agent, {"function": {"name": name, "arguments": arguments}})
+                require(effective_name == saved_name and canonical(effective_arguments) == canonical(saved_arguments), "native probe effective call differs from actual saved batch")
                 dispatches.append(identity)
                 if label == "todo":
                     if len(dispatches) == 1:
@@ -313,7 +320,10 @@ def native_authority_probes(binding, bundle, image_digest, skills_digest, scratc
                             require(identity not in adapter._native_consumed_tool_calls, "rejected probe consumed saved authority")
                         remainder = {key: value for key, value in values.items() if key not in {"function_name", "function_args", "task_id", "tool_call_id"}}
                         result = original_dispatch(name, arguments, values.get("task_id"), identity, **remainder)
-                        report["todo_registry_dispatch_forms"].append("positional")
+                        require(json.loads(result) == {"error": "todo_list must be handled by the agent loop"}, "Todo guard probe differs from pinned agent-loop response")
+                        require(identity in adapter._native_consumed_tool_calls, "approved Todo guard did not consume saved identity")
+                        approved_todo.append(json.loads(canonical(arguments)))
+                        report["todo_guard_dispatch_forms"].append("positional-agent-loop-stub")
                         snapshot = canonical(agent._todo_store.snapshot())
                         try:
                             original_dispatch(**values)
@@ -323,8 +333,12 @@ def native_authority_probes(binding, bundle, image_digest, skills_digest, scratc
                             raise FixtureError("saved native identity executed twice")
                         require(snapshot == canonical(agent._todo_store.snapshot()), "repeated identity changed Todo state")
                         return result
-                    report["todo_registry_dispatch_forms"].append("keyword-with-saved-legacy-alias")
-                    return original_dispatch(**values)
+                    result = original_dispatch(**values)
+                    require(json.loads(result) == {"error": "todo_list must be handled by the agent loop"}, "Todo guard probe differs from pinned agent-loop response")
+                    require(identity in adapter._native_consumed_tool_calls, "approved Todo guard did not consume saved identity")
+                    approved_todo.append(json.loads(canonical(arguments)))
+                    report["todo_guard_dispatch_forms"].append("keyword-agent-loop-stub-with-saved-legacy-alias")
+                    return result
 
                 require(name == "instruction_view", "mutation probe target differs")
                 model_tools.registry.get_entry("instruction_view").handler = capture_instruction
@@ -361,8 +375,10 @@ def native_authority_probes(binding, bundle, image_digest, skills_digest, scratc
                 if label == "todo":
                     agent._execute_tool_calls(request, adapter.native_history(), str(context.run_id), 0)
                     require(len(dispatches) == 2 and adapter.context.pending_assistant is None, "actual Todo batch did not complete")
-                    require(harmless_todo == [todo, {"todos": []}], "approved Todo registry probes differ from saved calls")
+                    require(approved_todo == [todo, {"todos": []}], "approved Todo guard probes differ from saved calls")
+                    require(not harmless_todo, "pinned agent-loop Todo guard unexpectedly reached registry handler")
                     require(adapter.context.todo.revision == 2 and not adapter.context.todo.todos, "actual Todo updates differ from saved batch")
+                    require([item.tool_call_id for item in adapter.context.messages if item.role == "tool"] == [item["id"] for item in calls], "native inline Todo results differ from saved identities")
                     report["actual_inline_todo_calls"] = len(dispatches)
                     require([item["context"]["boundary"] for item in recorder.boundaries] == ["before_tool", "tool_committed"], "Todo authority boundary order differs")
                 else:
