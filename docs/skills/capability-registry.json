@@ -339,6 +339,7 @@
     "database-lookup",
     "exa-search",
     "folklore-variant-evidence",
+    "get-available-resources",
     "gget",
     "literature-review",
     "ncats-arax",
@@ -443,7 +444,6 @@
     "exploratory-data-analysis",
     "flowio",
     "flowkit",
-    "get-available-resources",
     "lab-hardware-cad",
     "markdown-mermaid-writing",
     "networkx",
@@ -856,7 +856,6 @@
    "experimental-design",
    "exploratory-data-analysis",
    "flowio",
-   "get-available-resources",
    "lab-hardware-cad",
    "markdown-mermaid-writing",
    "networkx",
@@ -1040,6 +1039,7 @@
    "database-lookup",
    "exa-search",
    "folklore-variant-evidence",
+   "get-available-resources",
    "gget",
    "literature-review",
    "ncats-arax",
@@ -9568,11 +9568,11 @@
    "priority": "near_term_family",
    "readiness": "adapter_needed",
    "wave": "X0",
-   "dependency_profile": "prof.cpu-sci",
+   "dependency_profile": "prof.worker-base",
    "runtime": {
-    "python": "3.13",
+    "python": "3.14.7",
     "arch": "linux/arm64+linux/amd64",
-    "image": "prof.cpu-sci@py3.13",
+    "image": "prof.worker-base@py3.14.7",
     "isolated_env": false,
     "notes": []
    },
@@ -9637,7 +9637,7 @@
      "evidence": null,
      "date": null,
      "reason": "no loader entry, adapter or profile image",
-     "unlock": "X0 merged: loader entry + contained_recipe + image prof.cpu-sci@py3.13 build/scan PASS"
+     "unlock": "X0 merged: loader entry + contained_recipe + image prof.worker-base@py3.14.7 build/scan PASS"
     },
     "validated": {
      "value": false,

@@ -149,10 +149,13 @@ def _configure_dispatch_runtime(identity: DispatchIdentity) -> RuntimePins:
         provider_destinations={str(key): value for key, value in identity.provider_destinations.items()},
         peer_destinations={str(key): value for key, value in identity.peer_destinations.items()},
     )
+    from scientist import profile_preparation
+    profile_preparation.configure_evidence_key(broker._key())
     return pins
 
 
 def _build_effects_app(identity: DispatchIdentity, pins: RuntimePins):
+    from scientist import scientific_authority
     def read_result(ref):
         with objects.open_verified(ref) as source:
             return source.read()
@@ -162,6 +165,8 @@ def _build_effects_app(identity: DispatchIdentity, pins: RuntimePins):
         provider_destinations=identity.provider_destinations,
         capture=checkpoints.capture,
         result_reader=read_result,
+        scientific_validator=lambda db, run, binding: scientific_authority.validate_runtime_binding(
+            db, run, binding, expected_image_digest=pins.image_digest),
     )
     app = create_private_app(controller)
 

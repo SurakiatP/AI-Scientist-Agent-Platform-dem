@@ -1,5 +1,6 @@
 # This allowlist applies to the root context used with -f backend/Dockerfile.
 **
+!LICENSE.md
 !backend/
 !backend/src/
 !backend/src/scientist/
@@ -11,3 +12,11 @@
 !runtime/entrypoint.py
 !runtime/skills-manifest.json
 !runtime/prepare.py
+!runtime/requirements.lock
+!runtime/profiles/
+!runtime/profiles/*.json
+!docs/
+!docs/skills/
+!docs/skills/capability-registry.json
+!skills/
+!skills/**

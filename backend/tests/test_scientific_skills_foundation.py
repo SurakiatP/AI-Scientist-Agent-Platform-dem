@@ -37,7 +37,7 @@ def test_registry_loads_all_pinned_records_but_selection_uses_explicit_allowlist
     assert registry.select(["get-available-resources"]).capability_ids == (
         "get-available-resources",
     )
-    assert registry.select(["get-available-resources"]).profile_ids == ("prof.cpu-sci@py3.13",)
+    assert registry.select(["get-available-resources"]).profile_ids == ("prof.worker-base@py3.14.7",)
     with pytest.raises(RegistryError, match="allowlist"):
         registry.select(["paper-lookup"])
     assert REVIEWED_CAPABILITY_ALLOWLIST == frozenset({"get-available-resources"})
@@ -52,7 +52,7 @@ def test_runtime_bundle_count_does_not_mark_catalog_skills_enabled():
     assert statuses.validated is False
     assert statuses.enabled is False
     assert statuses.blocked is False
-    assert len(json.loads((ROOT / "runtime/skills-manifest.json").read_text())["skills"]) == 3
+    assert len(json.loads((ROOT / "runtime/skills-manifest.json").read_text())["skills"]) == 177
 
 
 def test_instruction_loader_reads_only_selected_pinned_file_and_binds_fingerprint(tmp_path):
@@ -74,12 +74,12 @@ def test_instruction_loader_reads_only_selected_pinned_file_and_binds_fingerprin
 
     assert bundle.text == content
     assert bundle.files == ("skills/get-available-resources/SKILL.md",)
-    assert bundle.profile_ids == ("prof.cpu-sci@py3.13",)
+    assert bundle.profile_ids == ("prof.worker-base@py3.14.7",)
     assert bundle.capability_ids == ("get-available-resources",)
     assert len(bundle.registry_sha256) == 64
     assert len(bundle.instruction_fingerprint) == 64
     assert "Never load" not in bundle.text
-    assert bundle.profile_ids == ("prof.cpu-sci@py3.13",)
+    assert bundle.profile_ids == ("prof.worker-base@py3.14.7",)
     assert not hasattr(bundle, "tools") and not hasattr(bundle, "destinations")
 
 
@@ -154,7 +154,7 @@ def test_resource_recipe_reports_bounded_worker_limits_without_sensitive_fields(
 def test_artifact_descriptor_binds_identity_and_rejects_oversized_result():
     descriptor = build_artifact_descriptor(
         b"bounded result",
-        profile_id="prof.cpu-sci@py3.13",
+        profile_id="prof.worker-base@py3.14.7",
         instruction_fingerprint="a" * 64,
         max_bytes=64,
     )
@@ -165,7 +165,7 @@ def test_artifact_descriptor_binds_identity_and_rejects_oversized_result():
     with pytest.raises(ValueError, match="size"):
         build_artifact_descriptor(
             b"too large",
-            profile_id="prof.cpu-sci@py3.13",
+        profile_id="prof.worker-base@py3.14.7",
             instruction_fingerprint="a" * 64,
             max_bytes=1,
         )

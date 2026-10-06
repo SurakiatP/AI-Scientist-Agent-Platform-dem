@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -11,7 +12,7 @@ from pathlib import Path
 
 
 RECIPE_ID = "get-available-resources"
-PROFILE_ID = "prof.cpu-sci@py3.13"
+PROFILE_ID = "prof.worker-base@py3.14.7"
 MAX_ARTIFACT_BYTES = 1_048_576
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -64,6 +65,92 @@ def get_available_resources_recipe(resources: WorkerResources) -> dict[str, int 
         "memory_current_bytes": resources.memory_current_bytes,
         "gpu_validation": False,
     }
+
+
+def canonical_resource_result(
+    measurement: dict[str, int | float | bool | None],
+    *,
+    profile_id: str,
+    instruction_fingerprint: str,
+) -> bytes:
+    """Serialize the fixed X0 measurement with its reviewed computation provenance."""
+    if profile_id != PROFILE_ID or not _SHA256.fullmatch(instruction_fingerprint):
+        raise ValueError("resource result provenance is invalid")
+    envelope = {
+        "schema_version": 1,
+        "recipe_id": RECIPE_ID,
+        "profile_id": profile_id,
+        "instruction_fingerprint": instruction_fingerprint,
+        "measurement": measurement,
+    }
+    result = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    validate_resource_result(
+        result,
+        profile_id=profile_id,
+        instruction_fingerprint=instruction_fingerprint,
+        max_bytes=MAX_ARTIFACT_BYTES,
+    )
+    return result
+
+
+def validate_resource_result(
+    result: bytes,
+    *,
+    profile_id: str,
+    instruction_fingerprint: str,
+    max_bytes: int = MAX_ARTIFACT_BYTES,
+) -> dict[str, int | float | bool | None]:
+    """Reject noncanonical, oversized, or semantically fabricated X0 results."""
+    if (
+        not isinstance(result, bytes)
+        or type(max_bytes) is not int
+        or not 1 <= max_bytes <= MAX_ARTIFACT_BYTES
+        or len(result) > max_bytes
+        or profile_id != PROFILE_ID
+        or not isinstance(instruction_fingerprint, str)
+        or not _SHA256.fullmatch(instruction_fingerprint)
+    ):
+        raise ValueError("resource result is outside its approved bounds")
+    try:
+        value = json.loads(result)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("resource result is not valid JSON") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "recipe_id", "profile_id", "instruction_fingerprint", "measurement"
+    }:
+        raise ValueError("resource result envelope is invalid")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["recipe_id"] != RECIPE_ID
+        or value["profile_id"] != profile_id
+        or value["instruction_fingerprint"] != instruction_fingerprint
+        or json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8") != result
+    ):
+        raise ValueError("resource result provenance or canonical encoding is invalid")
+    measurement = value["measurement"]
+    if not isinstance(measurement, dict) or set(measurement) != {
+        "cpu_count", "cpu_quota_cores", "memory_limit_bytes", "memory_current_bytes", "gpu_validation"
+    }:
+        raise ValueError("resource measurement schema is invalid")
+    cpu_count = measurement["cpu_count"]
+    quota = measurement["cpu_quota_cores"]
+    memory_limit = measurement["memory_limit_bytes"]
+    memory_current = measurement["memory_current_bytes"]
+    if (
+        type(cpu_count) is not int
+        or not 1 <= cpu_count <= 4096
+        or (quota is not None and (
+            isinstance(quota, bool) or not isinstance(quota, (int, float))
+            or not math.isfinite(quota) or not 0 < quota <= 4096
+        ))
+        or (memory_limit is not None and (type(memory_limit) is not int or memory_limit < 1))
+        or (memory_current is not None and (type(memory_current) is not int or memory_current < 0))
+        or (memory_limit is not None and memory_current is not None and memory_current > memory_limit)
+        or measurement["gpu_validation"] is not False
+    ):
+        raise ValueError("resource measurement values are invalid")
+    return measurement
 
 
 def build_artifact_descriptor(

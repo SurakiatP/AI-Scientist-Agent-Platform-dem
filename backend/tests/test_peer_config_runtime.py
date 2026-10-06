@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from scientist import host, owner_settings, settings
+from scientist import profile_preparation, scientific_authority
 from scientist.dispatch_runtime import DispatchIdentity, DispatchTemplate, _parse_template, parse_dispatch_config
 from scientist.private_dispatch_entrypoint import create_dispatch_app
 from scientist.runtime_contracts import RUNTIME_COMMIT, RuntimeContextV1
@@ -21,13 +22,22 @@ WORKER_IMAGE = "registry.local/worker@sha256:" + "a" * 64
 DISPATCH_IMAGE = "registry.local/dispatch@sha256:" + "b" * 64
 
 
+@pytest.fixture(autouse=True)
+def restore_preparation_globals(monkeypatch):
+    for module, names in ((profile_preparation, ("_builder", "_evidence_key")),
+                          (scientific_authority, ("_bundle_root",))):
+        for name in names:
+            monkeypatch.setattr(module, name, getattr(module, name))
+
+
 def _host_values(tmp_path: Path) -> dict[str, object]:
     secrets_dir = tmp_path / "secrets"
     state_dir = tmp_path / "state"
     secrets_dir.mkdir(mode=0o700)
     state_dir.mkdir(mode=0o700)
     for name in ("database_url", "broker_capability_key", "master_key", "s3_access_key", "s3_secret_key"):
-        (secrets_dir / name).write_bytes(b"synthetic-config-secret\n")
+        value = b"synthetic-config-capability-key-32-bytes" if name == "broker_capability_key" else b"synthetic-config-secret"
+        (secrets_dir / name).write_bytes(value + b"\n")
     return {
         "schema_version": 1,
         "database_url": "postgresql+psycopg:///scientist?host=/tmp&port=54329",
@@ -178,5 +188,6 @@ def test_dispatch_template_identity_json_and_private_configuration_preserve_peer
     monkeypatch.setattr(private_entrypoint.broker, "configure", lambda **kwargs: configured.update(kwargs))
     monkeypatch.setattr(private_entrypoint.checkpoints, "configure_trusted_pins", lambda **_kwargs: None)
     monkeypatch.setattr(private_entrypoint, "_read_secret", lambda _name: b"x" * 32)
+    monkeypatch.setattr(private_entrypoint.broker, "_key", lambda: b"x" * 32)
     create_dispatch_app(parsed_identity)
     assert configured["peer_destinations"] == {PEER_ID: PEER_ORIGIN}

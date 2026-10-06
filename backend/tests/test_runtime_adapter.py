@@ -938,14 +938,12 @@ def test_selected_skill_manifest_matches_pinned_catalog_files() -> None:
     digest = manifest.pop("manifest_sha256")
     encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     assert hashlib.sha256(encoded.encode()).hexdigest() == digest
-    source_root = repo / ".local/vendor/scientific-agent-skills/skills"
+    source_root = repo / ".local/build/scientific-server-source-check-20261006a/skills"
     if not source_root.is_dir():
-        pytest.skip("pinned skills catalog checkout is not present")
-    assert {skill["name"] for skill in manifest["skills"]} == {
-        "paper-lookup",
-        "literature-review",
-        "scientific-writing",
-    }
+        source_root = Path.home() / "AI-Scientist-Agent-Platform-dem/.local/build/scientific-server-source-check-20261006a/skills"
+    if not source_root.is_dir():
+        pytest.skip("full pinned skills source archive is not present")
+    assert len(manifest["skills"]) == 177
     for skill in manifest["skills"]:
         for item in skill["files"]:
             source = source_root / skill["name"] / item["path"]

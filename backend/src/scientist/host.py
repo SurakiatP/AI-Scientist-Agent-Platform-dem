@@ -27,7 +27,7 @@ from sqlalchemy import create_engine, make_url, text
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.pool import NullPool
 
-from scientist import broker, objects, peer_reconciliation_supervisor, settings, supervisor
+from scientist import broker, objects, peer_reconciliation_supervisor, settings, supervisor, profile_preparation, scientific_authority
 from scientist import db as database
 from scientist.app import create_app
 from scientist.contracts import PlanSpec
@@ -100,6 +100,7 @@ class HostConfig(BaseModel):
     bucket: str
     secrets_dir: Path
     state_dir: Path
+    scientific_bundle_dir: Path | None = None
     max_active: int = Field(strict=True, ge=1, le=3)
     poll_seconds: float = Field(default=2.0, ge=0.2, le=30)
     provider_destinations: dict[str, str]
@@ -155,6 +156,11 @@ class HostConfig(BaseModel):
     @classmethod
     def _dir(cls, value: Path) -> Path:
         return _private_dir(value)
+
+    @field_validator('scientific_bundle_dir')
+    @classmethod
+    def _scientific_bundle(cls, value: Path | None) -> Path | None:
+        return _private_dir(value) if value is not None else None
 
     @field_validator("provider_destinations")
     @classmethod
@@ -268,6 +274,20 @@ def compose(cfg: HostConfig, *, engine=None, s3=None):
         provider_destinations=dict(cfg.provider_destinations),
         peer_destinations=dict(cfg.peer_destinations),
     )
+    scientific_authority.configure_bundle(cfg.scientific_bundle_dir)
+    from scientist.profile_evidence import accepted_image_builder
+    from scientist.profile_preparation import BuildFailure
+    accepted = accepted_image_builder(cfg.state_dir / 'profiles', key=capability_key, expected_image_digest=pin)
+    def prepare_profile(profile, job_id):
+        # Recheck physical availability in the same owned engine before reusing accepted evidence.
+        try:
+            if engine.engine_id() != cfg.expected_engine_id:
+                raise BuildFailure('environment_unavailable')
+            engine._verified_image_id(cfg.worker_image, pin)
+        except Exception as exc:
+            raise BuildFailure('environment_unavailable') from exc
+        return accepted(profile, job_id)
+    profile_preparation.configure_builder(prepare_profile, evidence_key=capability_key)
     os.environ["SCIENTIST_MASTER_KEY_FILE"] = str(cfg.secrets_dir / "master_key")
     global _destinations
     _destinations = dict(cfg.provider_destinations)
@@ -296,9 +316,14 @@ def bootstrap(db, run_id: UUID, generation: int) -> WorkerBootstrap:
         raise RuntimeError("provider destination is not configured")
     cfg = supervisor._require_config()
     pins = {"image_digest": cfg.image_digest, "skills_digest": cfg.skills_digest, "environment_digest": cfg.environment_digest}
+    if plan.scientific is not None:
+        scientific_authority.validate_runtime_binding(db, run_id, plan.scientific, expected_image_digest=cfg.image_digest)
     if row["prior"]:
         controller = WorkerController(pins=RuntimePins(runtime_commit=cfg.runtime_commit, **pins),
-                                      provider_destinations={plan.provider_id: endpoint})
+                                     provider_destinations={plan.provider_id: endpoint},
+                                     scientific_validator=lambda database, run, binding:
+                                         scientific_authority.validate_runtime_binding(database, run, binding,
+                                             expected_image_digest=cfg.image_digest))
         return supervisor.continuation_bootstrap(db, run_id, generation, controller)
     stamp = time.time()
     context = RuntimeContextV1.model_validate({
@@ -449,11 +474,15 @@ class Host:
     def tick(self) -> None:
         if self.lost or not self._lock_alive():
             return  # never act without the singleton lock
-        for step in (self.reap, self.claim_and_start):
+        for step in (self.reap, self.prepare_environments, self.claim_and_start):
             try:
                 step()
             except Exception as exc:
                 _log("host.error", step.__name__, None, type(exc).__name__)
+
+    def prepare_environments(self) -> None:
+        with database.session() as db:
+            profile_preparation.process_next_job(db)
 
     def run_loop(self, stop: threading.Event) -> None:
         while not stop.wait(self.poll_seconds) and not self.lost:

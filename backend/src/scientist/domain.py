@@ -92,6 +92,9 @@ def revise_plan(db: Session, owner: Principal, run_id: UUID, expected_revision: 
     if plan.input_snapshot_digest != snapshot_digest:
         raise DomainError("revision_conflict", 409)
     _validate_peer_releases(db, run_id, row.project_id, plan)
+    if plan.scientific is not None:
+        from scientist.scientific_authority import validate_plan_binding
+        validate_plan_binding(db, owner, row.project_id, plan.scientific, require_ready=False)
     allowed = settings.allowed_recipients(plan.provider_id)  # data_recipients come from configuration only; peers are checked by the broker
     if any(r not in allowed and not r.startswith("peer:") for r in plan.data_recipients):
         raise DomainError("data_destinations_not_configured", 409)
@@ -116,6 +119,9 @@ def approve_run(db: Session, owner: Principal, run_id: UUID, expected_revision: 
     }).scalar_one()
     plan = PlanSpec.model_validate(plan_record)
     _validate_peer_releases(db, run_id, row.project_id, plan)
+    if plan.scientific is not None:
+        from scientist.scientific_authority import validate_plan_binding
+        validate_plan_binding(db, owner, row.project_id, plan.scientific)
     db.execute(text("INSERT INTO approvals (id, run_id, revision, project_id, owner_identity, plan_digest) VALUES (:id, :run, :revision, :project, :owner, :digest)"), {
         "id": uuid4(), "run": run_id, "revision": row.revision, "project": row.project_id,
         "owner": owner.identity, "digest": plan_digest,

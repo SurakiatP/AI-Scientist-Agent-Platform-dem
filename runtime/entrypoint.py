@@ -17,6 +17,7 @@ from scientist.runtime_contracts import (
     WorkspaceFile,
     validate_workspace_path,
 )
+from scientist.instruction_loader import InstructionLoadError, load_instruction_pins, validate_scientific_binding
 from scientist.runtime_adapter import (
     BudgetExhausted,
     RuntimeAdapter,
@@ -29,6 +30,9 @@ from scientist.runtime_adapter import (
 _BOOTSTRAP = Path("/run/scientist/bootstrap")
 _WORKSPACE = Path("/workspace")
 _READY = Path("/run/scientist/readiness/ready")
+_SCIENTIFIC_REGISTRY = Path("/opt/scientist/runtime/capability-registry.json")
+_SCIENTIFIC_MANIFEST = Path("/opt/scientist/runtime/skills-manifest.json")
+_SCIENTIFIC_BUNDLE_ROOT = Path("/opt/scientist")
 _MAX_JSON_BYTES = 90 * 1024 * 1024
 _MAX_TOKEN_BYTES = 4096
 
@@ -215,6 +219,24 @@ def load_bootstrap(bootstrap_dir: Path) -> tuple[RuntimeContextV1, list[dict[str
     return context, workspace, metadata
 
 
+def _load_scientific_bundle(context: RuntimeContextV1):
+    """Revalidate optional scientific authority against immutable worker files."""
+    binding = context.plan.scientific
+    if binding is None:
+        return None
+    try:
+        pins = load_instruction_pins(_SCIENTIFIC_MANIFEST)
+        return validate_scientific_binding(
+            binding,
+            registry_path=_SCIENTIFIC_REGISTRY,
+            bundle_root=_SCIENTIFIC_BUNDLE_ROOT,
+            pinned_hashes=pins,
+            expected_image_digest=context.image_digest,
+        )
+    except (InstructionLoadError, OSError, ValueError, TypeError) as exc:
+        raise BootstrapError("scientific authority failed worker bootstrap validation") from exc
+
+
 def _paused_for_budget(adapter: RuntimeAdapter) -> bool:
     """The broker recorded the owner budget wait and nothing else is left in flight.
 
@@ -241,6 +263,7 @@ def run_worker() -> None:
     wait_until_ready(Path(os.environ.get("SCIENTIST_READINESS_FILE", str(_READY))))
     bootstrap_dir, workspace_name, broker_url, capability_name = _sanitize_environment()
     context, workspace, metadata = load_bootstrap(Path(bootstrap_dir))
+    scientific_bundle = _load_scientific_bundle(context)
     capability = _read_regular(Path(capability_name), _MAX_TOKEN_BYTES).decode("utf-8")
     if not capability or "\n" in capability or "\r" in capability:
         raise BootstrapError("invalid worker capability")
@@ -255,6 +278,8 @@ def run_worker() -> None:
         workspace_dir=workspace_dir,
         checkpoint_revision=metadata.checkpoint_revision,
     )
+    if scientific_bundle is not None:
+        adapter.scientific_instruction_bundle = scientific_bundle
     try:
         agent = build_native_agent(adapter, workspace_dir=workspace_dir)
         # Imports and private Hermes initialization finish before entering the

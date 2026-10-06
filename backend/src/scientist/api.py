@@ -14,13 +14,14 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import text
 from typing import Annotated
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from scientist import domain, files, objects, research, supervisor
+from scientist import domain, files, objects, research, supervisor, profile_preparation
 from scientist import secrets as secret_store
 from scientist.auth import DomainError, authenticate_owner_session
-from scientist.contracts import DecisionSubmit, ObjectRef, PlanSpec, Principal
+from scientist.contracts import DecisionSubmit, ObjectRef, PlanSpec, Principal, PreparationSubmit
 from scientist.db import session as database_session
 
 MAX_UPLOAD_BYTES = objects.MAX_UPLOAD_BYTES
@@ -33,6 +34,48 @@ _INLINE_SAFE = {"text/plain", "text/markdown", "text/csv", "application/json", "
 router = APIRouter(prefix="/api/v1")
 # Wave 5b implements these; kept apart so the parent mounts them deliberately.
 control_router = APIRouter(prefix="/api/v1")
+
+
+@router.get("/projects/{project_id}/research-setup")
+def research_setup(request: Request, project_id: UUID):
+    with database_session() as db:
+        view = profile_preparation.get_setup(db, _principal(request), project_id)
+        return JSONResponse(view.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
+
+
+@router.post("/projects/{project_id}/preparations")
+def prepare_environment(request: Request, project_id: UUID, body: PreparationSubmit):
+    with database_session() as db:
+        view = profile_preparation.request_preparation(db, _principal(request), project_id, body)
+        db.commit()
+        return JSONResponse(view.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/projects/{project_id}/preparations/{job_id}")
+def preparation_status(request: Request, project_id: UUID, job_id: UUID):
+    with database_session() as db:
+        view = profile_preparation.get_job(db, _principal(request), project_id, job_id)
+        return JSONResponse(view.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/runs/{run_id}/readiness")
+def run_readiness(request: Request, run_id: UUID):
+    with database_session() as db:
+        principal = _principal(request)
+        view = profile_preparation.get_readiness(db, principal, run_id)
+        plan = domain.get_plan(db, principal, run_id)
+        if plan.plan.scientific is not None:
+            from scientist.scientific_authority import validate_plan_binding
+            from scientist.contracts import ResearchRequirementView
+            run = domain.get_run(db, principal, run_id)
+            try:
+                validate_plan_binding(db, principal, run.project_id, plan.plan.scientific, require_ready=False)
+            except DomainError:
+                view = view.model_copy(update={'state': 'blocked', 'requirements': [*view.requirements,
+                    ResearchRequirementView(id='approved_research_context', label='Current research plan',
+                        purpose='Rebuild the plan after its approved environment or instructions change.',
+                        state='blocked', action='request_approval', reason='scientific_binding_unavailable')]})
+        return JSONResponse(view.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
 
 
 class Body(BaseModel):
@@ -77,7 +120,8 @@ class PlanPatch(Body):
 
 class PreparePlan(Body):
     expected_revision: int
-    search_terms: list[str]
+    search_terms: list[str] = Field(default_factory=list, max_length=10)
+    workflow: Literal['literature', 'resources'] = 'literature'
 
 
 class Publish(Body):
@@ -319,7 +363,7 @@ def patch_plan(request: Request, run_id: UUID, body: PlanPatch):
 def prepare_plan(request: Request, run_id: UUID, body: PreparePlan):
     with database_session() as db:
         principal = _principal(request)
-        plan = research.build_plan(db, principal, run_id, body.search_terms)
+        plan = research.build_plan(db, principal, run_id, body.search_terms, workflow=body.workflow)
         run = domain.revise_plan(db, principal, run_id, body.expected_revision, plan)
         db.commit()
         return run

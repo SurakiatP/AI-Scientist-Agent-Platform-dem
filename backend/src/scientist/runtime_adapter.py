@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import json
 import os
@@ -18,6 +19,8 @@ import httpx
 from pydantic import ValidationError
 
 from scientist.contracts import OperationRequest, OperationResult
+from scientist.contracts import ScientificBinding
+from scientist.instruction_loader import InstructionBundle
 from scientist.model_payload import (
     ChatMessage,
     ModelPayloadError,
@@ -36,6 +39,8 @@ from scientist.runtime_contracts import (
     RuntimeContextV1,
     TodoSnapshot,
     WorkspaceFile,
+    WorkspaceEntry,
+    ScientificResultReceipt,
     canonical_bytes,
     operation_fingerprint,
     validate_workspace_path,
@@ -47,6 +52,13 @@ _DEFAULT_MODEL_OUTPUT_TOKENS = 2048
 _COMPRESSION_MAX_OUTPUT_TOKENS = 2048
 _REVIEWED_NATIVE_TODO_TOOL_NAMES = frozenset({"todo_list", "todo"})
 _REVIEWED_NATIVE_TODO_BRIDGE = "tool_call"
+_REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES = frozenset({"instruction_view", "scientific_resources"})
+_NATIVE_TOOL_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "scientist_native_tool_call_id", default=None
+)
+_NATIVE_TOOL_CALL_AUTHORITY: contextvars.ContextVar[tuple[str, str, bytes] | None] = contextvars.ContextVar(
+    "scientist_native_tool_call_authority", default=None
+)
 _SUPPORTED_CONTROLS = {
     "temperature",
     "top_p",
@@ -94,21 +106,40 @@ def _model_mapping(value: Any) -> dict[str, Any]:
     raise RuntimeAdapterError("invalid runtime context")
 
 
-def _validate_native_todo_call(agent: Any, call: Any) -> None:
-    """Allow only pinned Todo handlers, including a scope-checked Todo bridge.
+def _validate_native_tool_arguments(name: str, arguments: Any, binding: ScientificBinding | None) -> None:
+    if not isinstance(arguments, dict):
+        raise RuntimeAdapterError("native tool arguments must be an object")
+    if name == "scientific_resources":
+        if arguments or binding is None or "get-available-resources" not in binding.capability_ids:
+            raise RuntimeAdapterError("scientific resource request is outside approved authority")
+    elif name == "instruction_view":
+        if (
+            binding is None
+            or set(arguments) != {"capability_id"}
+            or arguments.get("capability_id") not in binding.capability_ids
+        ):
+            raise RuntimeAdapterError("instruction request is outside approved authority")
 
-    At RUNTIME_COMMIT the native schema exposes ``todo_list`` (with ``todo`` as
-    its legacy alias). Hermes' registry executor can still dispatch arbitrary
-    names passed directly to ``_execute_tool_calls``, regardless of those
-    schemas, so every call is checked before the native executor is entered.
+
+def _validate_native_todo_call(agent: Any, call: Any) -> tuple[str, dict[str, Any]]:
+    """Allow only Todo and exact reviewed scientific handlers, direct or deferred.
+
+    The registry executor can dispatch names regardless of model-visible schemas.
+    Deferred Tool Search calls are therefore unwrapped and checked here, then the
+    scientific handlers repeat authority validation after middleware transforms.
     """
     value = _model_mapping(call)
     function = value.get("function")
     if not isinstance(function, dict):
         raise RuntimeAdapterError("native tool call has no function")
     name = function.get("name")
-    if name not in _REVIEWED_NATIVE_TODO_TOOL_NAMES and name != _REVIEWED_NATIVE_TODO_BRIDGE:
-        raise RuntimeAdapterError("native tool call is outside the reviewed Todo surface")
+    # Hermes' pinned native parser canonicalizes this legacy registry alias
+    # before dispatch. Apply the same single alias at the saved-call boundary.
+    if name == "todo":
+        name = "todo_list"
+    allowed = _REVIEWED_NATIVE_TODO_TOOL_NAMES | _REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES
+    if name not in allowed and name != _REVIEWED_NATIVE_TODO_BRIDGE:
+        raise RuntimeAdapterError("native tool call is outside the reviewed surface")
     raw_arguments = function.get("arguments")
     if isinstance(raw_arguments, str):
         try:
@@ -118,7 +149,7 @@ def _validate_native_todo_call(agent: Any, call: Any) -> None:
     else:
         arguments = raw_arguments
     if not isinstance(arguments, dict):
-        raise RuntimeAdapterError("native Todo arguments are invalid")
+        raise RuntimeAdapterError("native tool arguments are invalid")
 
     try:
         # This pinned Hermes helper canonicalizes the legacy alias and, for the
@@ -126,13 +157,49 @@ def _validate_native_todo_call(agent: Any, call: Any) -> None:
         # enabled toolset and the concrete deferred-tool schema.
         from agent.tool_executor import _unwrap_tool_search_call
 
-        resolved_name, _resolved_arguments, scope_block = _unwrap_tool_search_call(
+        resolved_name, resolved_arguments, scope_block = _unwrap_tool_search_call(
             agent, name, arguments
         )
     except Exception as exc:
         raise RuntimeAdapterError("native Todo scope validation failed") from exc
-    if scope_block is not None or resolved_name not in _REVIEWED_NATIVE_TODO_TOOL_NAMES:
-        raise RuntimeAdapterError("native tool call is outside the reviewed Todo scope")
+    if scope_block is not None or resolved_name not in allowed:
+        raise RuntimeAdapterError("native tool call is outside the reviewed scope")
+    if resolved_name in _REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES:
+        _validate_native_tool_arguments(resolved_name, resolved_arguments, getattr(agent, "_scientific_binding", None))
+    return resolved_name, resolved_arguments
+
+
+def _write_scientific_result(workspace_dir: Path, path: str, content: bytes) -> None:
+    relative = validate_workspace_path(path)
+    root_info = workspace_dir.lstat()
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise RuntimeAdapterError("scientific workspace root is unsafe")
+    target = workspace_dir / relative
+    current = workspace_dir
+    for part in PurePosixPath(relative).parts[:-1]:
+        current = current / part
+        current.mkdir(mode=0o700, exist_ok=True)
+        info = current.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise RuntimeAdapterError("scientific result parent is unsafe")
+    try:
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except FileExistsError as exc:
+        raise RuntimeAdapterError("scientific result path already exists") from exc
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeAdapterError("scientific result write failed")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _wire_messages(messages: Any) -> list[dict[str, Any]]:
@@ -736,7 +803,7 @@ def install_saved_turn_continuation(agent: Any, adapter: RuntimeAdapter) -> None
 
 
 def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
-    """Construct pinned Hermes with only Todo available and broker-only clients.
+    """Construct pinned Hermes with Todo and approved scientific tools only.
 
     The caller must establish private HOME/HERMES_HOME and immutable import paths
     before invoking this function.
@@ -748,6 +815,196 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
     import agent.context_compressor as context_compressor
     import agent.micro_compaction as micro_compaction
     import model_tools
+
+    adapter._native_active_tool_calls = {}
+    binding = adapter.context.plan.scientific
+    instruction_bundle = getattr(adapter, "scientific_instruction_bundle", None)
+    if binding is not None:
+        if not isinstance(instruction_bundle, InstructionBundle):
+            raise RuntimeAdapterError("approved scientific instructions were not loaded")
+        if instruction_bundle.capability_ids != tuple(binding.capability_ids):
+            raise RuntimeAdapterError("loaded scientific instructions differ from approved capabilities")
+        adapter._native_scientific_outputs = {}
+
+        def require_active_call(tool_name: str, arguments: dict[str, Any]) -> str:
+            tool_call_id = _NATIVE_TOOL_CALL_ID.get()
+            if not isinstance(tool_call_id, str) or tool_call_id not in adapter._native_active_tool_calls:
+                raise RuntimeAdapterError("scientific handler has no issued native tool-call identity")
+            authority = _NATIVE_TOOL_CALL_AUTHORITY.get()
+            if authority is None or authority[0] != tool_call_id:
+                raise RuntimeAdapterError("scientific handler is outside native dispatcher authority")
+            if tool_call_id not in adapter._native_consumed_tool_calls:
+                raise RuntimeAdapterError("scientific handler has no consumed native tool-call identity")
+            if tool_name not in _REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES:
+                raise RuntimeAdapterError("scientific handler is outside the reviewed native surface")
+            if authority[1] != tool_name or authority[2] != canonical_bytes(arguments):
+                raise RuntimeAdapterError("scientific handler call differs from its issued native call")
+            _validate_native_tool_arguments(tool_name, arguments, binding)
+            return tool_call_id
+
+        def instruction_view_handler(arguments: dict[str, Any], **_kwargs: Any) -> str:
+            call_id = require_active_call("instruction_view", arguments)
+            adapter._native_scientific_outputs[call_id] = {"kind": "instruction_view"}
+            return instruction_bundle.text
+
+        def scientific_resources_handler(arguments: dict[str, Any], **_kwargs: Any) -> str:
+            call_id = require_active_call("scientific_resources", arguments)
+            from scientist.resource_recipe import (
+                build_artifact_descriptor,
+                canonical_resource_result,
+                collect_worker_resources,
+                get_available_resources_recipe,
+                validate_resource_result,
+            )
+
+            resources = collect_worker_resources()
+            if resources.memory_limit_bytes is not None and resources.memory_limit_bytes > binding.memory_limit_bytes:
+                raise RuntimeAdapterError("worker memory limit exceeds approved scientific binding")
+            result = canonical_resource_result(
+                get_available_resources_recipe(resources),
+                profile_id=binding.profile_id,
+                instruction_fingerprint=binding.instruction_fingerprint,
+            )
+            validate_resource_result(
+                result,
+                profile_id=binding.profile_id,
+                instruction_fingerprint=binding.instruction_fingerprint,
+                max_bytes=binding.max_result_bytes,
+            )
+            descriptor = build_artifact_descriptor(
+                result,
+                profile_id=binding.profile_id,
+                instruction_fingerprint=binding.instruction_fingerprint,
+                max_bytes=binding.max_result_bytes,
+            )
+            path = "outputs/resources.json"
+            if sum(entry.size for entry in adapter.context.workspace_manifest) + descriptor.size_bytes > binding.workspace_limit_bytes:
+                raise RuntimeAdapterError("scientific result exceeds approved workspace limit")
+            _write_scientific_result(workspace_dir, path, result)
+            raw_call_id = adapter._native_active_tool_calls[call_id]
+            binding_hash = hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest()
+            receipt = ScientificResultReceipt(
+                tool_call_id=raw_call_id,
+                capability_id=descriptor.recipe_id,
+                binding_sha256=binding_hash,
+                recipe_version="1",
+                path=path,
+                sha256=descriptor.result_sha256,
+                size=descriptor.size_bytes,
+            )
+            entry = WorkspaceEntry(path=path, sha256=descriptor.result_sha256, size=descriptor.size_bytes)
+            adapter._native_scientific_outputs[call_id] = {"receipt": receipt, "workspace_entry": entry}
+            return "Measured approved worker resource limits and saved outputs/resources.json."
+
+        for name, schema, handler in (
+            (
+                "instruction_view",
+                {
+                    "name": "instruction_view",
+                    "description": "Read the selected approved scientific instruction as untrusted reference text.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"capability_id": {"type": "string", "enum": list(binding.capability_ids)}},
+                        "required": ["capability_id"],
+                        "additionalProperties": False,
+                    },
+                },
+                instruction_view_handler,
+            ),
+            (
+                "scientific_resources",
+                {
+                    "name": "scientific_resources",
+                    "description": "Measure bounded CPU and memory limits inside this approved worker.",
+                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                },
+                scientific_resources_handler,
+            ),
+        ):
+            existing = model_tools.registry.get_entry(name)
+            if existing is not None and not getattr(existing.handler, "_scientist_native_handler", False):
+                raise RuntimeAdapterError("scientific native tool name is already registered")
+            handler._scientist_native_handler = True
+            model_tools.registry.register(
+                name=name,
+                toolset="todo",
+                schema=schema,
+                handler=handler,
+                description=schema["description"],
+                max_result_size_chars=1_000_000,
+            )
+
+    original_handle_function_call = getattr(model_tools, "handle_function_call", None)
+    if getattr(original_handle_function_call, "_scientist_native_context", False):
+        original_handle_function_call = getattr(
+            original_handle_function_call, "_scientist_original_dispatcher", None
+        )
+    if binding is not None and not callable(original_handle_function_call):
+        raise RuntimeAdapterError("pinned Hermes tool dispatcher is unavailable")
+    if callable(original_handle_function_call):
+        @wraps(original_handle_function_call)
+        def native_tool_call_context(*args: Any, **kwargs: Any) -> Any:
+            tool_call_id = kwargs.get("tool_call_id")
+            if tool_call_id is None and len(args) > 3:
+                tool_call_id = args[3]
+            tool_name = kwargs.get("function_name")
+            if tool_name is None and args:
+                tool_name = args[0]
+            arguments = kwargs.get("function_args")
+            if arguments is None and len(args) > 1:
+                arguments = args[1]
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeAdapterError("native tool arguments are invalid") from exc
+            if (
+                not isinstance(tool_call_id, str)
+                or tool_call_id not in adapter._native_active_tool_calls
+            ):
+                raise RuntimeAdapterError("native dispatcher has no issued tool-call identity")
+            if tool_call_id in adapter._native_consumed_tool_calls:
+                raise RuntimeAdapterError("native tool-call identity was already dispatched")
+            allowed_names = _REVIEWED_NATIVE_TODO_TOOL_NAMES | {_REVIEWED_NATIVE_TODO_BRIDGE}
+            if binding is not None:
+                allowed_names |= _REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES
+            if not isinstance(tool_name, str) or tool_name not in allowed_names:
+                raise RuntimeAdapterError("native dispatcher call is outside the reviewed surface")
+            agent = getattr(adapter, "_native_dispatch_agent", None)
+            if agent is None:
+                raise RuntimeAdapterError("native dispatcher has no factory agent")
+            raw_call_id = adapter._native_active_tool_calls[tool_call_id]
+            pending = adapter.context.pending_assistant
+            if pending is None or pending.message_index >= len(adapter.context.messages):
+                raise RuntimeAdapterError("native dispatcher has no saved assistant batch")
+            saved_calls = adapter.context.messages[pending.message_index].tool_calls or []
+            saved_call = next(
+                (call for call in saved_calls if _model_mapping(call).get("id") == raw_call_id), None
+            )
+            if saved_call is None:
+                raise RuntimeAdapterError("native dispatcher identity is not in the saved assistant batch")
+            saved_name, saved_arguments = _validate_native_todo_call(agent, saved_call)
+            incoming_name, incoming_arguments = _validate_native_todo_call(
+                agent, {"function": {"name": tool_name, "arguments": arguments}}
+            )
+            if (
+                incoming_name != saved_name
+                or canonical_bytes(incoming_arguments) != canonical_bytes(saved_arguments)
+            ):
+                raise RuntimeAdapterError("native dispatcher call differs from its saved assistant call")
+            adapter._native_consumed_tool_calls.add(tool_call_id)
+            authority = (tool_call_id, incoming_name, canonical_bytes(incoming_arguments))
+            token = _NATIVE_TOOL_CALL_ID.set(tool_call_id)
+            authority_token = _NATIVE_TOOL_CALL_AUTHORITY.set(authority)
+            try:
+                return original_handle_function_call(*args, **kwargs)
+            finally:
+                _NATIVE_TOOL_CALL_AUTHORITY.reset(authority_token)
+                _NATIVE_TOOL_CALL_ID.reset(token)
+
+        native_tool_call_context._scientist_native_context = True
+        native_tool_call_context._scientist_original_dispatcher = original_handle_function_call
+        model_tools.handle_function_call = native_tool_call_context
 
     original_assemble_api_request = conversation_loop.assemble_api_request
 
@@ -844,12 +1101,30 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
                     or saved_function.get("arguments") != live_function.get("arguments")
                 ):
                     raise RuntimeAdapterError("native tool suffix differs from its saved assistant call")
+                self._scientific_binding = binding
                 _validate_native_todo_call(self, live)
+            if sum(1 for item in suffix_calls if item.function.name == "scientific_resources") > 1:
+                raise RuntimeAdapterError("native tool batch repeats a scientific computation")
+            if adapter.context.scientific_results and any(
+                item.function.name == "scientific_resources" for item in suffix_calls
+            ):
+                raise RuntimeAdapterError("scientific computation already has a committed receipt")
             adapter.context = adapter.context.model_copy(
                 update={"boundary": "before_tool", "pending_assistant": pending}
             )
             adapter._checkpoint("before_tool")
-            super()._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+            adapter._native_active_tool_calls = {
+                item.applied_id: item.raw_id for item in applied[pending.next_tool_index :]
+            }
+            adapter._native_consumed_tool_calls = set()
+            adapter._native_dispatch_agent = self
+            adapter._native_scientific_outputs = {}
+            try:
+                super()._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+            finally:
+                adapter._native_active_tool_calls = {}
+                adapter._native_consumed_tool_calls = set()
+                adapter._native_dispatch_agent = None
             dumped = [
                 item.model_dump(mode="json", exclude_none=True)
                 if hasattr(item, "model_dump")
@@ -862,6 +1137,24 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
                 for item in dumped
                 if item.get("role") == "tool" and item.get("tool_call_id") in reverse
             }
+            for item in suffix_calls:
+                if item.function.name in _REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES:
+                    applied_id = raw_to_applied[item.id]
+                    if applied_id not in adapter._native_scientific_outputs or item.id not in completed:
+                        raise RuntimeAdapterError("scientific tool result was not produced and completed")
+            new_receipts = []
+            new_workspace = []
+            for applied_id, output in adapter._native_scientific_outputs.items():
+                if output.get("receipt") is None:
+                    continue
+                raw_id = adapter._native_active_tool_calls.get(applied_id) or next(
+                    (item.raw_id for item in applied if item.applied_id == applied_id), None
+                )
+                if raw_id is None or raw_id not in completed:
+                    raise RuntimeAdapterError("scientific receipt is not bound to a completed tool call")
+                receipt = output["receipt"].model_copy(update={"tool_call_id": raw_id})
+                new_receipts.append(receipt)
+                new_workspace.append(output["workspace_entry"])
             for item in dumped:
                 if item.get("role") == "tool" and item.get("tool_call_id") in reverse:
                     item["tool_call_id"] = reverse[item["tool_call_id"]]
@@ -890,6 +1183,8 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
                 update={
                 "messages": [ChatMessage.model_validate(item) for item in _wire_messages(dumped)],
                 "native_message_metadata": _native_message_metadata(dumped),
+                    "scientific_results": [*adapter.context.scientific_results, *new_receipts],
+                    "workspace_manifest": [*adapter.context.workspace_manifest, *new_workspace],
                     "todo": todo,
                     "pending_assistant": (
                         None
@@ -977,12 +1272,15 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
             "skip_tool_search_assembly": True,
         })
         definitions = original_tool_definitions(**call_kwargs)
-        # Pinned Hermes normally adds tool_search/tool_describe/tool_call bridge
-        # schemas after toolset filtering. Expose only the reviewed direct Todo
-        # handler; legacy bridge continuations are checked separately below.
+        reviewed_names = set(_REVIEWED_NATIVE_TODO_TOOL_NAMES)
+        if binding is not None:
+            reviewed_names.update(_REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES)
+        # Keep Tool Search/RPC schemas out of the model-visible surface. If a
+        # saved/deferred call reaches dispatch anyway, the preflight and handler
+        # checks independently scope it to these same concrete tools.
         return [
             item for item in definitions
-            if (item.get("function") or {}).get("name") == "todo_list"
+            if (item.get("function") or {}).get("name") in reviewed_names
         ]
 
     model_tools.get_tool_definitions = reviewed_native_tool_definitions
@@ -1017,6 +1315,7 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
     finally:
         model_tools.get_tool_definitions = original_tool_definitions
     agent._persist_disabled = True
+    agent._scientific_binding = binding
     # Hermes interprets this as TOTAL attempts, not retries-after-first.
     # Keep one broker request per turn; the OpenAI SDK itself uses 0 retries.
     agent._api_max_retries = 1

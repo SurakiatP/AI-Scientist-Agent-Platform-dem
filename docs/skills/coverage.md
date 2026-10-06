@@ -101,8 +101,8 @@ Each distinct image is built, scanned and license-inventoried separately; no sin
 
 | Profile | Skills | Pythons | Arch | Images |
 |---|---|---|---|---|
-| prof.cpu-sci | 34 | 3.12, 3.13 | linux/arm64+linux/amd64 | 4 |
-| prof.worker-base | 20 | 3.14.7 | linux/arm64+linux/amd64 | 1 |
+| prof.cpu-sci | 33 | 3.12, 3.13 | linux/arm64+linux/amd64 | 4 |
+| prof.worker-base | 21 | 3.14.7 | linux/arm64+linux/amd64 | 1 |
 | prof.remote-client | 19 | 3.12, 3.13 | linux/arm64+linux/amd64 | 3 |
 | prof.omics | 18 | 3.11, 3.12, 3.13 | linux/amd64, linux/arm64+linux/amd64 | 5 |
 | prof.sim | 16 | 3.11, 3.12, 3.13 | linux/arm64+linux/amd64 | 3 |
@@ -173,7 +173,7 @@ A = analyzed (S = semantic sample), I/V/E = implemented/validated/enabled, Sign 
 | `genomic-intelligence` | genomics/omics | X7 | 3.13 | yes | no | no | no | - | - | credential | credential: GI account/key; pricing and DNA-confidentiality terms unresolved | X7 merged: loader entry + mcp_client, remote_compute + image prof.remote-client@py3.13 build/scan PASS |
 | `geomaster` | imaging/spatial | X4 | 3.13 | yes | no | no | no | - | - | - | no loader entry, adapter or profile image | X4 merged: loader entry + contained_recipe, sci_format_io, tabular_io + image prof.imaging@py3.13 build/scan PASS |
 | `geopandas` | imaging/spatial | X4 | 3.13 | yes | no | no | no | - | - | - | no loader entry, adapter or profile image | X4 merged: loader entry + contained_recipe, sci_format_io, tabular_io + image prof.imaging@py3.13 build/scan PASS |
-| `get-available-resources` | developer tools | X0 | 3.13 | S | no | no | no | - | - | - | no loader entry, adapter or profile image | X0 merged: loader entry + contained_recipe + image prof.cpu-sci@py3.13 build/scan PASS |
+| `get-available-resources` | developer tools | X0 | 3.14.7 | S | no | no | no | - | - | - | no loader entry, adapter or profile image | X0 merged: loader entry + contained_recipe + image prof.worker-base@py3.14.7 build/scan PASS |
 | `gget` | databases | X3 | 3.14.7 | yes | no | no | no | - | - | - | no loader entry, adapter or profile image | X3 merged: loader entry + plot_render, public_data_api + image prof.worker-base@py3.14.7 build/scan PASS |
 | `ginkgo-cloud-lab` | lab workflows | X10 | 3.13 | S | no | no | no | - | - | policy_conflict | policy_conflict: No published submission API; browser ordering only | Provider API exists, or owner approves a reviewed supervised-browser adapter design |
 | `glycoengineering` | molecular/chem | X4 | 3.13 | yes | no | no | no | req | - | specialist_review | specialist_review: Unknown skill license | X4 merged: loader entry + contained_recipe, sci_format_io, tabular_io + image prof.chem@py3.13 build/scan PASS |

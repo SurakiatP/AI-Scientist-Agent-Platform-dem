@@ -15,12 +15,25 @@ from scientist.domain import get_plan
 _MAX_TERMS, _MAX_TERM_LEN = 10, 150
 
 
-def build_plan(db: Session, owner: Principal, run_id: UUID, search_terms: list[str]) -> PlanSpec:
+def build_plan(db: Session, owner: Principal, run_id: UUID, search_terms: list[str], *, workflow: str = 'literature') -> PlanSpec:
     """Draft the initial workflow: search literature, verify references, synthesize evidence.
 
     Keeps the run's snapshot digest, provider/model and owner-set limits; the caller
     persists the draft through domain.revise_plan so the revision check stays authoritative.
     """
+    if workflow == 'resources':
+        from scientist.scientific_authority import resource_binding
+        current = get_plan(db, owner, run_id).plan
+        provider = settings.provider_endpoint(current.provider_id)
+        if not provider:
+            raise DomainError('data_destinations_not_configured', 409)
+        return current.model_copy(update={
+            'scientific': resource_binding(current.input_snapshot_digest),
+            'stages': ['Measure workspace resources', 'Explain measured limits'],
+            'allowed_ops': ['llm'], 'data_recipients': [provider], 'packages': [],
+        })
+    if workflow != 'literature':
+        raise DomainError('invalid_request', 400)
     terms = list(dict.fromkeys(t.strip() for t in search_terms if isinstance(t, str) and t.strip()))
     if not terms or len(terms) > _MAX_TERMS or any(len(t) > _MAX_TERM_LEN for t in terms):
         raise DomainError("forbidden", 400)
@@ -30,7 +43,7 @@ def build_plan(db: Session, owner: Principal, run_id: UUID, search_terms: list[s
     provider, scholarly = settings.provider_endpoint(current.provider_id), settings.scholarly_endpoints()
     if not provider or not scholarly:
         raise DomainError("data_destinations_not_configured", 409)
-    return current.model_copy(update={"stages": stages, "allowed_ops": ["search", "llm"], "data_recipients": [*scholarly, provider]})
+    return current.model_copy(update={"stages": stages, "allowed_ops": ["search", "llm"], "data_recipients": [*scholarly, provider], "scientific": None})
 
 
 def _norm_id(kind: str, value: object) -> str | None:

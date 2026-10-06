@@ -15,6 +15,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 from scientist import broker, checkpoints, db as database, host, objects, settings, supervisor
+from scientist import profile_preparation, scientific_authority
 from scientist.app import create_app
 from scientist.contracts import PlanSpec, Principal
 from scientist.db import create_project, create_session, migrate, session
@@ -70,6 +71,8 @@ def iso(monkeypatch):
 @pytest.fixture(autouse=True)
 def restore_globals(monkeypatch):
     for module, names in ((supervisor, ["_config"]), (checkpoints, ["_trusted_pins"]),
+                          (profile_preparation, ["_builder", "_evidence_key"]),
+                          (scientific_authority, ["_bundle_root"]),
                           (objects, ["_configured_client", "BUCKET"]),
                           (broker, ["_capability_key", "_provider_destinations", "_resolver", "_transport",
                                     "_persist_result", "_peer_destinations", "_dispatch_is_inactive"])):
@@ -87,7 +90,8 @@ def _config_dict(tmp_path):
         directory.mkdir()
         directory.chmod(0o700)
     for name in _SECRET_NAMES:
-        (secrets_dir / name).write_bytes(f"value-of-{name}\n".encode())
+        value = b"test-only-capability-key-32-bytes!" if name == 'broker_capability_key' else f"value-of-{name}".encode()
+        (secrets_dir / name).write_bytes(value + b"\n")
         (secrets_dir / name).chmod(0o600)
     return {
         "schema_version": 1, "database_url": "postgresql+psycopg:///scientist_test_h1?host=/tmp&port=54329",
@@ -214,7 +218,7 @@ def test_compose_configures_runtime(tmp_path):
     assert supervisor._config is not None and supervisor._config.engine is engine
     assert supervisor._config.image == f"registry.local/worker@{WORKER_DIGEST}"
     assert broker._dispatch_inactivity_proof is not None
-    assert broker._capability_key == b"value-of-broker_capability_key"
+    assert broker._capability_key == b"test-only-capability-key-32-bytes!"
     assert broker._provider_destinations == {PROVIDER: ORIGIN}
     assert objects._configured_client is s3 and s3.heads == ["scientist"]
     assert os.environ["SCIENTIST_MASTER_KEY_FILE"] == str(cfg.secrets_dir / "master_key")

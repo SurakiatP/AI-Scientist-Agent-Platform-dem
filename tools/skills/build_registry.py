@@ -375,6 +375,8 @@ def frontend_for(r, adapters, blocked):
 
 def profile_for(k, r, wave):
     prof, fam = r["profile"], r["families"][0]
+    if k == "get-available-resources":
+        return "prof.worker-base"
     if prof == "instruction_only":
         return "prof.none"
     if k in ("markitdown", "liteparse"):

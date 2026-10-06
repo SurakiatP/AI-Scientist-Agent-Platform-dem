@@ -28,3 +28,21 @@ live API/event integration, MCP and bidirectional A2A adapters, and local
 deployment, backup/restore and final security acceptance. See the staged
 [implementation plan](docs/superpowers/plans/2026-10-03-platform-build.md)
 for dependencies and completion gates.
+
+## Research preparation
+
+Research Setup reuses the encrypted connection/grant settings and records
+preparation of predefined reviewed environments. Saving a credential does not
+perform a provider round-trip or authorize a research run, data release or paid
+call. Preparation is separate from reading scientific instructions.
+
+The initial profile measures resources using the existing Python 3.14.7 worker.
+An environment is ready only when the trusted host verifies matching actual
+build, compatibility, security, license and containment evidence. An unavailable
+builder, interrupted build, missing approval or failed scan stays unavailable.
+Refresh reads the recorded job instead of starting another preparation.
+
+The trusted host/controller configuration and operator procedure are in
+[runtime/README.md](runtime/README.md#trusted-environment-preparation). New profiles
+and scientific capabilities remain disabled until their own acceptance evidence
+passes. Do not infer readiness from bundled instructions or package imports.

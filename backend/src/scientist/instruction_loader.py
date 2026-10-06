@@ -4,17 +4,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Callable, Mapping
 
-from scientist.capability_registry import CapabilitySelection, REVIEWED_CAPABILITY_ALLOWLIST
+from scientist.capability_registry import (
+    CATALOG_COMMIT,
+    CapabilitySelection,
+    RegistryError,
+    REVIEWED_CAPABILITY_ALLOWLIST,
+    load_registry,
+)
+from scientist.contracts import ScientificBinding
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MAX_INSTRUCTION_FILE_BYTES = 1_000_000
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_MANIFEST_FILES = 20_000
+MAX_CATALOG_FILE_BYTES = 64 * 1024 * 1024
+MAX_CATALOG_TOTAL_BYTES = 256 * 1024 * 1024
+_SKILL_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 class InstructionLoadError(ValueError):
@@ -30,6 +44,151 @@ class InstructionBundle:
     profile_ids: tuple[str, ...]
     registry_sha256: str
     instruction_fingerprint: str
+
+
+def load_instruction_pins(manifest_path: str | Path) -> Mapping[str, str]:
+    """Read a bounded, digest-verified manifest and return canonical file pins."""
+    source = Path(manifest_path)
+    try:
+        info = source.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MANIFEST_BYTES:
+            raise InstructionLoadError("instruction manifest is unsafe or oversized")
+        fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            chunks = bytearray()
+            while len(chunks) <= MAX_MANIFEST_BYTES:
+                block = os.read(fd, min(65_536, MAX_MANIFEST_BYTES + 1 - len(chunks)))
+                if not block:
+                    break
+                chunks.extend(block)
+        finally:
+            os.close(fd)
+        if len(chunks) > MAX_MANIFEST_BYTES:
+            raise InstructionLoadError("instruction manifest is oversized")
+        document = json.loads(chunks, object_pairs_hook=_unique_object)
+    except InstructionLoadError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise InstructionLoadError("instruction manifest is invalid") from exc
+
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != 1
+        or document.get("catalog_commit") != CATALOG_COMMIT
+        or not isinstance(document.get("manifest_sha256"), str)
+        or not _SHA256.fullmatch(document["manifest_sha256"])
+    ):
+        raise InstructionLoadError("instruction manifest provenance is invalid")
+    payload = {key: value for key, value in document.items() if key != "manifest_sha256"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if hashlib.sha256(canonical).hexdigest() != document["manifest_sha256"]:
+        raise InstructionLoadError("instruction manifest digest mismatch")
+
+    skills = document.get("skills")
+    if not isinstance(skills, list) or not skills or len(skills) > 177:
+        raise InstructionLoadError("instruction manifest skill list is invalid")
+    pins: dict[str, str] = {}
+    seen_skills: set[str] = set()
+    file_count = 0
+    total_bytes = 0
+    for skill in skills:
+        if not isinstance(skill, dict):
+            raise InstructionLoadError("instruction manifest skill record is invalid")
+        skill_id, files = skill.get("name"), skill.get("files")
+        if not isinstance(skill_id, str) or not _SKILL_ID.fullmatch(skill_id) or skill_id in seen_skills:
+            raise InstructionLoadError("instruction manifest has a duplicate or invalid skill")
+        if not isinstance(files, list) or not files:
+            raise InstructionLoadError("instruction manifest file list is invalid")
+        seen_skills.add(skill_id)
+        has_skill_text = False
+        for entry in files:
+            file_count += 1
+            if file_count > MAX_MANIFEST_FILES or not isinstance(entry, dict):
+                raise InstructionLoadError("instruction manifest file count is invalid")
+            relative, digest, size = entry.get("path"), entry.get("sha256"), entry.get("size")
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or "\\" in relative
+                or ":" in relative
+                or PurePosixPath(relative).is_absolute()
+                or any(part in {"", ".", ".."} for part in relative.split("/"))
+                or any(ord(char) < 32 or ord(char) == 127 for char in relative)
+                or not isinstance(digest, str)
+                or not _SHA256.fullmatch(digest)
+                or type(size) is not int
+                or size < 0
+                or size > MAX_CATALOG_FILE_BYTES
+            ):
+                raise InstructionLoadError("instruction manifest contains an invalid file pin")
+            total_bytes += size
+            if total_bytes > MAX_CATALOG_TOTAL_BYTES:
+                raise InstructionLoadError("instruction manifest total file size exceeds limit")
+            path = f"skills/{skill_id}/{PurePosixPath(relative).as_posix()}"
+            if path in pins:
+                raise InstructionLoadError("instruction manifest contains duplicate paths")
+            pins[path] = digest
+            if path == f"skills/{skill_id}/SKILL.md":
+                if size == 0:
+                    raise InstructionLoadError("instruction manifest contains an empty skill instruction")
+                has_skill_text = True
+        if not has_skill_text:
+            raise InstructionLoadError("instruction manifest skill is missing its SKILL.md pin")
+    return MappingProxyType(pins)
+
+
+def validate_scientific_binding(
+    binding: ScientificBinding,
+    *,
+    registry_path: str | Path,
+    bundle_root: str | Path,
+    pinned_hashes: Mapping[str, str],
+    expected_image_digest: str,
+) -> InstructionBundle:
+    """Re-resolve scientific authority using only supervisor-pinned inputs."""
+    if not isinstance(binding, ScientificBinding):
+        raise InstructionLoadError("scientific binding is invalid")
+    if not isinstance(expected_image_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_image_digest):
+        raise InstructionLoadError("trusted image digest is invalid")
+    if binding.image_digest != expected_image_digest:
+        raise InstructionLoadError("scientific binding image differs from trusted image")
+    registry_file = Path(registry_path)
+    try:
+        info = registry_file.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MANIFEST_BYTES:
+            raise InstructionLoadError("capability registry is unsafe or oversized")
+        registry = load_registry(registry_file)
+    except InstructionLoadError:
+        raise
+    except (OSError, RegistryError) as exc:
+        raise InstructionLoadError("capability registry is invalid") from exc
+    if binding.catalog_commit != registry.catalog_commit or binding.registry_sha256 != registry.registry_sha256:
+        raise InstructionLoadError("scientific binding registry provenance differs")
+    try:
+        selection = registry.select(binding.capability_ids)
+    except (RegistryError, TypeError) as exc:
+        raise InstructionLoadError("scientific capability selection is invalid") from exc
+    if list(selection.capability_ids) != binding.capability_ids or selection.profile_ids != (binding.profile_id,):
+        raise InstructionLoadError("scientific binding capability profile differs")
+    bundle = load_instruction_bundle(
+        selection,
+        bundle_root,
+        pinned_hashes,
+        token_counter=lambda text: len(text.encode("utf-8")),
+        token_budget=MAX_INSTRUCTION_FILE_BYTES,
+    )
+    if bundle.instruction_fingerprint != binding.instruction_fingerprint:
+        raise InstructionLoadError("scientific instruction fingerprint differs")
+    return bundle
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise InstructionLoadError("instruction manifest has duplicate JSON keys")
+        value[key] = item
+    return value
 
 
 def load_instruction_bundle(
