@@ -84,6 +84,7 @@ def self_check() -> None:
     assert not _boundary_barrier_table_ready(absent)
     assert _boundary_barrier_table_ready(present)
     _self_check_boundary_diagnostics(fixture)
+    _self_check_boundary_origin(fixture)
     _self_check_b5_prerequisites()
     print(json.dumps({"status": "PASS", "check": "scientific-driver-prerequisites"}))
 
@@ -148,7 +149,150 @@ def _self_check_boundary_diagnostics(fixture) -> None:
     if len(sent) != len(nested) or any(actual is not expected for actual, expected in zip(sent, nested)):
         raise AssertionError("fixture changed response ASGI message identity or order")
 
-    failure = RuntimeError(secret)
+
+def _self_check_boundary_origin(fixture) -> None:
+    secret = "SYNTHETIC_PRIVATE_DETAIL_MUST_NOT_APPEAR"
+    import contextlib
+    import scientist.dispatch_authority as dispatch_authority
+    import scientist.dispatch_runtime as dispatch_runtime
+    import scientist.private_worker_api as private_api
+    import scientist.broker as broker_module
+    from fastapi import HTTPException
+    from scientist.auth import DomainError
+    from scientist.contracts import CheckpointManifest, ObjectRef
+    from scientist.runtime_contracts import BoundaryAck
+
+    class Database:
+        commits = 0
+        def commit(self):
+            self.commits += 1
+
+    database = Database()
+    old_parse, old_session = private_api.parse_boundary, private_api.session
+    private_api.parse_boundary = lambda _: object()
+    private_api.session = lambda: contextlib.nullcontext(database)
+    old_run, old_transport = fixture._run, broker_module._transport
+    old_dispatch_parser = dispatch_runtime.parse_dispatch_config
+    old_dispatch_transport = dispatch_authority.BoundDispatchTransport
+    old_read_bytes = Path.read_bytes
+    identity = SimpleNamespace(executor_id="synthetic", process_incarnation="synthetic", run_id=uuid4(), generation=1)
+    class Transport:
+        def __init__(self, *args): pass
+    dispatch_runtime.parse_dispatch_config = lambda _: identity
+    dispatch_authority.BoundDispatchTransport = Transport
+    Path.read_bytes = lambda path: b"synthetic" if str(path) == "/run/scientist/dispatch/config.json" else old_read_bytes(path)
+
+    async def request(app):
+        incoming, outgoing = 0, []
+        scope = {"type":"http", "asgi":{"version":"3.0","spec_version":"2.3"},
+            "http_version":"1.1", "method":"POST", "scheme":"http", "path":"/control/boundary",
+            "raw_path":b"/control/boundary", "query_string":b"", "root_path":"",
+            "headers":[(b"host",b"fixture.test"),(b"x-worker-capability",b"synthetic"),
+                (b"content-type",b"application/json"),(b"content-length",b"2")],
+            "client":("127.0.0.1",1),"server":("127.0.0.1",80)}
+        async def receive():
+            nonlocal incoming
+            incoming += 1
+            return {"type":"http.request","body":b"{}","more_body":False} if incoming == 1 else {"type":"http.disconnect"}
+        async def send(message): outgoing.append(message)
+        await app(scope, receive, send)
+        return outgoing
+
+    try:
+        manifest = CheckpointManifest.model_construct(schema_version=1, run_id=uuid4(), revision=1,
+            plan_digest="a"*64, runtime_commit=private_api.RUNTIME_COMMIT, image_digest="sha256:"+"b"*64,
+            skills_digest="c"*64, context=ObjectRef.model_construct(project_id=uuid4(), key="fixture/context",
+                sha256="d"*64, size=0, content_type="application/octet-stream"), workspace=[], environment_digest="e"*64,
+            operation_ids=[])
+        ack = BoundaryAck.model_construct(schema_version=1, boundary_id=uuid4(), checkpoint_id=uuid4(),
+            checkpoint_revision=1, manifest=manifest)
+
+        def exercise(mode):
+            calls = []
+            controller = private_api.WorkerController(pins=private_api.RuntimePins(
+                runtime_commit=private_api.RUNTIME_COMMIT, image_digest="sha256:"+"f"*64,
+                skills_digest="1"*64, environment_digest="2"*64), provider_destinations={},
+                capture=lambda *args: None, result_reader=lambda *args: b"", scientific_validator=None)
+            failure = DomainError("synthetic_unclassified", 503) if mode == "domain503" else (
+                DomainError("forbidden", 403) if mode == "domain403" else RuntimeError("synthetic failure")
+            )
+            def boundary(*args):
+                calls.append("called")
+                if mode == "success": return ack
+                raise failure
+            controller.boundary = boundary
+            raw_app = private_api.create_private_app(controller)
+            run_result = {}
+
+            def execute_during_run(app, *args, **kwargs):
+                target = app.app if mode == "success" else app
+                run_result["messages"] = asyncio.run(request(target))
+                return app
+
+            fixture._run = execute_during_run
+            output = io.StringIO()
+            try:
+                with redirect_stderr(output):
+                    wrapped = fixture._with_fixture(raw_app)
+            except RuntimeError as caught:
+                if mode != "runtime" or caught is not failure:
+                    raise
+            if not output.getvalue().startswith("scientific-fixture-boundary-origin safe_wrap_ready=true\n"):
+                raise AssertionError("fixture did not safely capture concrete boundary controller")
+            response_messages = run_result.get("messages", [])
+            if mode == "success":
+                if len(calls) != 1 or database.commits != 1 or response_messages[0].get("status") != 200:
+                    raise AssertionError("successful boundary was not delegated once")
+                return
+            diagnostic = output.getvalue()
+            if len(calls) != 1: raise AssertionError("boundary delegate call count changed")
+            diagnostic = output.getvalue()
+            if "SYNTHETIC_PRIVATE_DETAIL" in diagnostic: raise AssertionError("private error detail leaked")
+            origin = re.search(
+                r"scientific-fixture-boundary-origin observed=true source=(?:private_worker_api|profile_preparation|scientific_authority|checkpoints|objects|broker|other) line=\d+",
+                diagnostic,
+            )
+            if mode == "domain503" and (
+                not origin
+                or "controller_called=true" not in diagnostic
+                or "observed_domain_error=true" not in diagnostic
+            ):
+                start_message = next(
+                    (message for message in response_messages if message.get("type") == "http.response.start"),
+                    {},
+                )
+                status = start_message.get("status", 0)
+                response_diagnostic = re.search(
+                    r"scientific-fixture-response status=(\d{3}) code=([a-z_]+)", diagnostic
+                )
+                safe_diagnostics = [
+                    line
+                    for line in diagnostic.splitlines()
+                    if line.startswith(("scientific-fixture-response ", "scientific-fixture-boundary-origin "))
+                ]
+                raise AssertionError(
+                    "503 origin diagnostic failed safe fields: "
+                    f"origin={bool(origin)} controller_called={'controller_called=true' in diagnostic} "
+                    f"observed_domain_error={'observed_domain_error=true' in diagnostic} "
+                    f"delegate_calls={len(calls)} response_status={status} "
+                    f"diagnostic_code={response_diagnostic.group(2) if response_diagnostic else 'none'} "
+                    f"instrumentation_calls={wrapped.boundary_state['calls']} "
+                    f"instrumentation_observed={wrapped.boundary_state['observed']} "
+                    f"safe_diagnostics={safe_diagnostics!r}"
+                )
+            if mode != "domain503" and "scientific-fixture-boundary-origin observed=true" in diagnostic:
+                raise AssertionError("non-503 exception produced a 503 origin diagnostic")
+
+        for mode in ("domain503", "domain403", "runtime", "success"):
+            exercise(mode)
+    finally:
+        private_api.parse_boundary, private_api.session = old_parse, old_session
+        fixture._run, broker_module._transport = old_run, old_transport
+        dispatch_runtime.parse_dispatch_config = old_dispatch_parser
+        dispatch_authority.BoundDispatchTransport = old_dispatch_transport
+        Path.read_bytes = old_read_bytes
+
+    failure = RuntimeError("synthetic runtime failure")
     async def broken_app(scope, receive, send):
         raise failure
     wrapper = fixture._BoundaryAckBarrier(broken_app, SimpleNamespace(run_id=uuid4(), generation=1))

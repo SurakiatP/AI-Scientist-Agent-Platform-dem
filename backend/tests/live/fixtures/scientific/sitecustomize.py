@@ -162,7 +162,7 @@ def _error_shape(response):
     return f"candidate_field={field} candidate_kind={kind} nested_code={nested_code}"
 
 
-def _diagnose(status, code, response=None):
+def _diagnose(status, code, response=None, *, controller_called=None, observed_domain_error=None):
     if type(status) is not int or not 100 <= status <= 599:
         status = 0
     if not isinstance(code, str) or (code not in _SAFE_ERROR_CODES and code not in ("validation_error", "other")):
@@ -170,6 +170,10 @@ def _diagnose(status, code, response=None):
     line = f"scientific-fixture-response status={status} code={code}"
     if status >= 500 and code == "other":
         line += " " + _error_shape(response or [])
+        if controller_called is not None:
+            line += f" controller_called={'true' if controller_called else 'false'}"
+        if observed_domain_error is not None:
+            line += f" observed_domain_error={'true' if observed_domain_error else 'false'}"
     print(line, file=sys.stderr, flush=True)
 
 
@@ -194,13 +198,16 @@ def _synthetic_model(request, target):
 class _BoundaryAckBarrier:
     """Pause once after a committed scientific receipt and before its HTTP ACK is sent."""
 
-    def __init__(self, app, executor):
+    def __init__(self, app, executor, boundary_state=None):
         self.app, self.executor = app, executor
+        self.boundary_state = boundary_state
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http" or scope.get("path") != "/control/boundary":
             await self.app(scope, receive, send)
             return
+        calls_before = self.boundary_state["calls"] if self.boundary_state is not None else 0
+        observed_before = self.boundary_state["observed"] if self.boundary_state is not None else 0
         response = []
         async def capture(message):
             response.append(message)
@@ -216,7 +223,14 @@ class _BoundaryAckBarrier:
         start = next((m for m in response if m.get("type") == "http.response.start"), None)
         if start is None or start.get("status") != 200:
             status = start.get("status", 0) if start is not None else 0
-            _diagnose(status, _error_code(status, response), response)
+            state = self.boundary_state
+            _diagnose(
+                status,
+                _error_code(status, response),
+                response,
+                controller_called=(state["calls"] > calls_before) if state is not None else None,
+                observed_domain_error=(state["observed"] > observed_before) if state is not None else None,
+            )
             for message in response:
                 await send(message)
             return
@@ -280,7 +294,69 @@ def _with_fixture(app, *args, **kwargs):
 
     identity = parse_dispatch_config(Path("/run/scientist/dispatch/config.json").read_bytes())
     broker._transport = BoundDispatchTransport(identity.executor_id, identity.process_incarnation, _synthetic_model)
-    return _run(_BoundaryAckBarrier(app, identity), *args, **kwargs)
+    boundary_state = {"calls": 0, "observed": 0}
+    controller, original = None, None
+    try:
+        from scientist.auth import DomainError
+        from scientist.private_worker_api import WorkerController
+
+        routes = [route for route in getattr(app, "routes", ())
+                  if getattr(route, "path", None) == "/control/boundary"
+                  and "POST" in getattr(route, "methods", ())]
+        if len(routes) == 1:
+            endpoint = getattr(routes[0], "endpoint", None)
+            freevars = tuple(getattr(getattr(endpoint, "__code__", None), "co_freevars", ()))
+            cells = getattr(endpoint, "__closure__", None) or ()
+            captured = dict(zip(freevars, (cell.cell_contents for cell in cells)))
+            candidates = [value for value in captured.values() if isinstance(value, WorkerController)]
+            if freevars == ("controller",) and len(candidates) == 1:
+                controller = candidates[0]
+                original = controller.boundary
+
+                def observed_boundary(*call_args, **call_kwargs):
+                    boundary_state["calls"] += 1
+                    try:
+                        return original(*call_args, **call_kwargs)
+                    except DomainError as exc:
+                        if exc.status == 503:
+                            boundary_state["observed"] += 1
+                            source, line, tb = "other", 0, exc.__traceback__
+                            files = {
+                                "private_worker_api.py": "private_worker_api",
+                                "profile_preparation.py": "profile_preparation",
+                                "scientific_authority.py": "scientific_authority",
+                                "checkpoints.py": "checkpoints",
+                                "objects.py": "objects",
+                                "broker.py": "broker",
+                            }
+                            while tb is not None:
+                                filename = Path(tb.tb_frame.f_code.co_filename).name
+                                if filename in files and type(tb.tb_lineno) is int:
+                                    source = files[filename]
+                                    line = min(max(tb.tb_lineno, 0), 65535)
+                                tb = tb.tb_next
+                            try:
+                                print(f"scientific-fixture-boundary-origin observed=true source={source} line={line}",
+                                      file=sys.stderr, flush=True)
+                            except Exception:
+                                pass
+                        raise
+
+                controller.boundary = observed_boundary
+                if controller.boundary is not observed_boundary:
+                    controller.boundary = original
+                    controller, original = None, None
+    except Exception:
+        controller, original = None, None
+    ready = controller is not None
+    print(f"scientific-fixture-boundary-origin safe_wrap_ready={'true' if ready else 'false'}",
+          file=sys.stderr, flush=True)
+    barrier = _BoundaryAckBarrier(app, identity, boundary_state if ready else None)
+    try:
+        return _run(barrier, *args, **kwargs)
+    finally:
+        if controller is not None:
+            controller.boundary = original
 
 
 uvicorn.run = _with_fixture
