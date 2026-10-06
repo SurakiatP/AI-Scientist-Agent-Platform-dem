@@ -114,7 +114,10 @@ def load_config(*, require_ready: bool = True) -> tuple[dict, dict, Path]:
 
     if require_ready:
         for key, path in paths.items():
-            if key == "evidence_dir":
+            if key == "b5_live_config":
+                if not path.is_file():
+                    raise NotRunError("W2 B5 configuration file is not prepared")
+            elif key == "evidence_dir":
                 if not path.is_dir():
                     raise NotRunError("W2 evidence directory is not prepared")
             elif key == "web_dist_dir":
