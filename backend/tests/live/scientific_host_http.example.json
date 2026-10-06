@@ -1,0 +1,11 @@
+{
+  "b5_live_config": ".local/scientific-w1-20261006/b5-live.json",
+  "evidence_dir": ".local/scientific-w1-20261006/evidence",
+  "postgres_container_id": "<owned 64-hex container id>",
+  "minio_container_id": "<owned 64-hex container id>",
+  "scientific_bucket": "scientist-w1-20261006",
+  "scientific_fixture_image": "scientist-server-scientific@sha256:<reviewed-64-hex-image-digest>",
+  "scientific_bundle_dir": ".local/scientific-w1-20261006/namespace/bundle",
+  "sealed_profile_evidence_dir": ".local/scientific-w1-20261006/namespace/state/profiles",
+  "web_dist_dir": "apps/web/dist"
+}
