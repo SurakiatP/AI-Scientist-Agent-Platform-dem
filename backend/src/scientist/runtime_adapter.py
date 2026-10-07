@@ -1239,10 +1239,28 @@ class RuntimeAdapter:
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise RuntimeAdapterError("Chat Completions result has no choice")
         message = choices[0].get("message")
+        if not isinstance(message, dict):
+            raise RuntimeAdapterError("Chat Completions assistant message outside checkpoint profile")
+        # OpenRouter/GLM includes provider-only metadata that Hermes can ignore.
+        # Strip only those documented response keys before applying our strict
+        # checkpoint schema; unknown fields remain a validation error.
+        normalized = {
+            key: value
+            for key, value in message.items()
+            if key not in {"refusal", "reasoning", "reasoning_details"}
+        }
+        tool_calls = normalized.get("tool_calls")
+        if isinstance(tool_calls, list):
+            normalized["tool_calls"] = [
+                {key: value for key, value in call.items() if key != "index"}
+                if isinstance(call, dict)
+                else call
+                for call in tool_calls
+            ]
         try:
             from scientist.model_payload import ChatMessage
 
-            checked = ChatMessage.model_validate(message)
+            checked = ChatMessage.model_validate(normalized)
         except (ValidationError, TypeError) as exc:
             raise RuntimeAdapterError("Chat Completions assistant message is outside the checkpoint profile") from exc
         if checked.role != "assistant":

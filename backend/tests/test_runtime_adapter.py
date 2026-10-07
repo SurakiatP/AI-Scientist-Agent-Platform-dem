@@ -314,6 +314,83 @@ def test_generated_model_mapping_passes_real_broker_scope_before_effect(
     assert checked_requests[0].payload["timeout_seconds"] <= 20
 
 
+def test_openrouter_response_metadata_is_removed_before_checkpoint(
+    tmp_path: Path, context_data: dict[str, Any]
+) -> None:
+    events: list[tuple[str, dict | None]] = []
+    provider_message = {
+        "role": "assistant",
+        "content": None,
+        "refusal": None,
+        "reasoning": "I should add the requested todo.",
+        "reasoning_details": [{"type": "text", "text": "private provider metadata"}],
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_123",
+                "type": "function",
+                "function": {"name": "todo_list", "arguments": "{\"todos\":[]}"},
+            }
+        ],
+    }
+    response_bytes = json.dumps(
+        {"choices": [{"index": 0, "message": provider_message, "finish_reason": "tool_calls"}]}
+    ).encode()
+    adapter = RuntimeAdapter(
+        context_data,
+        broker_url="http://172.30.0.2:8000",
+        capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=_committing_broker(context_data, events, response_bytes),
+    )
+    native = httpx.Client(
+        transport=BrokerChatCompletionsTransport(adapter), trust_env=False
+    )
+
+    response = native.post(
+        "http://hermes.invalid/v1/chat/completions",
+        json={
+            "model": context_data["model"],
+            "messages": context_data["messages"],
+            "max_tokens": 64,
+        },
+    )
+
+    assert response.json()["choices"][0]["message"] == provider_message
+    committed_checkpoint = events[-1][1]
+    assert committed_checkpoint is not None
+    assert committed_checkpoint["context"]["boundary"] == "model_committed"
+    assert committed_checkpoint["context"]["messages"][-1] == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_123",
+                "type": "function",
+                "function": {"name": "todo_list", "arguments": "{\"todos\":[]}"},
+            }
+        ],
+    }
+
+
+def test_assistant_response_still_rejects_unknown_fields(
+    tmp_path: Path, context_data: dict[str, Any]
+) -> None:
+    adapter = RuntimeAdapter(
+        context_data,
+        broker_url="http://172.30.0.2:8000",
+        capability="fixture-capability",
+        workspace_dir=tmp_path,
+        broker_client=httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200))),
+    )
+    raw = json.dumps(
+        {"choices": [{"message": {"role": "assistant", "content": "done", "provider_extra": "unexpected"}}]}
+    ).encode()
+
+    with pytest.raises(RuntimeAdapterError, match="outside.*checkpoint profile"):
+        adapter._assistant_message(raw)
+
+
 def _committing_broker(context_data: dict[str, Any], events: list, response_bytes: bytes):
     def broker(request: httpx.Request) -> httpx.Response:
         path = request.url.path
