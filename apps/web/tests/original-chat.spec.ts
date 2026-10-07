@@ -14,6 +14,7 @@ test('composer keeps failed files disabled and links to the project library', as
   await installResearchFixtureRoutes(page, { run: null, messages: [] });
   await page.goto(SESSION_URL);
 
+  await page.locator('.chat-file-picker > summary').click();
   const addReady = page.getByRole('button', { name: 'Add to question: example.csv' });
   await expect(addReady).toBeEnabled();
   await expect(page.getByRole('button', { name: 'Add to question: broken.csv' })).toBeDisabled();
@@ -65,8 +66,14 @@ test('search-scope edits block approval until a fresh plan preparation completes
   const preparationStarted = new Promise<void>((resolve) => { markPreparationStarted = resolve; });
   const preparedRun = makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] });
   let preparedSearchTerms: string[] = [];
+  let prepareCalls = 0;
   await page.route(`**/api/v1/runs/${NEW_RUN_ID}/prepare-plan`, async (route) => {
+    prepareCalls += 1;
     preparedSearchTerms = route.request().postDataJSON().search_terms;
+    if (prepareCalls === 1) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(preparedRun) });
+      return;
+    }
     markPreparationStarted();
     await preparationGate;
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(preparedRun) });
@@ -80,12 +87,12 @@ test('search-scope edits block approval until a fresh plan preparation completes
   await page.getByRole('button', { name: 'Adjust search scope' }).click();
   await page.getByLabel('Literature search term').fill('temperature and diffusion');
   await page.getByRole('button', { name: 'Save search scope' }).click();
-  await expect(page.getByText('Search scope changed. Prepare the plan again before approving.')).toBeVisible();
+  await expect(page.getByText('Search scope or workflow changed. Prepare the plan again before approving.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Approve plan' })).toBeDisabled();
 
   await page.getByRole('button', { name: 'Adjust search scope' }).click();
   await page.getByRole('button', { name: 'Save search scope' }).click();
-  await expect(page.getByText('Search scope changed. Prepare the plan again before approving.')).toBeVisible();
+  await expect(page.getByText('Search scope or workflow changed. Prepare the plan again before approving.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Approve plan' })).toBeDisabled();
 
   await page.getByRole('button', { name: 'Prepare plan' }).click();
@@ -93,7 +100,7 @@ test('search-scope edits block approval until a fresh plan preparation completes
   await expect(page.getByRole('button', { name: 'Adjust search scope' })).toBeDisabled();
   releasePreparation();
   await expect(page.getByText('Plan prepared. Review the current requirements and limits before approving.')).toBeVisible();
-  await expect(page.getByText('Search scope changed. Prepare the plan again before approving.')).toHaveCount(0);
+  await expect(page.getByText('Search scope or workflow changed. Prepare the plan again before approving.')).toHaveCount(0);
   expect(preparedSearchTerms).toEqual(['temperature and diffusion']);
   expect(fixture.writes.some((write) => write.method === 'POST' && write.path.endsWith('/approve'))).toBe(false);
 });

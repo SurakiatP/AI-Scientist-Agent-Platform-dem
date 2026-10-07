@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
+import type { ConnectionTestView } from '../../../contracts/api-types';
 
 const PROJECT_ID = '11111111-1111-4111-8111-111111111111';
 const SECOND_PROJECT_ID = '22222222-2222-4222-8222-222222222222';
@@ -10,7 +11,7 @@ const SYNTHETIC_PEER_SECRET = 'synthetic-peer-secret-settings-test';
 const ONE_TIME_TOKEN = 'synthetic-once-only-scoped-token';
 
 type Write = { method: string; path: string; body: unknown };
-type SettingsOverrides = { connectionFailure?: boolean; connectionMutationFailure?: boolean; legacyManualToken?: boolean; providerFailure?: boolean };
+type SettingsOverrides = { connectionFailure?: boolean; connectionMutationFailure?: boolean; legacyManualToken?: boolean; providerFailure?: boolean; testResult?: Partial<ConnectionTestView>; testHold?: Promise<void> };
 
 async function mockSettingsApi(page: Page, overrides: SettingsOverrides = {}) {
   const writes: Write[] = [];
@@ -63,6 +64,10 @@ async function mockSettingsApi(page: Page, overrides: SettingsOverrides = {}) {
       const connection = { id: body.provider_id, label: body.label, provider: 'https://provider.example', model: body.model, state: 'ready', has_secret: true };
       connections = [connection, ...connections];
       return json(connection, 201);
+    }
+    if (method === 'POST' && /^\/connections\/[0-9a-f-]+\/test$/.test(path)) {
+      await overrides.testHold;
+      return json({ connection_id: path.split('/')[2], status: 'reachable', credential_status: 'accepted', model_status: 'not_tested', ...overrides.testResult });
     }
     if (method === 'DELETE' && /^\/connections\/[0-9a-f-]+$/.test(path)) {
       const id = path.split('/').at(-1);
@@ -222,6 +227,61 @@ test('provider metadata failure prevents credential submission', async ({ page }
   await expect(page.getByRole('button', { name: 'Save connection' })).toBeDisabled();
   await expect(page.getByRole('alert')).toBeVisible();
   expect(api.writes).toHaveLength(0);
+});
+
+async function saveTestConnection(page: Page) {
+  await page.getByRole('combobox', { name: 'Provider', exact: true }).selectOption(PROVIDER_ID);
+  await page.getByLabel('Connection name').fill('Test model');
+  await page.getByLabel('Model').fill('test-model');
+  await page.getByLabel('API key', { exact: true }).fill(SYNTHETIC_PROVIDER_SECRET);
+  await page.getByRole('button', { name: 'Save connection' }).click();
+  await expect(page.getByLabel('API key', { exact: true })).toHaveValue('');
+}
+
+test('connection test is explicit, single flight, metadata only and not persisted', async ({ page }) => {
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => { release = resolve; });
+  const api = await mockSettingsApi(page, { testHold: hold });
+  await page.addInitScript(() => localStorage.setItem('scientist-platform.language', 'en'));
+  await page.goto('/settings');
+  await saveTestConnection(page);
+  const tests = () => api.writes.filter((write) => write.path.endsWith('/test'));
+  expect(tests()).toHaveLength(0);
+  const button = page.getByRole('button', { name: 'Test connection Test model', exact: true });
+  await button.click();
+  await expect(button).toBeDisabled();
+  await expect(page.getByRole('status').filter({ hasText: 'Checking API access' })).toBeVisible();
+  await expect.poll(() => tests().length).toBe(1);
+  expect(tests()[0]).toEqual({ method: 'POST', path: `/connections/${PROVIDER_ID}/test`, body: null });
+  release();
+  await expect(page.getByRole('status').filter({ hasText: 'API key accepted. Model generation has not been tested.' })).toBeVisible();
+  await expect(button).toBeEnabled();
+  await page.getByRole('button', { name: 'TH', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'API key ผ่านการตรวจสอบแล้ว ยังไม่ได้ทดลองให้โมเดลตอบข้อความ' })).toBeVisible();
+  const persisted = await page.evaluate(() => [localStorage, sessionStorage].flatMap((storage) => Object.values(storage)).join(' '));
+  expect(persisted).not.toContain(SYNTHETIC_PROVIDER_SECRET);
+  expect(persisted).not.toContain('API key accepted');
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Test connection Test model', exact: true })).toBeVisible();
+  await expect(page.getByRole('status').filter({ hasText: 'API key ผ่านการตรวจสอบแล้ว' })).toHaveCount(0);
+  expect(tests()).toHaveLength(1);
+});
+
+for (const outcome of [
+  { status: 'reachable', credential_status: 'unverified', message: 'This endpoint does not confirm the API key.' },
+  { status: 'credentials_rejected', credential_status: 'rejected', message: 'The provider rejected the API key.' },
+  { status: 'denied', credential_status: 'unverified', message: 'The provider denied access.' },
+  { status: 'rate_limited', credential_status: 'unverified', message: 'The provider limited requests.' },
+  { status: 'unavailable', credential_status: 'unverified', message: 'The API could not be checked.' },
+  { status: 'unsupported', credential_status: 'unverified', message: 'Metadata testing is not supported for this provider.' },
+] as const) test(`connection metadata test reports ${outcome.status}/${outcome.credential_status} truthfully`, async ({ page }) => {
+  await mockSettingsApi(page, { testResult: { status: outcome.status, credential_status: outcome.credential_status } });
+  await page.addInitScript(() => localStorage.setItem('scientist-platform.language', 'en'));
+  await page.goto('/settings');
+  await saveTestConnection(page);
+  await page.getByRole('button', { name: 'Test connection Test model', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: outcome.message })).toBeVisible();
+  await expect(page.getByText('API key accepted.', { exact: false })).toHaveCount(0);
 });
 
 test('scoped tokens display once, list only metadata, copy, and revoke', async ({ page }) => {

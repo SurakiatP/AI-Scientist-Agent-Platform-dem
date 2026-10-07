@@ -46,6 +46,12 @@ _UNAVAILABLE_BY_ORIGIN = {
     "https://api.minimaxi.com": "native_adapter_required",
 }
 
+# Authenticated, non-inference endpoints whose success responses have a known shape.
+_CONNECTION_TEST_PROBES = {
+    "https://api.openai.com": ("/v1/models", "openai_models"),
+    "https://openrouter.ai": ("/api/v1/key", "openrouter_key"),
+}
+
 
 def catalog(destinations: Mapping[str, str]) -> list[dict[str, object]]:
     """Return curated choices, binding availability only to configured UUIDs."""
@@ -90,3 +96,8 @@ def api_path(origin: str) -> str | None:
 
 def unsupported_reason(origin: str) -> str | None:
     return _UNAVAILABLE_BY_ORIGIN.get(origin)
+
+
+def connection_test_probe(origin: str) -> tuple[str, str] | None:
+    """Return a fixed authenticated, read-only probe for a documented provider."""
+    return _CONNECTION_TEST_PROBES.get(origin)

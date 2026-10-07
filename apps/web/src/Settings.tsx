@@ -1,13 +1,13 @@
-import { useEffect, useState, type CSSProperties, type Dispatch, type FormEvent, type SetStateAction } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type Dispatch, type FormEvent, type SetStateAction } from 'react';
 import { ApiError, apiErrorMessage, request } from './api';
 import { useAppPreferences } from './App';
 import './outputs-original.css';
 import { AppearanceSettings } from './preferences';
 import { Link, useSearchParams } from 'react-router-dom';
-import type { ProviderView } from '../../../contracts/api-types';
+import type { ConnectionTestView, ProviderView } from '../../../contracts/api-types';
 
 type Language = 'en' | 'th';
-type ErrorLabel = 'load' | 'connection_save' | 'connection_remove' | 'peer_save' | 'peer_update' | 'peer_revoke' | 'token_create' | 'token_revoke';
+type ErrorLabel = 'load' | 'connection_save' | 'connection_remove' | 'connection_test' | 'peer_save' | 'peer_update' | 'peer_revoke' | 'token_create' | 'token_revoke';
 type StoredError = { code: string; status: number; requestId: string } | { message: string; label: ErrorLabel };
 type Resource<T> = { status: 'loading' | 'ready' | 'error'; value: T; error: StoredError | null };
 type Project = { id: string; name: string; revision: number; instructions: string };
@@ -30,6 +30,7 @@ const errorFallbacks: Record<ErrorLabel, [string, string]> = {
   load: ['Unable to load settings.', 'โหลดการตั้งค่าไม่สำเร็จ'],
   connection_save: ['Unable to save connection.', 'บันทึกการเชื่อมต่อไม่สำเร็จ'],
   connection_remove: ['Unable to remove connection.', 'ลบการเชื่อมต่อไม่สำเร็จ'],
+  connection_test: ['Unable to test connection.', 'ทดสอบการเชื่อมต่อไม่สำเร็จ'],
   peer_save: ['Unable to save peer access.', 'บันทึกสิทธิ์เพื่อนไม่สำเร็จ'],
   peer_update: ['Unable to update peer credential.', 'ปรับปรุงข้อมูลรับรองเพื่อนไม่สำเร็จ'],
   peer_revoke: ['Unable to revoke peer access.', 'เพิกถอนสิทธิ์เพื่อนไม่สำเร็จ'],
@@ -106,6 +107,8 @@ export default function Settings() {
   const [providerSecret, setProviderSecret] = useState('');
   const [connectionError, setConnectionError] = useState<StoredError | null>(null);
   const [connectionBusy, setConnectionBusy] = useState(false);
+  const [connectionTests, setConnectionTests] = useState<Record<string, Resource<ConnectionTestView>>>({});
+  const testingConnections = useRef(new Set<string>());
   const [delegationProject, setDelegationProject] = useState('');
   const [delegationPeer, setDelegationPeer] = useState('');
   const [peerCredentialName, setPeerCredentialName] = useState('');
@@ -148,6 +151,7 @@ export default function Settings() {
         body: JSON.stringify({ provider_id: providerId.trim(), label: connectionName.trim(), model: model.trim(), secret: providerSecret }),
       });
       setConnections((current) => ({ status: 'ready', error: null, value: [connection, ...(current.status === 'ready' ? current.value.filter((item) => item.id !== connection.id) : [])] }));
+      setConnectionTests((current) => { const next = { ...current }; delete next[connection.id]; return next; });
       setProviderId('');
       setConnectionName('');
       setModel('');
@@ -166,8 +170,38 @@ export default function Settings() {
     try {
       await request<void>(`/api/v1/connections/${encodeURIComponent(id)}`, { method: 'DELETE' });
       setConnections((current) => current.status === 'ready' ? { ...current, value: current.value.filter((item) => item.id !== id) } : current);
+      setConnectionTests((current) => { const next = { ...current }; delete next[id]; return next; });
     } catch (error) {
       setConnectionError(storeError(error, 'connection_remove'));
+    }
+  }
+
+  async function testConnection(id: string) {
+    if (testingConnections.current.has(id)) return;
+    testingConnections.current.add(id);
+    setConnectionTests((current) => ({ ...current, [id]: empty<ConnectionTestView>() }));
+    try {
+      const result = await request<ConnectionTestView>(`/api/v1/connections/${encodeURIComponent(id)}/test`, { method: 'POST' });
+      if (result.connection_id !== id || result.model_status !== 'not_tested'
+        || !['reachable', 'credentials_rejected', 'denied', 'rate_limited', 'unavailable', 'unsupported'].includes(result.status)
+        || !['accepted', 'rejected', 'unverified'].includes(result.credential_status)
+        || (result.credential_status === 'accepted' && result.status !== 'reachable')) throw new ApiError('invalid_response', 502, '');
+      setConnectionTests((current) => ({ ...current, [id]: { status: 'ready', value: result, error: null } }));
+    } catch (error) {
+      setConnectionTests((current) => ({ ...current, [id]: { status: 'error', value: undefined as unknown as ConnectionTestView, error: storeError(error, 'connection_test') } }));
+    } finally { testingConnections.current.delete(id); }
+  }
+
+  function connectionTestText(result: ConnectionTestView) {
+    switch (result.status) {
+      case 'reachable': return result.credential_status === 'accepted'
+        ? tx('API key accepted. Model generation has not been tested.', 'API key ผ่านการตรวจสอบแล้ว ยังไม่ได้ทดลองให้โมเดลตอบข้อความ')
+        : tx('API reachable. This endpoint does not confirm the API key. Model generation has not been tested.', 'เข้าถึง API ได้ แต่ปลายทางนี้ยังยืนยัน API key ไม่ได้ และยังไม่ได้ทดลองให้โมเดลตอบข้อความ');
+      case 'credentials_rejected': return tx('The provider rejected the API key.', 'ผู้ให้บริการปฏิเสธ API key');
+      case 'denied': return tx('The provider denied access. Check the key permissions.', 'ผู้ให้บริการไม่อนุญาตให้เข้าถึง โปรดตรวจสิทธิ์ของ key');
+      case 'rate_limited': return tx('The provider limited requests. Try the test again later.', 'ผู้ให้บริการจำกัดความถี่ โปรดกดทดสอบใหม่ภายหลัง');
+      case 'unsupported': return tx('Metadata testing is not supported for this provider. Model generation has not been tested.', 'ยังไม่รองรับการตรวจเมทาดาทาของผู้ให้บริการนี้ และยังไม่ได้ทดลองให้โมเดลตอบข้อความ');
+      default: return tx('The API could not be checked. Model generation has not been tested.', 'ตรวจสอบ API ไม่สำเร็จ และยังไม่ได้ทดลองให้โมเดลตอบข้อความ');
     }
   }
 
@@ -306,11 +340,18 @@ export default function Settings() {
       {connections.status === 'ready' && <ul className="settings-list" style={listStyle}>
         {connections.value.map((connection) => <li className="settings-item" style={itemStyle} key={connection.id}>
           <div><strong>{connection.label}</strong><p style={secondaryTextStyle}>{connection.model} · {connection.provider}</p>
-            <span role="status">{connection.state === 'unavailable_provider' ? tx('Provider is not configured.', 'ยังไม่ได้ตั้งค่าผู้ให้บริการ') : connection.state === 'invalid_credentials' ? tx('Stored credential cannot be decrypted.', 'ไม่สามารถถอดรหัสข้อมูลรับรองที่บันทึกไว้') : tx('Configured; verification not run', 'ตั้งค่าแล้ว; ยังไม่ได้ตรวจสอบ')}</span>
+            <span role="status">{connection.state === 'unavailable_provider' ? tx('Provider is not configured.', 'ยังไม่ได้ตั้งค่าผู้ให้บริการ') : connection.state === 'invalid_credentials' ? tx('Stored credential cannot be decrypted.', 'ไม่สามารถถอดรหัสข้อมูลรับรองที่บันทึกไว้') : connectionTests[connection.id] ? tx('Configured connection', 'ตั้งค่าการเชื่อมต่อแล้ว') : tx('Configured; verification not run', 'ตั้งค่าแล้ว; ยังไม่ได้ตรวจสอบ')}</span>
+            {connectionTests[connection.id]?.status === 'loading' && <p className="connection-test-result" role="status">{tx('Checking API access…', 'กำลังตรวจสอบการเข้าถึง API…')}</p>}
+            {connectionTests[connection.id]?.status === 'ready' && <p className="connection-test-result" role="status">{connectionTestText(connectionTests[connection.id].value)}</p>}
+            {connectionTests[connection.id]?.status === 'error' && <p className="connection-test-result" role="alert">{errorText(connectionTests[connection.id].error!, language)}</p>}
           </div>
-          <button className="button button-quiet button-small" type="button" onClick={() => void removeConnection(connection.id)}>{tx('Remove', 'ลบ')}</button>
+          <div className="connection-row-actions">
+            <button className="button button-quiet button-small" type="button" aria-label={`${tx('Test connection', 'ทดสอบการเชื่อมต่อ')} ${connection.label}`} disabled={connection.state !== 'ready' || !connection.has_secret || connectionTests[connection.id]?.status === 'loading'} onClick={() => void testConnection(connection.id)}>{connectionTests[connection.id]?.status === 'loading' ? tx('Testing…', 'กำลังทดสอบ…') : tx('Test connection', 'ทดสอบการเชื่อมต่อ')}</button>
+            <button className="button button-quiet button-small" type="button" disabled={connectionTests[connection.id]?.status === 'loading'} onClick={() => void removeConnection(connection.id)}>{tx('Remove', 'ลบ')}</button>
+          </div>
         </li>)}
       </ul>}
+      <p style={secondaryTextStyle}>{tx('Testing sends the saved key to its configured provider for a metadata check only. It does not send your questions or files, or run the model.', 'การทดสอบส่ง key ที่บันทึกไว้ไปยังผู้ให้บริการที่ตั้งค่าไว้เพื่อตรวจเมทาดาทาเท่านั้น ไม่ส่งคำถามหรือไฟล์ และไม่เรียกโมเดลให้ตอบข้อความ')}</p>
       {connectionError && <p role="alert">{errorText(connectionError, language)}</p>}
       <form className="settings-form" style={formStyle} onSubmit={(event) => void saveConnection(event)}>
         <h3>{tx('Add a model connection', 'เพิ่มการเชื่อมต่อโมเดล')}</h3>

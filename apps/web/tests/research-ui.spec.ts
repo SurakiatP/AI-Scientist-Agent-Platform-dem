@@ -126,7 +126,7 @@ test('approving an edited plan sends its exact new revision and digest', async (
   await page.getByLabel('Research question').fill('Is the reference real?');
   await page.getByRole('button', { name: 'Review plan' }).click();
   await expect(page.getByText('Fixture / fixture-model')).toBeVisible();
-  await expect(page.getByText('numpy 2.0.0')).toBeVisible();
+  await expect(page.getByText('numpy 2.0.0')).toBeVisible(); await page.locator('.plan-stage-options > summary').click();
   await page.getByLabel('Research stages (one per line)').fill('search_literature');
   await expect(page.getByRole('button', { name: 'Approve plan' })).toBeDisabled();
   await page.getByRole('button', { name: 'Save edits' }).click();
@@ -134,9 +134,9 @@ test('approving an edited plan sends its exact new revision and digest', async (
   await page.getByRole('button', { name: 'Approve plan' }).click();
   await expect(page.getByRole('heading', { name: 'Queued to start' })).toBeVisible();
   const approve = fixture.writes.find((w) => w.path.endsWith('/approve'))!;
-  expect(approve.body).toEqual({ expected_revision: 2, plan_digest: `${'d'.repeat(63)}2` });
+  expect(approve.body).toEqual({ expected_revision: 3, plan_digest: `${'d'.repeat(63)}3` });
   const patch = fixture.writes.find((w) => w.method === 'PATCH')!;
-  expect(patch.body.expected_revision).toBe(1);
+  expect(patch.body.expected_revision).toBe(2);
   expect(patch.body.plan.stages).toEqual(['search_literature']);
   expect(patch.body.plan.input_snapshot_digest).toHaveLength(64);
 });
@@ -145,7 +145,7 @@ test('revision conflict refreshes the plan instead of approving it', async ({ pa
   const fixture = await installResearchFixtureRoutes(page, { run: null, conflictOnApprove: true });
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Q');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Review plan' }).click(); await page.getByText('Plan prepared. Review the current requirements and limits before approving.').waitFor();
   await page.getByRole('button', { name: 'Approve plan' }).click();
   await expect(page.getByText('The plan changed')).toBeVisible();
   await expect(page.getByLabel('Research stages (one per line)')).toHaveValue('search_literature');
@@ -195,7 +195,7 @@ test('stop stays pending until acknowledged and a lost connection never claims i
   await expect(page.getByRole('heading', { name: 'Stopping, waiting for confirmation' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Stopped' })).toHaveCount(0);
   await expect.poll(async () => (await chatStreams(page)).length).toBe(2);
-  await expect(page.getByText('Connected', { exact: true })).toBeVisible();
+  await expect(page.getByText('Live updates connected', { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Stopping, waiting for confirmation' })).toBeVisible();
   fixture.acknowledgeStop();
   await emitChatEvent(page, 1, event(1, 'run.state', { state: 'canceled' }));
@@ -328,7 +328,7 @@ test('shared files are selected only when ready and removal from the question de
   await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.locator('#library-upload').setInputFiles({ name: 'uploaded.csv', mimeType: 'text/csv', buffer: Buffer.from('a,b\n') });
   await expect(page.getByText('uploaded.csv')).toBeVisible();
-  await page.goto(SESSION_URL);
+  await page.goto(SESSION_URL); await page.locator('.chat-file-picker > summary').click();
   await expect(page.getByRole('button', { name: 'Add to question: broken.csv' })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Add to question: uploaded.csv' })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Add to question: uploaded.csv' })).toBeEnabled({ timeout: 10_000 });
@@ -367,7 +367,7 @@ test('reports expose copyable code and selectable equation source', async ({ pag
 
 test('submit sends exactly the server fields and no retry_of', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: null });
-  await page.goto(SESSION_URL);
+  await page.goto(SESSION_URL); await page.locator('.chat-file-picker > summary').click();
   await page.getByLabel('Research question').fill('Q');
   await page.getByRole('button', { name: 'Add to question: example.csv' }).click();
   await page.getByRole('button', { name: 'Review plan' }).click();
@@ -379,7 +379,7 @@ test('submit sends exactly the server fields and no retry_of', async ({ page }) 
 
 test('messages and files still load when the connections route is missing', async ({ page }) => {
   await installResearchFixtureRoutes(page, { run: null, connection: 'missing' });
-  await page.goto(SESSION_URL);
+  await page.goto(SESSION_URL); await page.locator('.chat-file-picker > summary').click();
   await expect(page.getByText('Original question about diffusion')).toBeVisible();
   await expect(page.getByText('example.csv · Ready')).toBeVisible();
   await expect(page.getByText('Settings unavailable.')).toBeVisible();
@@ -404,7 +404,7 @@ test('an expired cursor re-pages from cursor 0 because events are never deleted'
   await failChatStream(page, 0);
   await expect.poll(async () => (await chatStreams(page)).length).toBe(2);
   await expect.poll(() => fixture.pageRequests().filter((n) => n === 0).length).toBeGreaterThanOrEqual(2);
-  await expect(page.getByText('Connected', { exact: true })).toBeVisible();
+  await expect(page.getByText('Live updates connected', { exact: true })).toBeVisible();
   await expect(page.getByText('1 stages completed')).toBeVisible();
   await expect(page.getByRole('listitem').filter({ hasText: 'Search literature' })).toHaveCount(1);
 });

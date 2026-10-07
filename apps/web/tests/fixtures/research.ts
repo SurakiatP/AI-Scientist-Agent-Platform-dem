@@ -108,9 +108,14 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
       }
       if (method === 'GET' && sub === '/plan') return json({ ...plan, run_id: runMatch[1] });
       if (method === 'GET' && sub === '/readiness') return json({ run_id: runMatch[1], revision: plan.revision, plan_digest: plan.plan_digest, state: 'ready', requirements: [] });
+      if (method === 'POST' && sub === '/prepare-plan') {
+        plan = makePlan(plan.revision + 1, plan.plan.stages);
+        run = { ...run!, revision: run!.revision + 1 };
+        return json(run);
+      }
       if (method === 'PATCH' && sub === '/plan') { plan = makePlan(plan.revision + 1, body.plan.stages); run = { ...run!, revision: run!.revision + 1 }; return json(run); }
       if (method === 'POST' && sub === '/approve') {
-        if (options.conflictOnApprove && body.expected_revision === 1) { plan = makePlan(3, ['search_literature']); run = { ...run!, revision: 3 }; return err('revision_conflict', 409); }
+        if (options.conflictOnApprove && body.expected_revision === 2) { plan = makePlan(3, ['search_literature']); run = { ...run!, revision: 3 }; return err('revision_conflict', 409); }
         run = makeRun({ run_id: NEW_RUN_ID, state: 'queued', artifacts: [] }); return json(run);
       }
       if (method === 'POST' && sub === '/stop') { run = { ...run!, state: 'stopping' }; return json(run); }

@@ -83,13 +83,13 @@ export function RunProgress({
   return (
     <section className="run-progress" role="region" aria-label={text(language, 'Research progress', 'ความคืบหน้าการวิจัย')}>
       <p className={`connection-badge${!connected && !terminal ? ' is-offline' : ''}`}>
-        {terminal ? text(language, 'Run finished.', 'งานสิ้นสุดแล้ว') : connected ? text(language, 'Connected', 'เชื่อมต่อแล้ว') : text(language, 'Connection lost. Showing last confirmed status; the run may still be active.', 'การเชื่อมต่อขาดหาย แสดงสถานะล่าสุดที่ยืนยันแล้ว งานอาจยังทำงานอยู่')}
+        {terminal ? text(language, 'Run finished.', 'งานสิ้นสุดแล้ว') : connected ? text(language, 'Live updates connected', 'เชื่อมต่อการอัปเดตสดแล้ว') : text(language, 'Connection lost. Showing last confirmed status; the run may still be active.', 'การเชื่อมต่อขาดหาย แสดงสถานะล่าสุดที่ยืนยันแล้ว งานอาจยังทำงานอยู่')}
       </p>
       <h2>{stopping ? stateLabels.stopping[language === 'th' ? 1 : 0] : label}</h2>
-      <p role="status">
+      {run.state !== 'awaiting_approval' && stages.length > 0 && <p role="status">
         {text(language, `${completed.size} stages completed`, `เสร็จสิ้น ${completed.size} ขั้นตอน`)}
         {current ? ` · ${text(language, 'Current stage', 'ขั้นตอนปัจจุบัน')}: ${stageLabel(current, language)}` : ''}
-      </p>
+      </p>}
       {stages.length > 0 && (
         <ol>{stages.map((stage) => (
           <li key={stage}>
@@ -186,7 +186,7 @@ export function RunProgress({
       )}
       {!terminal && (
         <button type="button" className="button button-quiet button-small" disabled={stopping} onClick={onStop}>
-          {stopping ? text(language, 'Stopping…', 'กำลังหยุด…') : text(language, 'Stop', 'หยุด')}
+          {stopping ? text(language, 'Stopping…', 'กำลังหยุด…') : run.state === 'awaiting_approval' ? text(language, 'Cancel plan', 'ยกเลิกแผน') : text(language, 'Stop', 'หยุด')}
         </button>
       )}
       {(run.state === 'failed' || run.state === 'canceled') && onRetry && (

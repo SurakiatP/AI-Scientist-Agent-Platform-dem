@@ -21,11 +21,9 @@ for (const workflow of ['literature', 'resources'] as const) {
     const question = 'Measure the selected workspace '.repeat(7).trim();
     await page.goto(SESSION_URL);
     await page.getByLabel('Research question').fill(question);
+    await page.getByText('Workflow options', { exact: true }).click();
     await page.getByLabel('Research workflow').selectOption(workflow);
     await page.getByRole('button', { name: 'Review plan', exact: true }).click();
-    await expect(page.getByRole('button', { name: 'Prepare plan', exact: true })).toBeVisible();
-    expect(preparations).toHaveLength(0);
-    await page.getByRole('button', { name: 'Prepare plan', exact: true }).dblclick();
     await expect.poll(() => preparations.length).toBe(1);
     expect(preparations[0]).toEqual({ expected_revision: 1, workflow, search_terms: workflow === 'resources' ? [] : [question.slice(0, 150)] });
     expect(fixture.writes.filter((write) => write.path.endsWith('/approve'))).toHaveLength(0);
@@ -47,6 +45,7 @@ test('owner budget edits preserve the plan and require refreshed review before a
   });
   await page.route(`**/api/v1/runs/${NEW_RUN_ID}/readiness`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ run_id: NEW_RUN_ID, revision: plan.revision, plan_digest: plan.plan_digest, state: 'ready', requirements: [] }) }));
   await page.goto(SESSION_URL);
+  await page.getByText('Edit stages and limits', { exact: true }).click();
   await page.getByLabel('Token limit').fill('1000');
   await page.getByLabel('Time limit (seconds)').fill('120');
   await expect(page.getByRole('button', { name: 'Approve plan', exact: true })).toBeDisabled();
@@ -149,6 +148,8 @@ test('Crossref CSV preparation requires explicit query and ready CSV, then reche
 
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Describe these measurements and find related studies.');
+  await page.getByText('Next question', { exact: true }).click();
+  await page.getByText('Workflow options', { exact: true }).click();
   await page.getByLabel('Research workflow').selectOption('crossref_csv');
   await page.getByLabel('Crossref query').fill('microplastic exposure');
   await page.getByLabel('CSV input file').selectOption(READY_FILE);
@@ -159,7 +160,7 @@ test('Crossref CSV preparation requires explicit query and ready CSV, then reche
   await page.getByRole('button', { name: 'EN', exact: true }).click();
   await page.getByRole('button', { name: 'Review plan' }).click();
   await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
-  await page.getByRole('button', { name: 'Prepare plan', exact: true }).click();
+  await expect.poll(() => prepareBodies.length).toBe(1);
   await expect(page.getByRole('button', { name: 'Approve plan', exact: true })).toBeEnabled();
   expect(prepareBodies).toEqual([{
     expected_revision: 1,
@@ -247,6 +248,8 @@ test('CSV plan review shows its saved authority and requires reprepare after dra
   await expect(page.getByText(new RegExp(`inputs/${inputHash}`))).toBeVisible();
   await expect(page.getByText(/x, y/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Approve plan', exact: true })).toBeEnabled();
+  await page.getByText('Next question', { exact: true }).click();
+  await page.getByText('Workflow options', { exact: true }).click();
   await page.getByLabel('Crossref query').fill('different query');
   await page.getByLabel('Numeric columns').fill('x,z');
   await expect(page.getByText('The current draft differs from the saved scientific inputs. Prepare the plan again before approval.')).toBeVisible();
@@ -532,7 +535,7 @@ test('large bodies and malformed JSON fail without a fabricated preview', async 
 });
 
 test('setup keeps return context through credential forms, language and small screens', async ({ page }) => {
-  await setupApi(page);
+  const api = await setupApi(page);
   await page.setViewportSize({ width: 320, height: 700 });
   await page.goto(SETUP_URL);
   await page.getByRole('link', { name: 'Configure connections and access' }).click();
@@ -544,9 +547,22 @@ test('setup keeps return context through credential forms, language and small sc
   await expect(page.getByRole('link', { name: 'กลับไปตรวจทานแผน' })).toHaveAttribute('href', `${SESSION_URL}?run=${NEW_RUN_ID}`);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.getByRole('link', { name: 'กลับไปตรวจทานแผน' }).click();
+  await page.getByText('แก้ไขขั้นตอนและขีดจำกัด', { exact: true }).click();
   await expect(page.getByLabel('ขีดจำกัดโทเคน')).toBeVisible();
+  await page.getByText('คำถามถัดไป', { exact: true }).click();
+  await page.getByText('ตัวเลือกเวิร์กโฟลว์', { exact: true }).click();
   await page.getByLabel('รูปแบบงานวิจัย').selectOption('resources');
-  await expect(page.getByRole('button', { name: 'เตรียมแผน', exact: true })).toBeEnabled();
+  await expect(page.getByLabel('รูปแบบงานวิจัย')).toHaveValue('resources');
+  await expect(page.getByText('ขอบเขตหรือรูปแบบงานวิจัยเปลี่ยนแล้ว โปรดเตรียมแผนอีกครั้งก่อนอนุมัติ')).toBeVisible();
+  const prepareButton = page.getByRole('button', { name: 'เตรียมแผน', exact: true });
+  await expect(prepareButton).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'อนุมัติแผน', exact: true })).toBeDisabled();
+  expect(api.fixture.writes.filter((write) => write.path.endsWith('/prepare-plan'))).toHaveLength(0);
+  await prepareButton.click();
+  await expect.poll(() => api.fixture.writes.filter((write) => write.path.endsWith('/prepare-plan')).length).toBe(1);
+  expect(api.fixture.writes.find((write) => write.path.endsWith('/prepare-plan'))!.body).toEqual({ expected_revision: 1, workflow: 'resources', search_terms: [] });
+  expect(api.fixture.writes.filter((write) => write.path.endsWith('/approve'))).toHaveLength(0);
+  expect(api.submissions).toHaveLength(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
 

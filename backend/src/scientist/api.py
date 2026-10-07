@@ -18,7 +18,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from scientist import domain, files, objects, research, supervisor, profile_preparation, settings
+from scientist import connection_test, domain, files, objects, research, supervisor, profile_preparation, settings
 from scientist.provider_catalog import catalog as provider_catalog
 from scientist import secrets as secret_store
 from scientist.auth import DomainError, authenticate_owner_session
@@ -198,6 +198,25 @@ def revoke_connection(request: Request, connection_id: UUID):
         secret_store.revoke_connection(db, _principal(request), connection_id)
         db.commit()
     return Response(status_code=204)
+
+
+@router.post("/connections/{connection_id}/test")
+async def test_connection(request: Request, connection_id: UUID):
+    owner = _principal(request)
+    if owner.kind != "owner":
+        raise DomainError("forbidden", 403)
+    if request.headers.get("content-length", "0") != "0":
+        raise DomainError("forbidden", 400)
+    async for chunk in request.stream():
+        if chunk:
+            raise DomainError("forbidden", 400)
+    view = await run_in_threadpool(_test_saved_connection, owner, connection_id)
+    return JSONResponse(view, headers={"Cache-Control": "no-store"})
+
+
+def _test_saved_connection(owner: Principal, connection_id: UUID) -> dict[str, str]:
+    with database_session() as db:
+        return connection_test.test_connection(db, owner, connection_id)
 
 
 @router.get("/projects")

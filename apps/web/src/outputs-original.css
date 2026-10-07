@@ -62,3 +62,7 @@
 .provider-selection-note { display: grid; gap: 3px; margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--soft); font-size: 12px; overflow-wrap: anywhere; }
 .provider-selection-note strong { color: var(--ink); }
 .provider-selection-note span, .provider-selection-note small { color: var(--muted); }
+
+.connection-row-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.connection-test-result { max-width: 52ch; margin: 10px 0 0; color: var(--ink); font-size: 13px; line-height: 1.65; }
+@media (max-width: 600px) { .connection-row-actions { justify-content: flex-start; } }

@@ -315,6 +315,13 @@ export interface CitationView {
   verification?: "verified" | "unverified" | "contradictory" | null;
 }
 
+export interface ConnectionTestView {
+  connection_id: string;
+  status: 'reachable' | 'credentials_rejected' | 'denied' | 'rate_limited' | 'unavailable' | 'unsupported';
+  credential_status: 'accepted' | 'rejected' | 'unverified';
+  model_status: 'not_tested';
+}
+
 export interface ProviderView {
   slug: string;
   name: string;
