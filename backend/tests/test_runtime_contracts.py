@@ -251,6 +251,39 @@ def test_v2_context_receipt_binds_approved_grant_and_checkpoint_bytes(context_da
     continued_context = RuntimeContextV1.model_validate(continued)
     assert len(continued_context.scientific_results_v2) == 1
 
+    # A later model response may issue the next V2 tool while the completed
+    # search mapping remains part of this turn's durable operation history.
+    continued["messages"].append({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call-3",
+            "type": "function",
+            "function": {
+                "name": "scientific_csv_describe",
+                "arguments": '{"grant_id":"grant-1"}',
+            },
+        }],
+    })
+    continued["boundary"] = "model_committed"
+    continued["pending_assistant"] = {
+        "turn_id": continued["turn_id"],
+        "message_index": len(continued["messages"]) - 1,
+        "next_tool_index": 0,
+    }
+    next_context = RuntimeContextV1.model_validate(continued)
+    assert next_context.operation_mappings[0].tool_call_id == "call-2"
+    assert next_context.pending_assistant.message_index == len(continued["messages"]) - 1
+
+    no_anchor = deepcopy(continued)
+    no_anchor["messages"].pop()
+    no_anchor["messages"].append({"role": "user", "content": "A new turn."})
+    no_anchor["current_turn_user_index"] = None
+    no_anchor["boundary"] = "before_model"
+    no_anchor["pending_assistant"] = None
+    with pytest.raises(ValidationError, match="mapped tool call was not issued"):
+        RuntimeContextV1.model_validate(no_anchor)
+
     forged = deepcopy(context_data)
     forged["scientific_results_v2"][0]["operation_fingerprint"] = "9" * 64
     with pytest.raises(ValidationError):

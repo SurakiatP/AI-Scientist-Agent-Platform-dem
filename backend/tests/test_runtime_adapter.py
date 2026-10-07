@@ -1508,16 +1508,20 @@ def test_approved_search_operation_is_bound_to_raw_call_and_replayed_by_mapping(
     context_data["plan_digest"] = hashlib.sha256(
         json.dumps(plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    context_data["messages"] = [{
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": "raw-search-call", "type": "function",
-            "function": {"name": "scientific_search", "arguments": '{"request_id":"search-1"}'},
-        }],
-    }]
+    context_data["messages"] = [
+        {"role": "user", "content": "Find fixture papers"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "raw-search-call", "type": "function",
+                "function": {"name": "scientific_search", "arguments": '{"request_id":"search-1"}'},
+            }],
+        },
+    ]
+    context_data["current_turn_user_index"] = 0
     context_data["pending_assistant"] = {
-        "turn_id": context_data["turn_id"], "message_index": 0, "next_tool_index": 0,
+        "turn_id": context_data["turn_id"], "message_index": 1, "next_tool_index": 0,
         "applied_tool_ids": [{"raw_id": "raw-search-call", "applied_id": "applied-search-call"}],
     }
     context_data["boundary"] = "before_tool"
@@ -1613,15 +1617,19 @@ def test_approved_search_preserves_crossref_provenance_and_same_effect_identity(
     context_data["plan_digest"] = hashlib.sha256(
         json.dumps(plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    context_data["messages"] = [{
-        "role": "assistant", "content": None,
-        "tool_calls": [{
-            "id": "raw-search-call", "type": "function",
-            "function": {"name": "scientific_search", "arguments": '{"request_id":"search-1"}'},
-        }],
-    }]
+    context_data["messages"] = [
+        {"role": "user", "content": "Find fixture papers"},
+        {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": "raw-search-call", "type": "function",
+                "function": {"name": "scientific_search", "arguments": '{"request_id":"search-1"}'},
+            }],
+        },
+    ]
+    context_data["current_turn_user_index"] = 0
     context_data["pending_assistant"] = {
-        "turn_id": context_data["turn_id"], "message_index": 0, "next_tool_index": 0,
+        "turn_id": context_data["turn_id"], "message_index": 1, "next_tool_index": 0,
         "applied_tool_ids": [{"raw_id": "raw-search-call", "applied_id": "applied-search-call"}],
     }
     context_data["boundary"] = "before_tool"
@@ -1709,15 +1717,19 @@ def test_csv_compute_returns_four_verified_output_receipts_and_writes_workspace(
     context_data["plan_digest"] = hashlib.sha256(
         json.dumps(plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    context_data["messages"] = [{
-        "role": "assistant", "content": None,
-        "tool_calls": [{
-            "id": "raw-compute-call", "type": "function",
-            "function": {"name": "scientific_csv_describe", "arguments": '{"grant_id":"grant-1"}'},
-        }],
-    }]
+    context_data["messages"] = [
+        {"role": "user", "content": "Summarize the fixture CSV"},
+        {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": "raw-compute-call", "type": "function",
+                "function": {"name": "scientific_csv_describe", "arguments": '{"grant_id":"grant-1"}'},
+            }],
+        },
+    ]
+    context_data["current_turn_user_index"] = 0
     context_data["pending_assistant"] = {
-        "turn_id": context_data["turn_id"], "message_index": 0, "next_tool_index": 0,
+        "turn_id": context_data["turn_id"], "message_index": 1, "next_tool_index": 0,
         "applied_tool_ids": [{"raw_id": "raw-compute-call", "applied_id": "applied-compute-call"}],
     }
     context_data["boundary"] = "before_tool"

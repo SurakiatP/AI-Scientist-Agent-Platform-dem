@@ -468,6 +468,22 @@ class RuntimeContextV1(RuntimeRecord):
         last_tool_calls = next((message.tool_calls for message in reversed(self.messages)
                                 if message.role == "assistant" and message.tool_calls), [])
         active_tool_ids = {call.id for call in last_tool_calls}
+        current_turn_start = self.current_turn_user_index
+        if current_turn_start is None:
+            current_turn_start = next(
+                (
+                    index
+                    for index in range(len(self.messages) - 1, -1, -1)
+                    if self.messages[index].role == "user"
+                ),
+                len(self.messages),
+            )
+        current_turn_tool_calls = {
+            call.id: call
+            for message in self.messages[current_turn_start:]
+            if message.role == "assistant"
+            for call in (message.tool_calls or [])
+        }
         scientific = self.plan.scientific
         v2_binding = scientific if isinstance(scientific, ScientificBindingV2) else None
         if isinstance(scientific, ScientificBindingV2):
@@ -562,14 +578,18 @@ class RuntimeContextV1(RuntimeRecord):
                 raise ValueError("operation is outside active approved continuation")
             if mapping.model_sequence is not None and mapping.model_sequence >= self.operation_sequence:
                 raise ValueError("operation sequence is not allocated")
-            if mapping.purpose == "tool" and mapping.tool_call_id not in active_tool_ids:
-                raise ValueError("mapped tool call was not issued in the active continuation")
+            if mapping.purpose == "tool":
+                issued_tool_ids = (
+                    current_turn_tool_calls if v2_binding is not None else active_tool_ids
+                )
+                if mapping.tool_call_id not in issued_tool_ids:
+                    raise ValueError("mapped tool call was not issued in the active continuation")
             if request.kind == "llm" and (request.payload.get("model") != self.model
                     or request.payload.get("provider_id") != str(self.provider_id)
                     or request.payload.get("recipient") != self.provider_endpoint):
                 raise ValueError("mapped model request changed provider identity")
             if v2_binding is not None and mapping.purpose == "tool":
-                call = next((item for item in last_tool_calls if item.id == mapping.tool_call_id), None)
+                call = current_turn_tool_calls.get(mapping.tool_call_id)
                 if request.kind in {"search", "compute"} and request.reserve_tokens != 0:
                     raise ValueError("V2 scientific calls cannot reserve LLM tokens")
                 if request.kind == "compute":

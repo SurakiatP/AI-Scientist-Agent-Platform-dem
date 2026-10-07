@@ -276,20 +276,24 @@ def owner():
 
 @pytest.fixture
 def db(migrated_database, monkeypatch):
-    """Each committed-state case gets its own database; retained as synthetic evidence."""
+    """Keep committed state isolated during each test; dispose its temporary DB afterwards."""
     base = database.engine().url
     _, connection = base.get_dialect()().create_connect_args(base)
     name = "scientist_test_l1" + uuid4().hex
     with psycopg.connect(**{**connection, "dbname": "postgres"}, autocommit=True) as admin:
         admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
     engine = create_engine(base.set(database=name), pool_pre_ping=True)
-    database.migrate(engine)
-    factory = sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database, "_engine", engine)
-    monkeypatch.setattr(database, "_sessions", factory)
-    with factory() as connection:
-        yield connection
-    engine.dispose()
+    try:
+        database.migrate(engine)
+        factory = sessionmaker(engine, expire_on_commit=False)
+        monkeypatch.setattr(database, "_engine", engine)
+        monkeypatch.setattr(database, "_sessions", factory)
+        with factory() as session:
+            yield session
+    finally:
+        engine.dispose()
+        with psycopg.connect(**{**connection, "dbname": "postgres"}, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(name)))
 
 
 def submission(**changes):
