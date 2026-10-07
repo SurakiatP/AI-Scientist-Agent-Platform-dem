@@ -48,7 +48,7 @@ export function RunProgress({
   connected: boolean;
   onStop: () => void;
   stopPending?: boolean;
-  onDecision?: (decision: DecisionRequiredPayload, choice: DecisionChoice, usageTokens?: number) => void;
+    onDecision?: (decision: DecisionRequiredPayload, choice: DecisionChoice, usageTokens?: number, additionalElapsedMs?: number) => void;
   onRetry?: () => void;
 }) {
   const { language } = useAppPreferences();
@@ -65,6 +65,19 @@ export function RunProgress({
   const decision = pendingDecisions[0];
   const [usage, setUsage] = useState('');
   const [usageAcknowledged, setUsageAcknowledged] = useState(false);
+  const [elapsedHeadroomMinutes, setElapsedHeadroomMinutes] = useState('10');
+  const requiredElapsedMs = decision?.required_elapsed_ms ?? 0;
+  const headroomMinutes = Number(elapsedHeadroomMinutes);
+  const candidateHeadroomMs = headroomMinutes * 60_000;
+  const headroomValid = /^\d+$/.test(elapsedHeadroomMinutes)
+    && headroomMinutes >= 0
+    && Number.isSafeInteger(headroomMinutes)
+    && requiredElapsedMs >= 0
+    && Number.isSafeInteger(requiredElapsedMs)
+    && Number.isSafeInteger(candidateHeadroomMs)
+    && Number.isSafeInteger(requiredElapsedMs + candidateHeadroomMs);
+  const additionalElapsedMs = requiredElapsedMs > 0 && headroomValid ? candidateHeadroomMs : 0;
+  const requestedElapsedMs = requiredElapsedMs + additionalElapsedMs;
   const usageCap = decision?.operation_reserved_tokens ?? 0;
   const usageValue = Number(usage);
   const usageValid = /^\d+$/.test(usage) && usageValue <= usageCap;
@@ -76,6 +89,7 @@ export function RunProgress({
   useEffect(() => {
     setUsage('');
     setUsageAcknowledged(false);
+    setElapsedHeadroomMinutes('10');
   }, [decision?.decision_id]);
 
   const label = stateLabels[run.state][language === 'th' ? 1 : 0];
@@ -108,9 +122,32 @@ export function RunProgress({
                 {(decision.required_elapsed_ms ?? 0) > 0 && <> {text(language, `Required: ${Math.ceil(decision.required_elapsed_ms! / 1000)} more seconds.`, `ต้องเพิ่มอีก ${Math.ceil(decision.required_elapsed_ms! / 1000)} วินาที`)}</>}
               </p>
               {((decision.required_tokens ?? 0) > 0 || (decision.required_elapsed_ms ?? 0) > 0) && (
-                <button type="button" className="button button-small" onClick={() => onDecision?.(decision, 'extend')}>
-                  {text(language, 'Extend limit and continue', 'ขยายขีดจำกัดและดำเนินการต่อ')}
-                </button>
+                <>
+                {requiredElapsedMs > 0 && (
+                <>
+                  <label>
+                    {text(language, 'Additional time beyond the required amount (minutes)', 'เวลาเพิ่มเติมจากจำนวนขั้นต่ำที่ต้องเพิ่ม (นาที)')}
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={elapsedHeadroomMinutes}
+                      onChange={(event) => setElapsedHeadroomMinutes(event.target.value)}
+                    />
+                  </label>
+                  <p>
+                    {text(
+                      language,
+                      `Extension request: ${requiredElapsedMs} ms required + ${additionalElapsedMs} ms headroom = ${requestedElapsedMs} ms.`,
+                      `คำขอขยายเวลา: ขั้นต่ำ ${requiredElapsedMs} มิลลิวินาที + เผื่อเพิ่ม ${additionalElapsedMs} มิลลิวินาที = ${requestedElapsedMs} มิลลิวินาที`,
+                    )}
+                  </p>
+                </>
+              )}
+              <button type="button" className="button button-small" disabled={requiredElapsedMs > 0 && !headroomValid} onClick={() => onDecision?.(decision, 'extend', undefined, additionalElapsedMs)}>
+                {text(language, 'Extend limit and continue', 'ขยายขีดจำกัดและดำเนินการต่อ')}
+              </button>
+                </>
               )}
             </>
           )}

@@ -93,8 +93,8 @@ async function setupApi(page: Page, options: { lostFirst?: boolean; unverifiedRe
     if (method === 'GET' && path === '/capabilities') return json({ file_types: ['text/csv'], max_upload_bytes: 1000000, protocols: {} });
     if (method === 'GET') reads.push(path);
     if (method === 'GET' && path === `/projects/${PROJECT_ID}/research-setup`) {
-      const profileState = jobs[0]?.state === 'failed' ? 'failed' : jobs.length ? 'preparing' : options.ownerReadyWithoutProjectJob ? 'ready' : 'missing';
-      const view: ResearchSetupView = { project_id: PROJECT_ID, requirements: [{ id: 'environment', label: 'Calculation environment', purpose: 'Use the reviewed calculation environment.', state: readinessState, action: 'prepare_environment' }], profiles: [{ ...PROFILE, state: profileState }], connections: [{ id: '12121212-1212-4212-8212-121212121212', label: 'Configured research connection', provider: 'https://provider.example', model: 'fixture-model', state: 'ready', has_secret: true }], preparations: jobs };
+      const profileState = jobs[0]?.state === 'failed' ? 'failed' : jobs[0]?.state === 'blocked' ? 'blocked' : jobs.length ? 'preparing' : options.ownerReadyWithoutProjectJob ? 'ready' : 'missing';
+      const view: ResearchSetupView = { project_id: PROJECT_ID, requirements: [{ id: 'environment', label: 'Calculation environment', purpose: 'Use the reviewed calculation environment.', state: readinessState, action: 'prepare_environment' }], profiles: [{ ...PROFILE, state: profileState, ...(jobs[0]?.error_code ? { reason: jobs[0].error_code } : {}) }], connections: [{ id: '12121212-1212-4212-8212-121212121212', label: 'Configured research connection', provider: 'https://provider.example', model: 'fixture-model', state: 'ready', has_secret: true }], preparations: jobs };
       return json(view);
     }
     if (method === 'POST' && path === `/projects/${PROJECT_ID}/preparations`) {
@@ -346,6 +346,39 @@ test('a known failed preparation can be retried with a fresh request identity', 
   await expect(page.getByRole('button', { name: 'Check preparation request' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Prepare environment' })).toHaveCount(0);
   expect(api.submissions).toHaveLength(1);
+});
+
+test('stale blocked build evidence exposes a reprepare action with a fresh request id', async ({ page }) => {
+  const previousRequestId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const api = await setupApi(page, { initialJob: job({ state: 'blocked', stage: 'owner_decision', error_code: 'build_evidence_unavailable' }), lostFirst: true });
+  await page.addInitScript(({ key, requestId }) => { if (!sessionStorage.getItem(key)) sessionStorage.setItem(key, requestId); }, {
+    key: `research-preparation-v1:${PROJECT_ID}:${JSON.stringify([PROFILE.profile_id, PROFILE.version, PROFILE.manifest_sha256])}`,
+    requestId: previousRequestId,
+  });
+  await page.goto(SETUP_URL);
+  await expect(page.getByRole('button', { name: 'Reprepare environment', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Reprepare environment', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('could not confirm whether preparation started');
+  await expect.poll(() => api.submissions.length).toBe(1);
+  const retryRequestId = api.submissions[0].request_id;
+  expect(api.submissions[0]).toEqual({ profile_id: PROFILE.profile_id, version: PROFILE.version, manifest_sha256: PROFILE.manifest_sha256, request_id: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/) });
+  expect(retryRequestId).not.toBe(previousRequestId);
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Check preparation request', exact: true })).toBeVisible();
+  expect(api.submissions).toHaveLength(1);
+  await page.getByRole('button', { name: 'Check preparation request', exact: true }).click();
+  await expect.poll(() => api.submissions.length).toBe(2);
+  expect(api.submissions[1].request_id).toBe(retryRequestId);
+  await expect(page.getByText('Security checks', { exact: true })).toBeVisible();
+});
+
+test('an active preparation cannot start a second request', async ({ page }) => {
+  const api = await setupApi(page, { initialJob: job({ state: 'checking', stage: 'security' }) });
+  await page.goto(SETUP_URL);
+  await expect(page.getByText('Security checks', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Reprepare environment', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Prepare environment', exact: true })).toHaveCount(0);
+  expect(api.submissions).toHaveLength(0);
 });
 
 test('an unknown preparation cannot start a new request', async ({ page }) => {

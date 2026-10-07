@@ -122,7 +122,7 @@ function Report({ artifact, language }: { artifact: ArtifactView; language: Lang
   }, [artifact.project_id, artifact.artifact_id, artifact.sha256, artifact.kind, artifact.title]);
   if (error !== null) return <p role="alert">{apiErrorMessage(error, language)}</p>;
   if (!content) return <p role="status">{text(language, 'Loading output…', 'กำลังโหลดผลลัพธ์…')}</p>;
-  if (content.type.startsWith('image/') && content.url) return <img className="artifact-image" src={content.url} alt={artifact.title} />;
+  if (content.type.startsWith('image/') && content.url) return <img className={`artifact-image${content.type === 'image/svg+xml' ? ' artifact-image-svg' : ''}`} src={content.url} alt={artifact.title} />;
   if (content.type === 'application/pdf' && content.url) return <iframe className="artifact-document" src={content.url} title={artifact.title} sandbox="" />;
   if (content.type === 'text/csv' && content.body !== null) return <Table body={content.body} language={language} />;
   if (content.type === 'text/markdown' && content.body !== null) return <Markdown source={content.body} language={language} />;

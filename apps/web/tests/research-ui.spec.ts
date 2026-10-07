@@ -41,6 +41,22 @@ async function failChatStream(page: Page, index: number) {
   await page.evaluate((index) => (window as typeof window & { __chatEventSources: ChatEventSource[] }).__chatEventSources[index].fail(), index);
 }
 
+test('assistant chat replies render GFM while owner messages stay plain text', async ({ page }) => {
+  await installResearchFixtureRoutes(page, { messages: [
+    { id: 'm1', sequence: 1, role: 'user', content: '## Keep this text' },
+    { id: 'm2', sequence: 2, role: 'assistant', content: '## Findings\n\n| Item | Result |\n| --- | --- |\n| Sample | **increased** |' },
+  ] });
+  await page.goto(SESSION_URL);
+
+  const conversation = page.getByRole('region', { name: 'Conversation' });
+  await expect(conversation.getByRole('heading', { name: 'Findings', level: 2 })).toBeVisible();
+  const table = conversation.getByRole('region', { name: 'Table' });
+  await expect(table.getByRole('columnheader', { name: 'Item' })).toBeVisible();
+  await expect(table.getByRole('cell', { name: 'increased' })).toBeVisible();
+  await expect(conversation.locator('.notebook-message.owner')).toContainText('## Keep this text');
+  await expect(conversation.locator('.notebook-message.owner').getByRole('heading')).toHaveCount(0);
+});
+
 test('notebook workspace keeps scoped navigation, messages, outputs, and expanded artifact usable on mobile', async ({ page }) => {
   await installResearchFixtureRoutes(page, { messages: [
     { id: 'm1', sequence: 1, role: 'user', content: 'Original question about diffusion' },
@@ -425,7 +441,7 @@ test('stop and its acknowledgement never change the revision, and 422 uses detai
 
 test('budget decision sends the required amounts, revision and one reused key', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'waiting_input', artifacts: [], revision: 4 }), failFirstDecision: true });
-  fixture.pushEvents(event(1, 'decision.required', { decision_id: DECISION_BUDGET, reason: 'budget_exhausted', required_tokens: 37, required_elapsed_ms: 2500 }));
+  fixture.pushEvents(event(1, 'decision.required', { decision_id: DECISION_BUDGET, reason: 'budget_exhausted', required_tokens: 37, required_elapsed_ms: 0 }));
   await page.goto(SESSION_URL);
   const extend = page.getByRole('button', { name: 'Extend limit and continue' });
   await extend.click();
@@ -434,8 +450,26 @@ test('budget decision sends the required amounts, revision and one reused key', 
   await expect(page.getByRole('heading', { name: 'Queued to start' })).toBeVisible();
   const calls = fixture.writes.filter((w) => w.path.endsWith('/decisions'));
   expect(calls).toHaveLength(2);
-  expect(calls[0].body).toEqual({ decision_id: DECISION_BUDGET, expected_revision: 4, idempotency_key: expect.stringMatching(/^[0-9a-f-]{36}$/), choice: 'extend', add_tokens: 37, add_elapsed_ms: 2500 });
+  expect(calls[0].body).toEqual({ decision_id: DECISION_BUDGET, expected_revision: 4, idempotency_key: expect.stringMatching(/^[0-9a-f-]{36}$/), choice: 'extend', add_tokens: 37, add_elapsed_ms: 0 });
   expect(calls[1].body.idempotency_key).toBe(calls[0].body.idempotency_key);
+});
+
+test('budget extension sends the visible ten-minute headroom', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ state: 'waiting_input', artifacts: [], revision: 4 }) });
+  fixture.pushEvents(event(1, 'decision.required', { decision_id: DECISION_BUDGET, reason: 'budget_exhausted', required_tokens: 0, required_elapsed_ms: 129000 }));
+  await page.goto(SESSION_URL);
+  const headroom = page.locator('.run-progress input[type=number]');
+  const extend = page.getByRole('button', { name: 'Extend limit and continue' });
+  await expect(headroom).toHaveValue('10');
+  await expect(page.getByText('Extension request: 129000 ms required + 600000 ms headroom = 729000 ms.')).toBeVisible();
+  await headroom.fill('100000000000000');
+  await expect(extend).toBeDisabled();
+  await headroom.fill('5');
+  await expect(page.getByText('Extension request: 129000 ms required + 300000 ms headroom = 429000 ms.')).toBeVisible();
+  await extend.click();
+  await expect.poll(() => fixture.writes.filter((w) => w.path.endsWith('/decisions')).length).toBe(1);
+  const call = fixture.writes.find((w) => w.path.endsWith('/decisions'))!;
+  expect(call.body).toMatchObject({ choice: 'extend', add_tokens: 0, add_elapsed_ms: 429000 });
 });
 
 test('double-click on a decision sends one request', async ({ page }) => {

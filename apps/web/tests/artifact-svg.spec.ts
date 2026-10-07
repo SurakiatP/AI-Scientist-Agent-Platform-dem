@@ -27,12 +27,15 @@ test('renders and expands SVG artifacts as inert image previews', async ({ page 
   const card = page.getByRole('article', { name: resource.title });
   const image = card.locator('img.artifact-image');
   await expect(image).toBeVisible();
+  await expect(image).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await expect(image).toHaveCSS('padding-top', '12px');
   await expect.poll(() => image.evaluate((node) => (node as HTMLImageElement).naturalWidth)).toBe(64);
 
   await card.getByRole('button', { name: `Expand visual: ${resource.title}` }).click();
   const dialog = page.getByRole('dialog');
   const expanded = dialog.locator('img.artifact-image');
   await expect(expanded).toBeVisible();
+  await expect(expanded).toHaveCSS('background-color', 'rgb(255, 255, 255)');
   await expect.poll(() => expanded.evaluate((node) => (node as HTMLImageElement).naturalWidth)).toBe(64);
 
   await page.waitForTimeout(100);

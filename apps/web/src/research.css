@@ -15,6 +15,7 @@
 .setup-profile dl { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 12px; }
 .setup-profile dd { margin: 0; }
 .artifact-image { display: block; max-width: 100%; max-height: 70vh; width: auto; height: auto; object-fit: contain; }
+.artifact-image-svg { box-sizing: border-box; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .artifact-document { display: block; width: 100%; min-height: 440px; border: 1px solid var(--line); }
 .artifact-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 70vh; overflow: auto; }
 .artifact-content { min-width: 0; }

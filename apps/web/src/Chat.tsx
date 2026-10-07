@@ -8,6 +8,7 @@ import type { DecisionRequiredPayload } from '../../../contracts/api-types';
 import { RunProgress, stageLabel, type DecisionChoice } from './RunProgress';
 import { useRunEvents } from './useRunEvents';
 import { PeerReleaseReview } from './PeerReleaseReview';
+import { Markdown } from './Markdown';
 import './research.css';
 import './chat-original.css';
 
@@ -435,12 +436,12 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       setPendingDecisions([]);
     }
   }
-  const decide = async (decision: DecisionRequiredPayload, choice: DecisionChoice, usageTokens?: number) => {
+  const decide = async (decision: DecisionRequiredPayload, choice: DecisionChoice, usageTokens?: number, additionalElapsedMs = 0) => {
     if (!run || deciding.current) return;
     const body: Omit<DecisionBody, 'idempotency_key'> = { decision_id: decision.decision_id, expected_revision: run.revision, choice };
     if (choice === 'extend') {
-      if ((decision.required_tokens ?? 0) > 0) body.add_tokens = decision.required_tokens!;
-      if ((decision.required_elapsed_ms ?? 0) > 0) body.add_elapsed_ms = decision.required_elapsed_ms!;
+      body.add_tokens = decision.required_tokens ?? 0;
+      body.add_elapsed_ms = (decision.required_elapsed_ms ?? 0) + additionalElapsedMs;
     }
     if (choice === 'confirm_usage') body.usage_tokens = usageTokens;
     const signature = JSON.stringify(body);
@@ -548,12 +549,12 @@ function ChatSession({ pollMs }: { pollMs: number }) {
         <span className="empty-conversation-mark" aria-hidden="true">◈</span><h2 id="empty-conversation-title">{text(language, 'Start with a question you want to explore', 'เริ่มจากคำถามที่อยากค้นต่อ')}</h2>
         <p>{text(language, 'Add project files, then review the plan before any research run begins.', 'เพิ่มไฟล์ของโปรเจกต์ แล้วตรวจทานแผนก่อนเริ่มงานวิจัย')}</p>
         <button type="button" className="button button-quiet" onClick={() => { setQuestion(text(language, 'Find research on how temperature affects molecular diffusion.', 'ช่วยค้นงานวิจัยเรื่องอุณหภูมิที่มีผลต่อการแพร่ของโมเลกุล')); questionInput.current?.focus(); }}>{text(language, 'Try a sample question', 'ลองคำถามตัวอย่าง')}</button>
-      </div> : <ol className="notebook-messages">{messages.map((m) => <li key={m.id} className={`notebook-message ${m.role === 'assistant' ? 'assistant' : 'owner'}`}><strong>{m.role === 'assistant' ? text(language, 'Assistant', 'ผู้ช่วย') : text(language, 'You', 'คุณ')}:</strong> <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span></li>)}</ol>}
+      </div> : <ol className="notebook-messages">{messages.map((m) => <li key={m.id} className={`notebook-message ${m.role === 'assistant' ? 'assistant' : 'owner'}`}><strong>{m.role === 'assistant' ? text(language, 'Assistant', 'ผู้ช่วย') : text(language, 'You', 'คุณ')}:</strong> {m.role === 'assistant' ? <Markdown source={m.content} language={language} /> : <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span>}</li>)}</ol>}
       <div className="chat-turn-feed">
     {runSelectionError && <p role="alert">{text(language, 'The requested run is unavailable in this project and conversation.', 'ไม่พบการทำงานที่ร้องขอในโครงการและบทสนทนานี้')}</p>}
     {planError !== null && <p role="alert">{apiErrorMessage(planError, language)}</p>}
     {error && run?.state === 'awaiting_approval' && <p role="alert">{error}</p>}
-    {run && <RunProgress run={run} events={events} pendingDecisions={pendingDecisions} connected={connected} onStop={() => void stop()} stopPending={stopPending} onDecision={(d, choice, usage) => void decide(d, choice, usage)} onRetry={retry} />}
+        {run && <RunProgress run={run} events={events} pendingDecisions={pendingDecisions} connected={connected} onStop={() => void stop()} stopPending={stopPending} onDecision={(d, choice, usage, headroomMs) => void decide(d, choice, usage, headroomMs)} onRetry={retry} />}
     {run?.state === 'awaiting_approval' && pendingPreparation?.runId === run.run_id && !plan && <section ref={prepareRecoveryRef} tabIndex={-1} className="chat-prepare-recovery" aria-label={text(language, 'Plan preparation recovery', 'กู้คืนการเตรียมแผน')}>
       <p>{text(language, 'This run is waiting for your approval. Prepare the saved plan inputs to review it.', 'งานนี้กำลังรอการอนุมัติ เตรียมข้อมูลแผนที่บันทึกไว้เพื่อตรวจทาน')}</p>
       <button type="button" className="button button-primary" disabled={preparingPlan || approving} onClick={() => void prepareCurrentPlan()}>{preparingPlan ? text(language, 'Preparing plan…', 'กำลังเตรียมแผน…') : text(language, 'Prepare plan', 'เตรียมแผน')}</button>
