@@ -8,6 +8,7 @@ test.setTimeout(20000);
 const SETUP_URL = `/projects/${PROJECT_ID}/research-setup?session=${SESSION_ID}&run=${NEW_RUN_ID}`;
 const PROFILE = { profile_id: 'reviewed-cpu', version: '1', manifest_sha256: 'b'.repeat(64), label: 'Scientific calculations', purpose: 'Analyze the selected measurements.', state: 'missing' as const, memory_limit_bytes: 1073741824, workspace_limit_bytes: 536870912 };
 const JOB_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const RETRY_JOB_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const job = (patch: Partial<PreparationJobView> = {}): PreparationJobView => ({ id: JOB_ID, project_id: PROJECT_ID, profile_id: PROFILE.profile_id, version: PROFILE.version, manifest_sha256: PROFILE.manifest_sha256, state: 'checking', stage: 'security', evidence_verified: false, ...patch });
 
 for (const workflow of ['literature', 'resources'] as const) {
@@ -76,9 +77,9 @@ test('scientific approval requires the current verified binding on the final rea
   expect(fixture.writes.filter((write) => write.path.endsWith('/approve'))).toHaveLength(0);
 });
 
-async function setupApi(page: Page, options: { lostFirst?: boolean; unverifiedReady?: boolean; ownerReadyWithoutProjectJob?: boolean } = {}) {
+async function setupApi(page: Page, options: { lostFirst?: boolean; unverifiedReady?: boolean; ownerReadyWithoutProjectJob?: boolean; initialJob?: PreparationJobView; retryJob?: PreparationJobView } = {}) {
   const fixture = await installResearchFixtureRoutes(page, { run: makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] }) });
-  let jobs: PreparationJobView[] = options.unverifiedReady ? [job({ state: 'ready', stage: 'complete' })] : [];
+  let jobs: PreparationJobView[] = options.initialJob ? [options.initialJob] : options.unverifiedReady ? [job({ state: 'ready', stage: 'complete' })] : [];
   let revision = 1;
   let readinessState: RunReadinessView['state'] = 'missing';
   let readinessFailure = false;
@@ -92,16 +93,22 @@ async function setupApi(page: Page, options: { lostFirst?: boolean; unverifiedRe
     if (method === 'GET' && path === '/capabilities') return json({ file_types: ['text/csv'], max_upload_bytes: 1000000, protocols: {} });
     if (method === 'GET') reads.push(path);
     if (method === 'GET' && path === `/projects/${PROJECT_ID}/research-setup`) {
-      const view: ResearchSetupView = { project_id: PROJECT_ID, requirements: [{ id: 'environment', label: 'Calculation environment', purpose: 'Use the reviewed calculation environment.', state: readinessState, action: 'prepare_environment' }], profiles: [{ ...PROFILE, state: jobs.length ? 'preparing' : options.ownerReadyWithoutProjectJob ? 'ready' : 'missing' }], connections: [{ id: '12121212-1212-4212-8212-121212121212', label: 'Configured research connection', provider: 'https://provider.example', model: 'fixture-model', state: 'ready', has_secret: true }], preparations: jobs };
+      const profileState = jobs[0]?.state === 'failed' ? 'failed' : jobs.length ? 'preparing' : options.ownerReadyWithoutProjectJob ? 'ready' : 'missing';
+      const view: ResearchSetupView = { project_id: PROJECT_ID, requirements: [{ id: 'environment', label: 'Calculation environment', purpose: 'Use the reviewed calculation environment.', state: readinessState, action: 'prepare_environment' }], profiles: [{ ...PROFILE, state: profileState }], connections: [{ id: '12121212-1212-4212-8212-121212121212', label: 'Configured research connection', provider: 'https://provider.example', model: 'fixture-model', state: 'ready', has_secret: true }], preparations: jobs };
       return json(view);
     }
     if (method === 'POST' && path === `/projects/${PROJECT_ID}/preparations`) {
       submissions.push(route.request().postDataJSON());
       if (options.lostFirst && submissions.length === 1) return route.abort('failed');
-      jobs = [options.ownerReadyWithoutProjectJob ? job({ state: 'ready', stage: 'complete', evidence_verified: true }) : job()];
+      jobs = [options.retryJob ?? (options.ownerReadyWithoutProjectJob ? job({ state: 'ready', stage: 'complete', evidence_verified: true }) : job())];
       return json(jobs[0], 202);
     }
-    if (method === 'GET' && path === `/projects/${PROJECT_ID}/preparations/${JOB_ID}`) return json(jobs[0]);
+    const preparationPrefix = `/projects/${PROJECT_ID}/preparations/`;
+    if (method === 'GET' && path.startsWith(preparationPrefix)) {
+      const requestedJobId = path.slice(preparationPrefix.length);
+      const existingJob = jobs.find((existing) => existing.id === requestedJobId);
+      if (existingJob) return json(existingJob);
+    }
     if (method === 'GET' && path === `/runs/${NEW_RUN_ID}/readiness`) {
       if (readinessFailure) return json({ code: 'storage_unavailable', request_id: 'setup-test' }, 503);
       return json({ run_id: NEW_RUN_ID, revision: staleReadiness ? revision - 1 : revision, plan_digest: makePlan(staleReadiness ? revision - 1 : revision).plan_digest, state: readinessState, binding_sha256: 'c'.repeat(64), requirements: [] });
@@ -314,6 +321,65 @@ test('lost preparation response reuses one UUID after refresh without automatic 
   expect(api.submissions).toHaveLength(2);
   expect(api.submissions[0]).toEqual(api.submissions[1]);
   expect(api.submissions[0]).toEqual({ profile_id: PROFILE.profile_id, version: PROFILE.version, manifest_sha256: PROFILE.manifest_sha256, request_id: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/) });
+});
+
+test('a known failed preparation can be retried with a fresh request identity', async ({ page }) => {
+  const previousRequestId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const api = await setupApi(page, {
+    initialJob: job({ state: 'failed', error_code: 'image_build_failed' }),
+    retryJob: job({ id: RETRY_JOB_ID }),
+  });
+  await page.addInitScript(({ key, requestId }) => { if (!sessionStorage.getItem(key)) sessionStorage.setItem(key, requestId); }, {
+    key: `research-preparation-v1:${PROJECT_ID}:${JSON.stringify([PROFILE.profile_id, PROFILE.version, PROFILE.manifest_sha256])}`,
+    requestId: previousRequestId,
+  });
+  await page.goto(SETUP_URL);
+  await expect(page.getByText('Security checks', { exact: true })).toBeVisible();
+  await expect(page.getByRole('alert')).toBeVisible();
+  await page.getByRole('button', { name: 'Retry failed preparation' }).click();
+  await expect.poll(() => api.submissions.length).toBe(1);
+  expect(api.submissions[0].request_id).not.toBe(previousRequestId);
+  expect(api.submissions[0].request_id).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+  await page.reload();
+  await expect(page.getByText('Security checks', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Retry failed preparation' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Check preparation request' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Prepare environment' })).toHaveCount(0);
+  expect(api.submissions).toHaveLength(1);
+});
+
+test('an unknown preparation cannot start a new request', async ({ page }) => {
+  const api = await setupApi(page, { initialJob: job({ state: 'unknown' }) });
+  await page.goto(SETUP_URL);
+  await expect(page.getByText(/Preparation outcome is unknown/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Retry failed preparation' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Prepare environment' })).toHaveCount(0);
+  expect(api.submissions).toHaveLength(0);
+});
+
+test('an uncertain retry of a failed preparation keeps its request identity after refresh', async ({ page }) => {
+  const previousRequestId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const api = await setupApi(page, {
+    lostFirst: true,
+    initialJob: job({ state: 'failed', error_code: 'image_build_failed' }),
+    retryJob: job({ id: RETRY_JOB_ID }),
+  });
+  await page.addInitScript(({ key, requestId }) => { if (!sessionStorage.getItem(key)) sessionStorage.setItem(key, requestId); }, {
+    key: `research-preparation-v1:${PROJECT_ID}:${JSON.stringify([PROFILE.profile_id, PROFILE.version, PROFILE.manifest_sha256])}`,
+    requestId: previousRequestId,
+  });
+  await page.goto(SETUP_URL);
+  await page.getByRole('button', { name: 'Retry failed preparation' }).click();
+  await expect(page.getByText(/could not confirm whether preparation started/)).toBeVisible();
+  await expect.poll(() => api.submissions.length).toBe(1);
+  const uncertainRequestId = api.submissions[0].request_id;
+  expect(uncertainRequestId).not.toBe(previousRequestId);
+
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Check preparation request' })).toBeVisible();
+  await page.getByRole('button', { name: 'Check preparation request' }).click();
+  await expect.poll(() => api.submissions.length).toBe(2);
+  expect(api.submissions[1].request_id).toBe(uncertainRequestId);
 });
 
 test('GET polling only shows ready after verified complete evidence and survives refresh', async ({ page }) => {

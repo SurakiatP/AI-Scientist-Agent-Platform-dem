@@ -19,6 +19,18 @@ const matches = (job: PreparationJobView, profile: ResearchProfileView, projectI
 const verified = (job?: PreparationJobView) => job?.state === 'ready' && job.stage === 'complete' && job.evidence_verified === true;
 const active = (job: PreparationJobView) => ['queued', 'building', 'checking'].includes(job.state);
 const attemptKey = (project: string, profile: ResearchProfileView) => `research-preparation-v1:${project}:${JSON.stringify([profile.profile_id, profile.version, profile.manifest_sha256])}`;
+const retryAttemptKey = (key: string) => `${key}:retry`;
+type RetryAttempt = { requestId: string; priorJobIds: string[] };
+function readRetryAttempt(key: string): RetryAttempt | 'invalid' | null {
+  try {
+    const raw = sessionStorage.getItem(retryAttemptKey(key));
+    if (raw === null) return null;
+    const value = JSON.parse(raw) as Partial<RetryAttempt>;
+    return typeof value.requestId === 'string' && UUID.test(value.requestId) && Array.isArray(value.priorJobIds) && value.priorJobIds.every((id) => typeof id === 'string' && UUID.test(id))
+      ? { requestId: value.requestId, priorJobIds: value.priorJobIds }
+      : 'invalid';
+  } catch { return 'invalid'; }
+}
 function readAttempt(key: string): string | null {
   try { const value = sessionStorage.getItem(key); return value && UUID.test(value) ? value : null; } catch { return null; }
 }
@@ -52,7 +64,18 @@ export default function ResearchSetup() {
       if (controller.signal.aborted || currentEpoch !== epoch.current) return;
       if (next.project_id !== projectId || !Array.isArray(next.requirements) || !Array.isArray(next.profiles) || !Array.isArray(next.connections) || !Array.isArray(next.preparations) || next.profiles.some((profile) => !validProfile(profile))) throw new ApiError('invalid_response', 502, '');
       setView(next);
-      setUncertain(Object.fromEntries(next.profiles.map((profile) => [profile.profile_id, !!readAttempt(attemptKey(projectId, profile)) && !next.preparations.some((job) => matches(job, profile, projectId))])));
+      setUncertain(Object.fromEntries(next.profiles.map((profile) => {
+        const key = attemptKey(projectId, profile);
+        const retry = readRetryAttempt(key);
+        const jobs = next.preparations.filter((job) => matches(job, profile, projectId));
+        if (retry === 'invalid') return [profile.profile_id, true];
+        if (retry) {
+          const reconciled = jobs.some((job) => !retry.priorJobIds.includes(job.id));
+          if (reconciled) sessionStorage.removeItem(retryAttemptKey(key));
+          else return [profile.profile_id, true];
+        }
+        return [profile.profile_id, !!readAttempt(key) && jobs.length === 0];
+      })));
     }).catch((reason) => { if (!controller.signal.aborted && currentEpoch === epoch.current) setError(reason); });
     return () => controller.abort();
   }, [projectId, refresh]);
@@ -86,18 +109,31 @@ export default function ResearchSetup() {
 
   async function prepare(profile: ResearchProfileView) {
     if (busyRef.current || !view || !validProfile(profile)) return;
+    const key = attemptKey(projectId, profile);
+    const previousJob = view.preparations.find((job) => matches(job, profile, projectId));
+    const explicitFailedRetry = previousJob?.state === 'failed' && !uncertain[profile.profile_id];
+    const existingRequestId = readAttempt(key);
+    if (previousJob?.state === 'failed' && uncertain[profile.profile_id] && !existingRequestId) {
+      setError(new Error(tx('The retry request identity is unavailable. Refresh and reconcile its status before trying again.', 'ไม่มีรหัสคำขอลองใหม่ โปรดรีเฟรชและตรวจสอบสถานะก่อนดำเนินการอีกครั้ง')));
+      return;
+    }
+    const requestId = explicitFailedRetry ? newRequestId() : existingRequestId ?? newRequestId();
     busyRef.current = true; setBusy(profile.profile_id); setError(null);
     const currentEpoch = epoch.current;
-    const key = attemptKey(projectId, profile);
-    const requestId = readAttempt(key) ?? newRequestId();
     try {
       sessionStorage.setItem(key, requestId);
+      if (explicitFailedRetry && previousJob) {
+        const priorJobIds = view.preparations.filter((job) => matches(job, profile, projectId)).map((job) => job.id);
+        sessionStorage.setItem(retryAttemptKey(key), JSON.stringify({ requestId, priorJobIds } satisfies RetryAttempt));
+      }
       const body: PreparationSubmit = { profile_id: profile.profile_id, version: profile.version, manifest_sha256: profile.manifest_sha256, request_id: requestId };
       const next = await request<PreparationJobView>(`/api/v1/projects/${encodeURIComponent(projectId)}/preparations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!matches(next, profile, projectId)) throw new ApiError('invalid_response', 502, '');
       if (mounted.current && currentEpoch === epoch.current) {
         setView((current) => current && ({ ...current, preparations: [next, ...current.preparations.filter((job) => job.profile_id !== profile.profile_id)] }));
         setUncertain((current) => ({ ...current, [profile.profile_id]: false }));
+        const retry = readRetryAttempt(key);
+        if (retry !== null && retry !== 'invalid' && retry.requestId === requestId) sessionStorage.removeItem(retryAttemptKey(key));
       }
     } catch (reason) {
       if (mounted.current && currentEpoch === epoch.current) {
@@ -127,7 +163,7 @@ function SetupContents({ view, projectId, language, settingsPath, uncertain, bus
       return <article className="setup-profile" key={`${profile.profile_id}:${profile.version}:${profile.manifest_sha256}`}><h3>{profile.label}</h3><p>{profile.purpose}</p><dl><dt>{tx('Version', 'รุ่น')}</dt><dd>{profile.version}</dd><dt>{tx('Memory limit', 'ขีดจำกัดหน่วยความจำ')}</dt><dd>{Math.ceil(profile.memory_limit_bytes / 1048576)} MB</dd><dt>{tx('Workspace limit', 'ขีดจำกัดพื้นที่ทำงาน')}</dt><dd>{Math.ceil(profile.workspace_limit_bytes / 1048576)} MB</dd></dl>
         {job ? <><p role="status">{isReady ? tx('Environment ready', 'สภาพแวดล้อมพร้อมใช้งาน') : stages[job.stage][language === 'th' ? 1 : 0]}</p>{job.state === 'ready' && !isReady && <p role="alert">{tx('Preparation evidence is not verified.', 'ยังไม่มีหลักฐานยืนยันการเตรียมที่ตรวจสอบแล้ว')}</p>}{job.state === 'blocked' && <p>{tx('Preparation is blocked. Resolve the requirement before continuing.', 'การเตรียมติดข้อจำกัด โปรดดำเนินการตามข้อกำหนดก่อน')}</p>}{job.state === 'failed' && <p role="alert">{job.error_code ? apiCodeLabel(job.error_code, language) : tx('Preparation failed.', 'เตรียมไม่สำเร็จ')}</p>}{job.state === 'unknown' && <p role="alert">{tx('Preparation outcome is unknown. Check its recorded status before starting anything else.', 'ไม่ทราบผลการเตรียม โปรดตรวจสอบสถานะที่บันทึกไว้ก่อนเริ่มสิ่งอื่น')}</p>}{jobErrors[job.id] !== undefined && jobErrors[job.id] !== null && <p role="alert">{apiErrorMessage(jobErrors[job.id], language)}</p>}</> : <p>{profile.state === 'ready' ? tx('Preparation evidence is not verified.', 'ยังไม่มีหลักฐานยืนยันการเตรียมที่ตรวจสอบแล้ว') : states[profile.state][language === 'th' ? 1 : 0]}</p>}
         {profile.reason && <p>{profile.reason}</p>}
-        {!job && ['missing', 'failed', 'ready'].includes(profile.state) && <button type="button" className="button button-primary" disabled={busy !== null} onClick={() => void prepare(profile)}>{busy === profile.profile_id ? tx('Submitting…', 'กำลังส่งคำขอ…') : uncertain[profile.profile_id] ? tx('Check preparation request', 'ตรวจสอบคำขอเตรียม') : tx('Prepare environment', 'เตรียมสภาพแวดล้อม')}</button>}
+        {((!job && ['missing', 'failed', 'ready'].includes(profile.state)) || job?.state === 'failed') && <button type="button" className="button button-primary" disabled={busy !== null} onClick={() => void prepare(profile)}>{busy === profile.profile_id ? tx('Submitting…', 'กำลังส่งคำขอ…') : uncertain[profile.profile_id] ? tx('Check preparation request', 'ตรวจสอบคำขอเตรียม') : job?.state === 'failed' ? tx('Retry failed preparation', 'ลองเตรียมอีกครั้ง') : tx('Prepare environment', 'เตรียมสภาพแวดล้อม')}</button>}
       </article>;
     })}</section>
     <section className="setup-panel" aria-label={tx('Configured connections', 'การเชื่อมต่อที่ตั้งค่าแล้ว')}><h2>{tx('Configured connections', 'การเชื่อมต่อที่ตั้งค่าแล้ว')}</h2>{view.connections.length === 0 ? <p>{tx('No connection is configured.', 'ยังไม่ได้ตั้งค่าการเชื่อมต่อ')}</p> : <ul>{view.connections.map((connection) => <li key={connection.id}><strong>{connection.label}</strong><p>{connection.model} · {connection.provider}</p><p>{connection.state === 'ready' ? tx('Configured; verification not run', 'ตั้งค่าแล้ว; ยังไม่ได้ตรวจสอบ') : connection.state === 'invalid_credentials' ? tx('Stored credential cannot be decrypted.', 'ไม่สามารถถอดรหัสข้อมูลรับรองที่บันทึกไว้') : tx('Connection unavailable.', 'การเชื่อมต่อไม่พร้อมใช้งาน')}</p></li>)}</ul>}</section>
