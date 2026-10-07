@@ -289,15 +289,18 @@ def _check_v2_receipts(rows) -> None:
          "W2 V2 receipt is not bound to the committed tool checkpoint")
 
 
-def _output_snapshot(h, expected_titles: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+def _output_snapshot(
+    h, expected_titles: tuple[str, ...], *, expect_partial: bool = False
+) -> dict[str, dict[str, Any]]:
     rows = h.q("""
         SELECT id, title, object_key, sha256, size, partial
         FROM artifacts WHERE run_id=:run ORDER BY title
     """)
     need({row["title"] for row in rows} == set(expected_titles) and len(rows) == len(expected_titles),
          "run artifact set differs from acceptance contract")
-    need(all(not row["partial"] and len(row["sha256"].strip()) == 64 and row["size"] > 0 for row in rows),
-         "run contains partial or unhashed scientific output")
+    need(all(row["partial"] is expect_partial
+             and len(row["sha256"].strip()) == 64 and row["size"] > 0 for row in rows),
+         "run output completion state, hash, or size differs from acceptance contract")
     return {row["title"]: {**row, "sha256": row["sha256"].strip()} for row in rows}
 
 
@@ -376,7 +379,7 @@ def _run_recovery() -> None:
         receipts = wait_for(lambda: rows if len(rows := _receipts_at_tool_checkpoint(h, text)) == 4 else None,
                             "four V2 output receipts were not committed at tool_committed", 30)
         _check_v2_receipts(receipts)
-        before = _output_snapshot(h, OUTPUTS)
+        before = _output_snapshot(h, OUTPUTS, expect_partial=True)
         before_hashes = {title: row["sha256"] for title, row in before.items()}
         phase = "kill_and_restart"
         host.proc.kill()

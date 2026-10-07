@@ -43,3 +43,39 @@ def test_v2_outputs_share_one_receipt_digest_and_reject_divergence() -> None:
     blank[2]["receipt_sha256"] = "  "
     with pytest.raises(_RECOVERY.AcceptanceError, match="receipt"):
         _RECOVERY._check_v2_receipts(blank)
+
+
+def test_output_snapshot_requires_the_expected_partial_state_and_integrity() -> None:
+    titles = _RECOVERY.OUTPUTS
+    rows = [
+        {
+            "id": f"artifact-{index}",
+            "title": title,
+            "object_key": f"objects/{index}",
+            "sha256": "a" * 64,
+            "size": index + 1,
+            "partial": True,
+        }
+        for index, title in enumerate(titles)
+    ]
+
+    class _Handle:
+        def q(self, _query):
+            return rows
+
+    handle = _Handle()
+    partial_snapshot = _RECOVERY._output_snapshot(handle, titles, expect_partial=True)
+    assert len(partial_snapshot) == 4
+    with pytest.raises(_RECOVERY.AcceptanceError):
+        _RECOVERY._output_snapshot(handle, titles)
+
+    complete_rows = [{**row, "partial": False} for row in rows]
+    handle.q = lambda _query: complete_rows
+    assert len(_RECOVERY._output_snapshot(handle, titles)) == 4
+    with pytest.raises(_RECOVERY.AcceptanceError):
+        _RECOVERY._output_snapshot(handle, titles, expect_partial=True)
+
+    unhashed_rows = [{**row, "sha256": ""} for row in rows]
+    handle.q = lambda _query: unhashed_rows
+    with pytest.raises(_RECOVERY.AcceptanceError):
+        _RECOVERY._output_snapshot(handle, titles, expect_partial=True)
