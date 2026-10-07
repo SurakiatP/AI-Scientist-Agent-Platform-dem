@@ -319,13 +319,13 @@ test('composer rejects empty questions and unconfigured models with next actions
   await page.getByLabel('Research question').fill('Q');
   await page.getByRole('button', { name: 'Review plan' }).click();
   await expect(page.getByRole('alert')).toContainText('No model is ready');
-  await expect(page.getByRole('link', { name: 'Open Settings' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Configure model' })).toBeVisible();
   expect(fixture.writes.filter((w) => w.path.endsWith('/runs'))).toHaveLength(0);
 });
 
 test('shared files are selected only when ready and removal from the question deletes nothing', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: null });
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.locator('#library-upload').setInputFiles({ name: 'uploaded.csv', mimeType: 'text/csv', buffer: Buffer.from('a,b\n') });
   await expect(page.getByText('uploaded.csv')).toBeVisible();
   await page.goto(SESSION_URL);
@@ -383,7 +383,7 @@ test('messages and files still load when the connections route is missing', asyn
   await expect(page.getByText('Original question about diffusion')).toBeVisible();
   await expect(page.getByText('example.csv · Ready')).toBeVisible();
   await expect(page.getByText('Settings unavailable.')).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Open Settings' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Configure model' })).toBeVisible();
 });
 
 test('event paging drains every page after the run is terminal and never fetches the SSE route', async ({ page }) => {

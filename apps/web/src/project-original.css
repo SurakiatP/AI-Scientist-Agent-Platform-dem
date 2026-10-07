@@ -1,0 +1,116 @@
+.project-original,
+.workspace-placeholder.project-original {
+  --project-soft: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  max-width: 1100px;
+  min-height: 70vh;
+  margin-inline: auto;
+  padding: 32px;
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+.project-page-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 30px;
+}
+
+.project-page-heading h1,
+.project-detail-heading h1 {
+  margin: 0;
+  font-size: 27px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.project-page-heading p:last-child,
+.project-detail-intro { margin: 5px 0 0; color: var(--muted); }
+.project-page-heading .button { flex: none; }
+.project-eyebrow { margin: 0 0 5px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .09em; line-height: 1.7; }
+.project-original .button { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 7px 14px; border: 1px solid var(--line); border-radius: 7px; font: inherit; font-size: 13px; line-height: 1.5; text-decoration: none; cursor: pointer; }
+.project-original .button-primary { border-color: var(--accent); }
+.project-original .button-quiet { color: var(--ink); background: var(--surface); }
+.project-panel { min-width: 0; padding: 23px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); }
+.first-use-panel { max-width: 760px; margin: 44px auto 0; padding: 32px; }
+.first-use-panel h2 { margin: 0; font-size: 21px; font-weight: 600; line-height: 1.55; }
+.first-use-panel > p:not(.project-eyebrow) { margin: 5px 0 22px; color: var(--muted); }
+.setup-steps { border-top: 1px solid var(--line); }
+.setup-step { display: grid; grid-template-columns: 46px minmax(0, 1fr); gap: 16px; padding: 20px 0; }
+.setup-step + .setup-step { border-top: 1px solid var(--line); }
+.setup-step h3 { margin: 0; font-size: 16px; font-weight: 600; }
+.setup-step p { margin: 2px 0 11px; color: var(--muted); font-size: 13px; }
+.step-number { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 10px; color: var(--accent); background: var(--project-soft); font: 500 14px/1 var(--mono); }
+.project-summary-strip { display: flex; flex-wrap: wrap; gap: 40px; margin: 0 0 26px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+.project-summary-strip > div { display: flex; align-items: baseline; gap: 9px; color: var(--muted); font-size: 12px; }
+.project-summary-strip strong { color: var(--ink); font: 500 24px/1.4 var(--mono); }
+.project-card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.project-card { display: flex; flex-direction: column; }
+.project-card-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
+.project-icon { display: grid; width: 40px; height: 40px; place-items: center; border-radius: 11px; color: var(--accent); background: var(--project-soft); font-size: 23px; }
+.project-pill { padding: 3px 8px; border-radius: 5px; color: var(--accent); background: var(--project-soft); font-size: 11px; }
+.project-card h2 { margin: 0 0 5px; font-size: 18px; font-weight: 600; line-height: 1.6; overflow-wrap: anywhere; }
+.project-card-title-link { color: inherit; text-decoration: none; }
+.project-card-summary { display: -webkit-box; min-height: 52px; margin: 0; overflow: hidden; color: var(--muted); font-size: 13px; white-space: pre-wrap; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.project-card-meta { margin: 17px 0 14px; padding-top: 11px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.project-card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; }
+.continue-project { margin-top: 22px; }
+.continue-project h2 { margin: 0 0 12px; font-size: 18px; font-weight: 600; }
+.resume-project-row { display: flex; align-items: center; gap: 12px; padding: 13px; border-radius: 8px; color: var(--ink); background: var(--canvas); text-decoration: none; }
+.resume-project-row > span:first-child { color: var(--accent); font-size: 23px; }
+.resume-project-row > span:nth-child(2) { display: grid; min-width: 0; }
+.resume-project-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
+.resume-project-row small { color: var(--muted); font: 11px/1.7 var(--mono); }
+.resume-project-row > span:last-child { margin-left: auto; }
+.project-error { color: var(--ink); }
+.project-dialog { width: min(520px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px); margin: auto; padding: 26px; border: 1px solid var(--line); border-radius: 12px; color: var(--ink); background: var(--surface); }
+.project-dialog::backdrop { background: rgb(16 30 39 / 42%); }
+.project-dialog h2 { margin: 0 0 17px; font-size: 21px; line-height: 1.5; }
+.project-dialog form { display: grid; gap: 9px; }
+.project-dialog label, .project-session-form label, .project-instructions-form label { color: var(--ink); font-size: 13px; font-weight: 500; }
+.project-dialog input, .project-session-form input, .project-instructions-form textarea { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: var(--canvas); font: inherit; }
+.project-field-note { margin: 0; color: var(--muted); font-size: 12px; }
+.project-dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 9px; }
+.project-detail-page { max-width: 1120px; }
+.project-detail-heading { margin-bottom: 9px; }
+.project-detail-intro { margin-bottom: 15px; }
+.project-detail-nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 20px; }
+.project-detail-nav a, .detail-text-link { color: var(--accent); font-size: 13px; text-decoration: none; }
+.project-detail-nav a { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.project-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.detail-panel h2 { margin: 0 0 10px; font-size: 18px; font-weight: 600; line-height: 1.6; }
+.detail-panel > p:not(.project-eyebrow) { color: var(--muted); font-size: 13px; }
+.detail-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.detail-panel-heading h2 { margin-bottom: 10px; }
+.project-item-list { margin: 0 0 15px; padding: 0; list-style: none; }
+.project-item-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.project-item-list li a { min-width: 0; overflow-wrap: anywhere; color: var(--accent); text-decoration: none; }
+.project-item-list li span { flex: none; color: var(--muted); font-size: 11px; }
+.project-session-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; margin-top: 17px; }
+.project-session-form label { grid-column: 1 / -1; }
+.project-session-form .button { white-space: nowrap; }
+.project-instructions-form { display: flex; flex-direction: column; align-items: flex-start; gap: 9px; }
+.project-instructions-form textarea { resize: vertical; }
+.saved-finding { padding-top: 14px; border-top: 1px solid var(--line); }
+.saved-finding > p { font-size: 13px; overflow-wrap: anywhere; }
+.saved-finding a { color: var(--accent); }
+.saved-finding ul { padding-left: 20px; font-size: 12px; }
+.saved-finding .button { margin-bottom: 10px; }
+
+@media (max-width: 760px) {
+  .project-original { padding: 24px 20px; }
+  .project-page-heading { flex-direction: column; gap: 14px; }
+  .project-card-grid, .project-detail-grid { grid-template-columns: minmax(0, 1fr); }
+  .first-use-panel { margin-top: 24px; padding: 22px; }
+  .project-summary-strip { gap: 20px; }
+}
+
+@media (max-width: 420px) {
+  .project-original { padding: 20px 14px; }
+  .project-page-heading h1, .project-detail-heading h1 { font-size: 24px; }
+  .project-session-form { grid-template-columns: minmax(0, 1fr); }
+  .project-session-form label { grid-column: auto; }
+  .project-session-form .button { justify-self: start; }
+}

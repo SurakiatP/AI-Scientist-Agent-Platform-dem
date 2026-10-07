@@ -131,7 +131,7 @@ test('settings saves masked credentials, keeps peer grants scoped, and never off
   });
   await page.goto('/settings');
 
-  await expect(page.getByRole('heading', { name: 'Settings', level: 1 })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Configure your research workspace', level: 1 })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Connections' })).toBeVisible();
   await page.getByLabel('Configured provider ID').fill(PROVIDER_ID);
   await page.getByLabel('Connection name').fill('Literature model');
@@ -285,5 +285,5 @@ test('settings text follows the shell language preference', async ({ page }) => 
   await expect(page.getByRole('heading', { name: 'ตั้งค่า', level: 1 })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'การเชื่อมต่อ', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'EN' }).click();
-  await expect(page.getByRole('heading', { name: 'Settings', level: 1 })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Configure your research workspace', level: 1 })).toBeVisible();
 });

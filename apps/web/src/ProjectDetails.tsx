@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import type { CitationView, FileView, FindingView, ProjectView, RunView, SessionView } from '../../../contracts/api-types';
 import { ApiError, apiErrorMessage, refreshOwnerSession, request } from './api';
 import { useAppPreferences } from './App';
+import './project-original.css';
 
 const text = (language: 'th' | 'en', en: string, th: string) => language === 'th' ? th : en;
 type LoadState = 'loading' | 'ready' | 'error';
@@ -108,25 +109,33 @@ export function ProjectDetails() {
   if (!project) return null;
 
   const citationById = new Map(citations.map((citation) => [citation.id, citation]));
-  return <Page title={project.name}>
-    <p>{text(language, 'Sessions, files, and saved findings are shared across this project. Each session keeps its own conversation history.', 'เซสชัน ไฟล์ และข้อค้นพบที่บันทึกไว้จะแชร์ภายในโครงการนี้ แต่ละเซสชันมีประวัติการสนทนาแยกกัน')}</p>
-    <nav aria-label={text(language, 'Project workspace', 'พื้นที่ทำงานโครงการ')} style={{ display: 'flex', flexWrap: 'wrap', gap: 16, marginBlock: 20 }}>
+  const latestSession = sessions[0];
+  return <Page title={project.name} eyebrow="YOUR RESEARCH SPACE" className="project-detail-page">
+    <p className="project-detail-intro">{text(language, 'Sessions, files, and saved findings are shared across this project. Each session keeps its own conversation history.', 'เซสชัน ไฟล์ และข้อค้นพบที่บันทึกไว้จะแชร์ภายในโครงการนี้ แต่ละเซสชันมีประวัติการสนทนาแยกกัน')}</p>
+    <nav className="project-detail-nav" aria-label={text(language, 'Project workspace', 'พื้นที่ทำงานโครงการ')}>
+      <Link to="/projects">{text(language, 'All projects', 'ทุกโปรเจกต์')}</Link>
       <Link to={`/projects/${projectId}/library`}>{text(language, 'Sources & outputs', 'แหล่งข้อมูลและผลงาน')}</Link>
       <Link to={`/projects/${projectId}/runs`}>{text(language, 'Run history', 'ประวัติการทำงาน')}</Link>
     </nav>
     {error && <p role="alert">{error} {csrfRecovery && <button type="button" disabled={refreshingSession} onClick={() => void refreshSession()}>{refreshingSession ? text(language, 'Refreshing…', 'กำลังต่ออายุ…') : text(language, 'Refresh session', 'ต่ออายุเซสชัน')}</button>}</p>}
-    <section aria-labelledby="sessions-title"><h2 id="sessions-title">{text(language, 'Sessions', 'เซสชัน')}</h2>
-      {sessions.length === 0 ? <p>{text(language, 'No sessions yet. Create one to begin a separate conversation.', 'ยังไม่มีเซสชัน สร้างเซสชันเพื่อเริ่มการสนทนาใหม่')}</p> : <ul>{sessions.map((session) => <li key={session.id}><Link to={`/projects/${projectId}/sessions/${session.id}`}>{session.title}</Link></li>)}</ul>}
-      <form onSubmit={createSession} style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBlock: 16 }}>
+    <div className="project-detail-grid">
+    <section className="project-panel detail-panel" aria-labelledby="sessions-title"><div className="detail-panel-heading"><div><p className="project-eyebrow">PROJECT SESSIONS</p><h2 id="sessions-title">{text(language, 'Sessions', 'เซสชัน')}</h2></div>{latestSession && <Link className="button button-primary" to={`/projects/${projectId}/sessions/${latestSession.id}`}>{text(language, 'Continue chat →', 'คุยต่อ →')}</Link>}</div>
+      {sessions.length === 0 ? <p>{text(language, 'No sessions yet. Create one to begin a separate conversation.', 'ยังไม่มีเซสชัน สร้างเซสชันเพื่อเริ่มการสนทนาใหม่')}</p> : <ul className="project-item-list">{sessions.map((session) => <li key={session.id}><Link to={`/projects/${projectId}/sessions/${session.id}`}>{session.title}</Link><span>→</span></li>)}</ul>}
+      <form className="project-session-form" onSubmit={createSession}>
         <label htmlFor="session-title">{text(language, 'New session', 'เซสชันใหม่')}</label><input id="session-title" value={sessionTitle} onChange={(event) => setSessionTitle(event.target.value)} maxLength={200} required />
         <button className="button button-quiet" disabled={busy || !sessionTitle.trim()}>{text(language, 'Create session', 'สร้างเซสชัน')}</button>
       </form>
     </section>
-    <section aria-labelledby="project-files-title"><h2 id="project-files-title">{text(language, 'Shared files', 'ไฟล์ที่แชร์ในโครงการ')}</h2>
-      {files.length === 0 ? <p>{text(language, 'No files have been added.', 'ยังไม่มีไฟล์')}</p> : <ul>{files.map((file) => <li key={file.id}><Link to={`/projects/${projectId}/library#file-${file.id}`}>{file.filename}</Link> · {stateLabel(file.state, language)}</li>)}</ul>}
+    <form className="project-panel detail-panel project-instructions-form" onSubmit={saveInstructions}><p className="project-eyebrow">SHARED GUIDANCE</p><h2>{text(language, 'Project instructions', 'คำแนะนำประจำโปรเจกต์')}</h2>
+      <label htmlFor="project-instructions">{text(language, 'Instructions shared with sessions in this project', 'คำแนะนำที่แชร์กับทุกเซสชันในโปรเจกต์')}</label><textarea id="project-instructions" rows={5} maxLength={100000} value={instructions} onChange={(event) => setInstructions(event.target.value)} />
+      <button className="button button-primary" disabled={busy}>{text(language, 'Save instructions', 'บันทึกคำแนะนำ')}</button>
+    </form>
+    <section className="project-panel detail-panel" aria-labelledby="project-files-title"><p className="project-eyebrow">PROJECT FILES</p><h2 id="project-files-title">{text(language, 'Shared files', 'ไฟล์ที่แชร์ในโครงการ')}</h2>
+      {files.length === 0 ? <p>{text(language, 'No files have been added.', 'ยังไม่มีไฟล์')}</p> : <ul className="project-item-list">{files.map((file) => <li key={file.id}><Link to={`/projects/${projectId}/library#file-${file.id}`}>{file.filename}</Link><span>{stateLabel(file.state, language)}</span></li>)}</ul>}
+      <Link className="detail-text-link" to={`/projects/${projectId}/library`}>{text(language, 'Manage files and outputs →', 'จัดการไฟล์และผลงาน →')}</Link>
     </section>
-    <section aria-labelledby="findings-title"><h2 id="findings-title">{text(language, 'Saved findings', 'ข้อค้นพบที่บันทึกไว้')}</h2>
-      {findings.length === 0 ? <p>{text(language, 'No findings have been saved.', 'ยังไม่มีข้อค้นพบที่บันทึกไว้')}</p> : findings.map((finding) => <article key={finding.id} id={`finding-${finding.id}`} style={{ paddingBlock: 16, borderTop: '1px solid var(--line)' }}>
+    <section className="project-panel detail-panel" aria-labelledby="findings-title"><p className="project-eyebrow">SAVED EVIDENCE</p><h2 id="findings-title">{text(language, 'Saved findings', 'ข้อค้นพบที่บันทึกไว้')}</h2>
+      {findings.length === 0 ? <p>{text(language, 'No findings have been saved.', 'ยังไม่มีข้อค้นพบที่บันทึกไว้')}</p> : findings.map((finding) => <article key={finding.id} id={`finding-${finding.id}`} className="saved-finding">
         <p>{finding.text}</p><p>{text(language, 'Saved from', 'บันทึกจาก')} <Link to={`/projects/${projectId}/sessions/${finding.session_id}`}>{sessions.find((session) => session.id === finding.session_id)?.title ?? finding.session_id}</Link></p>
         {finding.artifact_id && <p>{text(language, 'Report', 'รายงาน')}: <Link to={`/projects/${projectId}/library#artifact-${finding.artifact_id}`}>{runs.flatMap((run) => run.artifacts).find((artifact) => artifact.artifact_id === finding.artifact_id)?.title ?? finding.artifact_id}</Link></p>}
         {finding.citation_ids.length > 0 && <ul aria-label={text(language, 'Finding sources', 'แหล่งที่มาของข้อค้นพบ')}>{finding.citation_ids.map((id) => {
@@ -135,11 +144,8 @@ export function ProjectDetails() {
         })}</ul>}
         <button className="button button-quiet" type="button" aria-label={`${text(language, 'Remove finding', 'นำข้อค้นพบออก')}: ${finding.text}`} onClick={() => { setRemoving(finding); setRemoveError(''); setCsrfRecovery(false); }}>{text(language, 'Remove saved finding', 'นำข้อค้นพบที่บันทึกไว้ออก')}</button>
       </article>)}</section>
-    <form onSubmit={saveInstructions} style={{ marginTop: 24 }}><h2>{text(language, 'Project instructions', 'คำแนะนำประจำโครงการ')}</h2>
-      <label htmlFor="project-instructions">{text(language, 'Instructions shared with sessions in this project', 'คำแนะนำที่แชร์กับทุกเซสชันในโครงการ')}</label><textarea id="project-instructions" rows={5} maxLength={100000} value={instructions} onChange={(event) => setInstructions(event.target.value)} style={{ display: 'block', width: '100%', marginBlock: 10 }} />
-      <button className="button button-primary" disabled={busy}>{text(language, 'Save instructions', 'บันทึกคำแนะนำ')}</button>
-    </form>
-    <dialog ref={dialog} aria-labelledby="remove-finding-title" onCancel={(event) => { event.preventDefault(); setRemoving(null); }}>
+    </div>
+    <dialog className="project-dialog" ref={dialog} aria-labelledby="remove-finding-title" onCancel={(event) => { event.preventDefault(); setRemoving(null); }}>
       <h2 id="remove-finding-title">{text(language, 'Remove saved finding?', 'นำข้อค้นพบที่บันทึกไว้ออกหรือไม่')}</h2>
       <p>{text(language, 'This removes the saved finding from the project. Its source file and report remain available.', 'การดำเนินการนี้นำข้อค้นพบออกจากโครงการ ไฟล์ต้นทางและรายงานยังคงอยู่')}</p>
       {removeError && <p role="alert">{removeError} {csrfRecovery && <button type="button" disabled={refreshingSession} onClick={() => void refreshSession()}>{refreshingSession ? text(language, 'Refreshing…', 'กำลังต่ออายุ…') : text(language, 'Refresh session', 'ต่ออายุเซสชัน')}</button>}</p>}
@@ -158,8 +164,8 @@ function citationAccess(access: NonNullable<CitationView['access']>, language: '
   return text(language, labels[access][0], labels[access][1]);
 }
 
-function Page({ title, children }: { title: string; children: React.ReactNode }) {
-  return <section className="workspace-placeholder"><div className="page-heading"><p className="eyebrow">AI SCIENTIST AGENT PLATFORM</p><h1 className="route-heading" tabIndex={-1}>{title}</h1></div><div className="placeholder-card" style={{ maxWidth: 960 }}>{children}</div></section>;
+function Page({ title, eyebrow = 'YOUR RESEARCH SPACE', className = '', children }: { title: string; eyebrow?: string; className?: string; children: React.ReactNode }) {
+  return <section className={`workspace-placeholder project-original ${className}`}><div className="page-heading project-detail-heading"><p className="project-eyebrow">{eyebrow}</p><h1 className="route-heading" tabIndex={-1}>{title}</h1></div>{children}</section>;
 }
 
 export default ProjectDetails;

@@ -27,7 +27,7 @@ test('bootstrap fragment is removed before the request and its CSRF token author
   expect(events).toEqual(['bootstrap:']);
   await expect(page.locator('#root')).toBeEmpty();
   release();
-  await expect(page.getByRole('heading', { name: /Turn a question/ })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /Every scientific question/ })).toBeVisible();
   await page.evaluate(async () => {
     const api = await import('/src/api.ts');
     await api.request('/api/v1/test-mutation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
@@ -47,7 +47,7 @@ test('failed bootstrap shows a safe message without mounting routes or fetching 
   await page.goto('/#bootstrap=one-time-secret');
   await expect(page.getByRole('alert')).toContainText('Startup could not be completed.');
   await expect(page.locator('body')).not.toContainText('one-time-secret');
-  await expect(page.locator('#root')).not.toContainText(/Turn a question/);
+  await expect(page.locator('#root')).not.toContainText(/Every scientific question/);
   await expect(page).toHaveURL('/');
 });
 
@@ -61,7 +61,7 @@ test('normal startup keeps session lookup lazy until the first mutation', async 
     else await route.fulfill({ json: { ok: true } });
   });
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: /Turn a question/ })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /Every scientific question/ })).toBeVisible();
   expect(events).toEqual([]);
   await page.evaluate(async () => {
     const api = await import('/src/api.ts');

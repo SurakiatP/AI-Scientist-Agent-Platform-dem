@@ -1,6 +1,7 @@
 import { useEffect, useState, type CSSProperties, type Dispatch, type FormEvent, type SetStateAction } from 'react';
 import { ApiError, apiErrorMessage, request } from './api';
 import { useAppPreferences } from './App';
+import './outputs-original.css';
 import { AppearanceSettings } from './preferences';
 import { Link, useSearchParams } from 'react-router-dom';
 
@@ -273,8 +274,9 @@ export default function Settings() {
 
   return <section className="workspace-placeholder settings-workspace">
     <div className="page-heading">
-      <p className="eyebrow">AI SCIENTIST AGENT PLATFORM</p>
-      <h1 className="route-heading" tabIndex={-1}>{tx('Settings', 'ตั้งค่า')}</h1>
+      <p className="eyebrow">WORKSPACE / SETTINGS</p>
+      <h1 className="route-heading" tabIndex={-1}>{tx('Configure your research workspace', 'ตั้งค่าพื้นที่วิจัยของคุณ')}</h1>
+      <p>{tx('Configure models, data sources, and connections in one place.', 'ตั้งค่าโมเดล แหล่งข้อมูล และการเชื่อมต่อกับระบบอื่นในที่เดียว')}</p>
     </div>
 
     <div className="settings-group settings-preferences">
@@ -282,6 +284,7 @@ export default function Settings() {
       <AppearanceSettings language={language} {...preferences} />
     </div>
 
+    <div className="original-settings-grid">
     <section className="settings-group settings-section" style={panelStyle} aria-labelledby="research-setup-title">
       <h2 id="research-setup-title">{tx('Research Setup', 'ความพร้อมของงาน')}</h2>
       <p>{tx('Review requirements and prepare a reviewed environment for a project. Saving a connection or preparing an environment does not approve a research plan.', 'ตรวจสอบข้อกำหนดและเตรียมสภาพแวดล้อมของโครงการ การบันทึกการเชื่อมต่อหรือเตรียมสภาพแวดล้อมไม่ได้อนุมัติแผนวิจัย')}</p>
@@ -409,5 +412,6 @@ export default function Settings() {
         <ul>{Object.entries(capabilities.value.protocols).map(([protocol, state]) => <li key={protocol}>{protocol.toUpperCase()}: {state}</li>)}</ul>
       </>}
     </section>
+    </div>
   </section>;
 }

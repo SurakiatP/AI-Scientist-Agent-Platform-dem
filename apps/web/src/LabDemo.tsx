@@ -1,43 +1,49 @@
 import type { CSSProperties } from 'react';
-import { t, type Language } from './locales';
 
-export type LabState = { diffusion: number; paused: boolean; seed: number };
-export const INITIAL_LAB_STATE: LabState = { diffusion: 0.45, paused: true, seed: 0 };
+export type LabState = { temperature: number; paused: boolean };
+export const INITIAL_LAB_STATE: LabState = { temperature: 300, paused: true };
 
-export function LabDemo({ state, onChange, language }: { state: LabState; onChange: (state: LabState) => void; language: Language }) {
-  const dots = Array.from({ length: 28 }, (_, index) => {
-    const angle = index * 2.399963 + (state.seed % 1);
-    const radius = 18 + ((index * 37) % 41) + state.diffusion * 22;
-    const x = 160 + Math.cos(angle + state.seed) * radius;
-    const y = 96 + Math.sin(angle + state.seed) * radius * 0.58;
-    return <circle key={index} cx={x} cy={y} r={index % 5 === 0 ? 4 : 3} className="particle" style={{ animationDelay: `${(index % 8) * -0.21}s` } as CSSProperties} />;
+export function LabDemo({ state, onChange, language }: { state: LabState; onChange: (state: LabState) => void; language: 'th' | 'en' }) {
+  const th = language === 'th';
+  const spread = Math.sqrt(state.temperature / 300);
+  const particles = Array.from({ length: 32 }, (_, index) => {
+    const angle = index * 2.399963;
+    const radius = (11 + ((index * 37) % 45)) * spread;
+    const x = 180 + Math.cos(angle) * radius;
+    const y = 89 + Math.sin(angle) * radius * 0.55;
+    return { x, y, radius: index % 5 === 0 ? 4 : 3, delay: `${(index % 8) * -0.19}s` };
   });
+  const bins = [0, 0, 0, 0, 0];
+  for (const particle of particles) bins[Math.min(4, Math.floor(particle.x / 72))] += 1;
+  const spreadWidth = ((Math.max(...particles.map(({ x }) => x)) - Math.min(...particles.map(({ x }) => x))) / 360 * 100).toFixed(1);
+  const setTemperature = (temperature: number) => onChange({ ...state, temperature });
 
-  return <section className="lab-card" aria-labelledby="lab-title" aria-label={t('labName', language)}>
-    <div className="lab-heading">
-      <div><p className="eyebrow">{t('labTitle', language)}</p><h3 id="lab-title">{t('labName', language)}</h3></div>
-      <span className="lab-mark" aria-hidden="true">↗</span>
-    </div>
-    <p className="lab-intro">{t('labIntro', language)}</p>
-    <div className={`particle-scene${state.paused ? ' is-paused' : ''}`}>
-      <svg viewBox="0 0 320 192" role="img" aria-label={t('particleCaption', language)}>
-        <defs><radialGradient id="field"><stop stopColor="var(--soft)" /><stop offset="1" stopColor="var(--surface)" /></radialGradient></defs>
-        <rect width="320" height="192" rx="18" fill="url(#field)" />
-        <path d="M160 12v168" stroke="var(--line)" strokeDasharray="3 6" />
-        <circle cx="160" cy="96" r="36" fill="none" stroke="var(--line)" />
-        {dots}
-        <circle cx="160" cy="96" r="5" fill="var(--accent)" />
+  return <section className="lab-card" aria-labelledby="lab-title" aria-label={th ? 'ห้องทดลองการแพร่' : 'Diffusion lab'}>
+    <div className="lab-heading"><span className="notebook-tag">INTERACTIVE LAB 001</span><span className="lab-status" role="status">{state.paused ? (th ? 'หยุดชั่วคราว' : 'Paused') : (th ? 'กำลังเล่น' : 'Playing')}</span></div>
+    <h3 id="lab-title">{th ? 'การแพร่ของอนุภาค' : 'Particle diffusion'}</h3>
+    <p className="lab-instruction">{th ? 'ลองปรับอุณหภูมิแล้วสังเกตการกระจาย' : 'Adjust temperature and observe particle spread.'}</p>
+    <div className={`lab-scene${state.paused ? ' is-paused' : ''}`}>
+      <svg viewBox="0 0 360 178" role="img" aria-label={th ? 'อนุภาคกระจายออกจากจุดศูนย์กลาง' : 'Particles spread away from the center'}>
+        <rect width="360" height="178" rx="12" className="lab-scene-bg" />
+        <path d="M180 12v154" className="lab-axis" />
+        <circle cx="180" cy="89" r="29" className="lab-center-ring" />
+        {particles.map((particle, index) => <circle key={index} cx={particle.x} cy={particle.y} r={particle.radius} className="lab-particle" style={{ animationDelay: particle.delay } as CSSProperties} />)}
+        <circle cx="180" cy="89" r="4" className="lab-center" />
       </svg>
     </div>
-    <label className="lab-range" htmlFor="diffusion">
-      <span>{t('diffusion', language)}</span><output htmlFor="diffusion">{state.diffusion.toFixed(2)}</output>
-      <input id="diffusion" type="range" min="0" max="1" step="0.05" value={state.diffusion} onChange={(event) => onChange({ ...state, diffusion: Number(event.target.value) })} />
+    <label className="lab-temperature" htmlFor="lab-temperature">
+      <span>{th ? 'อุณหภูมิ' : 'Temperature'}</span><output id="lab-temperature-value" htmlFor="lab-temperature">{state.temperature} K</output>
+      <input id="lab-temperature" type="range" min="200" max="500" step="10" value={state.temperature} aria-valuetext={`${state.temperature} K`} onChange={(event) => setTemperature(Number(event.target.value))} />
     </label>
-    <p className="lab-readout">{t('readout', language).replace('{value}', state.diffusion.toFixed(2))}</p>
-    <div className="lab-actions">
-      <button type="button" className="button button-small" onClick={() => onChange({ ...state, paused: !state.paused })}>{t(state.paused ? 'play' : 'pause', language)}</button>
-      <button type="button" className="button button-quiet button-small" onClick={() => onChange({ ...INITIAL_LAB_STATE })}>{t('reset', language)}</button>
+    <div className="lab-presets" aria-label={th ? 'ค่าที่ตั้งไว้' : 'Temperature presets'}>
+      {[200, 300, 500].map((value) => <button key={value} type="button" aria-pressed={state.temperature === value} onClick={() => setTemperature(value)}>{value} K</button>)}
     </div>
-    <p className="lab-disclaimer">{t('illustrative', language)}</p>
+    <div className="lab-measures"><div><span>{th ? 'การเคลื่อนที่สัมพัทธ์' : 'Relative motion'}</span><output>{spread.toFixed(2)}×</output></div><div><span>{th ? 'ความกว้างการกระจาย' : 'Spread width'}</span><output>{spreadWidth}%</output></div></div>
+    <figure className="lab-distribution"><svg viewBox="0 0 220 42" role="img" aria-label={th ? 'ฮิสโตแกรมแสดงการกระจายของอนุภาค' : 'Histogram of particle distribution'}>{bins.map((count, index) => <rect key={index} x={9 + index * 42} y={38 - count * 3} width="30" height={count * 3} rx="2" className="lab-bin"/>)}<path d="M6 39H214" className="lab-bin-axis"/></svg><figcaption>{th ? 'การกระจายของอนุภาค' : 'Particle distribution'}</figcaption></figure>
+    <p className="lab-model-note">{th ? 'แบบจำลองภาพประกอบอย่างง่าย ไม่ใช่ผลการทดลอง' : 'Illustrative model only; these are not experimental results.'}</p>
+    <div className="lab-controls">
+      <button type="button" className="lab-play" aria-pressed={!state.paused} onClick={() => onChange({ ...state, paused: !state.paused })}>{state.paused ? (th ? 'เล่น' : 'Play') : (th ? 'หยุดชั่วคราว' : 'Pause')}</button>
+      <button type="button" className="lab-reset" onClick={() => onChange({ ...INITIAL_LAB_STATE })}>{th ? 'เริ่มใหม่' : 'Reset'}</button>
+    </div>
   </section>;
 }

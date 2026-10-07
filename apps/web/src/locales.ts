@@ -24,7 +24,7 @@ const messages = {
   },
   th: {
     skip: 'ข้ามไปยังเนื้อหา', brand: 'AI Scientist Agent Platform', navLabel: 'เมนูหลัก',
-    home: 'หน้าแรก', projects: 'โครงการ', sources: 'แหล่งข้อมูลและผลงาน', history: 'ประวัติการทำงาน', settings: 'ตั้งค่า',
+    home: 'หน้าแรก', projects: 'โปรเจกต์', sources: 'แหล่งอ้างอิงและผลงาน', history: 'ประวัติงาน', settings: 'ตั้งค่า',
     openNavigation: 'เปิดเมนูนำทาง', closeNavigation: 'ปิดเมนูนำทาง', navDialog: 'เมนูนำทาง',
     landingEyebrow: 'พื้นที่ทำงานสำหรับการสำรวจทางวิทยาศาสตร์อย่างรอบคอบ', heroTitle: 'เปลี่ยนคำถามให้เห็นหลักฐานได้ชัดเจนขึ้น',
     heroText: 'สำรวจคำถามทางวิทยาศาสตร์ ตรวจสอบแหล่งที่มา และเชื่อมโยงข้อค้นพบกับงานที่ทำให้เกิดข้อค้นพบนั้น',
@@ -37,7 +37,7 @@ const messages = {
     workflowEyebrow: 'เส้นทางชัดเจนสำหรับคำถามที่ซับซ้อน', labEyebrow: 'แบบจำลองเชิงโต้ตอบอย่างง่าย', footerLine: 'การวิจัยเริ่มต้นจากคำถาม',
     illustrative: 'แบบจำลองเพื่อประกอบความเข้าใจ · ยังไม่ได้ปรับเทียบหรือยืนยันเพื่อการพยากรณ์ทางวิทยาศาสตร์', diffusion: 'การแพร่', play: 'เล่น', pause: 'หยุดชั่วคราว', reset: 'เริ่มใหม่',
     readout: 'ค่าการแพร่: {value}', particleCaption: 'อนุภาคกระจายทั่วพื้นที่เมื่อเปลี่ยนค่าการแพร่',
-    appearanceTitle: 'ลักษณะที่ปรากฏ', appearanceDescription: 'เลือกรูปแบบการแสดงผลบนอุปกรณ์นี้',
+    appearanceTitle: 'การแสดงผล', appearanceDescription: 'เลือกบรรยากาศที่อ่านสบายสำหรับงานของคุณ',
     light: 'สว่าง', dark: 'มืด', system: 'ตามระบบ', language: 'ภาษา', languageDescription: 'เลือกภาษาสำหรับเมนูและตัวควบคุม',
     english: 'English', thai: 'ไทย', workspaceTitle: 'โครงการ', workspaceUnavailable: 'ข้อมูลโครงการและงานวิจัยจะแสดงที่นี่เมื่อเชื่อมต่อบริการในเครื่องแล้ว',
     sourcesTitle: 'แหล่งข้อมูลและผลงาน', historyTitle: 'ประวัติการทำงาน', settingsTitle: 'ตั้งค่า',

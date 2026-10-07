@@ -194,8 +194,8 @@ test('W2 real scientific workflow uploads CSV, retrieves Crossref, and publishes
   if (new URL(page.url()).origin !== origin) throw new Error('W2 owner session left actual host');
   await page.getByRole('button', { name: 'EN' }).click();
 
-  await gotoHost(`/projects/${encodeURIComponent(proof.project_id)}/library`);
-  await expect(page.getByRole('heading', { name: 'Sources & outputs' })).toBeVisible();
+  await gotoHost(`/projects/${encodeURIComponent(proof.project_id)}/library#outputs-files`);
+  await expect(page.getByRole('heading', { name: 'Evidence and outputs, together' })).toBeVisible();
   await page.locator('#library-upload').setInputFiles(w2CsvFixture!);
   await expect.poll(async () => page.evaluate(async (projectId) => {
     const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/files`, { credentials: 'same-origin' });

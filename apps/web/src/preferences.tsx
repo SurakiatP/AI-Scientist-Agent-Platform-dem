@@ -11,7 +11,7 @@ function readLanguage(): Language {
 }
 function readAppearance(): Appearance {
   const value = localStorage.getItem(APPEARANCE_KEY);
-  return value === 'light' || value === 'dark' ? value : 'system';
+  return value === 'light' || value === 'dark' || value === 'system' ? value : 'system';
 }
 
 export function usePreferences() {
@@ -42,15 +42,16 @@ export function usePreferences() {
 }
 
 export function AppearanceSettings({ language, appearance, setLanguage, setAppearance }: ReturnType<typeof usePreferences>) {
-  return <section className="settings-panel" aria-labelledby="appearance-title">
+  return <section className="settings-panel original-appearance" aria-labelledby="appearance-title">
     <div className="settings-group">
       <h2 id="appearance-title">{t('appearanceTitle', language)}</h2>
       <p>{t('appearanceDescription', language)}</p>
-      <fieldset className="choice-group">
+      <fieldset className="choice-group mode-grid">
         <legend className="visually-hidden">{t('appearanceTitle', language)}</legend>
-        {(['light', 'dark', 'system'] as const).map((value) => <label className="choice" key={value}>
-          <input type="radio" name="appearance" value={value} checked={appearance === value} onChange={() => setAppearance(value)} />
-          <span>{t(value, language)}</span>
+        {(['light', 'dark', 'system'] as const).map((value) => <label className="choice mode-card" key={value}>
+          <span className={`mode-sample mode-sample-${value}`} aria-hidden="true"><i /><b /><em /></span>
+          <span className="mode-card-title"><input aria-label={t(value, language)} type="radio" name="appearance" value={value} checked={appearance === value} onChange={() => setAppearance(value)} />{t(value, language)}</span>
+          <small>{language === 'th' ? value === 'light' ? 'พื้นสว่าง อ่านเอกสารชัดเจน' : value === 'dark' ? 'พื้นเข้ม เหมาะกับการใช้งานตอนกลางคืน' : 'ปรับตามธีมของเครื่องโดยอัตโนมัติ' : value === 'light' ? 'A clear canvas for reading.' : value === 'dark' ? 'A comfortable canvas for evening work.' : 'Automatically follow your device theme.'}</small>
         </label>)}
       </fieldset>
     </div>

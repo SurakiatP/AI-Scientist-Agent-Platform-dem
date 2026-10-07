@@ -1,16 +1,32 @@
 import { useEffect, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import type { CitationView, FileView, ProjectView, RunView } from '../../../contracts/api-types';
 import { ApiError, apiCodeLabel, apiErrorMessage, refreshOwnerSession, request, requestBlob } from './api';
 import { useAppPreferences } from './App';
+import { ArtifactCard, ArtifactViewer } from './ArtifactViewer';
+import './outputs-original.css';
 
 const text = (language: 'th' | 'en', en: string, th: string) => language === 'th' ? th : en;
 type UploadPolicy = { file_types: string[]; max_upload_bytes: number };
 
 export function Library() {
   const { projectId = '' } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [tab, setTab] = useState<'report' | 'sources' | 'files'>('report');
+  const [selectedArtifactId, setSelectedArtifactId] = useState('');
+  const [expandedArtifactId, setExpandedArtifactId] = useState('');
+  const artifactOpener = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (location.hash.startsWith('#file-') || location.hash === '#outputs-files') setTab('files');
+    else if (location.hash.startsWith('#citation-') || location.hash === '#outputs-sources') setTab('sources');
+    else if (location.hash.startsWith('#artifact-')) { setTab('report'); setSelectedArtifactId(location.hash.slice(10)); }
+    else setTab('report');
+  }, [location.hash]);
+  const closeArtifact = () => { setExpandedArtifactId(''); const opener = artifactOpener.current; artifactOpener.current = null; if (opener?.isConnected) requestAnimationFrame(() => opener.focus()); };
   const { language } = useAppPreferences();
   const [availableProjects, setAvailableProjects] = useState<ProjectView[]>([]);
+  const [projectsLoading, setProjectsLoading] = useState(!projectId);
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const activeProjectId = projectId || selectedProjectId;
   const [files, setFiles] = useState<FileView[]>([]);
@@ -43,13 +59,15 @@ export function Library() {
   useEffect(() => {
     if (projectId) return;
     const controller = new AbortController();
+    setProjectsLoading(true);
     request<ProjectView[]>('/api/v1/projects', { signal: controller.signal }).then((items) => {
-      if (!controller.signal.aborted) { setAvailableProjects(items); if (items.length === 1) setSelectedProjectId(items[0].id); }
-    }).catch((reason: unknown) => { if (!controller.signal.aborted) setError(apiErrorMessage(reason, language, 'Unable to load projects.')); });
+      if (!controller.signal.aborted) { setAvailableProjects(items); setProjectsLoading(false); if (items.length === 1) setSelectedProjectId(items[0].id); }
+    }).catch((reason: unknown) => { if (!controller.signal.aborted) { setError(apiErrorMessage(reason, language, 'Unable to load projects.')); setProjectsLoading(false); } });
     return () => controller.abort();
   }, [projectId]);
 
   useEffect(() => {
+    setExpandedArtifactId('');
     if (!activeProjectId) { setLoading(false); return; }
     const controller = new AbortController();
     setLoading(true); setError(''); setFiles([]); setCitations([]); setRuns([]); setPolicy(null);
@@ -174,16 +192,18 @@ export function Library() {
   }
 
   const artifacts = runs.flatMap((run) => run.artifacts.map((artifact) => ({ ...artifact, sessionId: run.session_id, runState: run.state })));
-  return <section className="workspace-placeholder">
-    <div className="page-heading"><p className="eyebrow">AI SCIENTIST AGENT PLATFORM</p><h1 className="route-heading" tabIndex={-1}>{text(language, 'Sources & outputs', 'แหล่งข้อมูลและผลงาน')}</h1>
+  const selectedArtifact = artifacts.find((artifact) => artifact.artifact_id === selectedArtifactId) ?? artifacts[0];
+  const expandedArtifact = artifacts.find((artifact) => artifact.artifact_id === expandedArtifactId);
+  return <section className="workspace-placeholder original-library">
+    <div className="page-heading"><p className="eyebrow">RESEARCH / OUTPUTS</p><h1 className="route-heading" tabIndex={-1}>{text(language, 'Evidence and outputs, together', 'หลักฐานและผลงาน อยู่ด้วยกัน')}</h1><p>{text(language, 'Read the report, then trace each finding back to its sources.', 'อ่านรายงาน แล้วกลับไปตรวจแหล่งที่มาของข้อค้นพบได้')}</p>
       {projectId ? <p>{text(language, 'Project evidence for', 'หลักฐานในโครงการ')}: <Link to={`/projects/${projectId}`}>{projectId}</Link></p> : <label>{text(language, 'Choose a project', 'เลือกโครงการ')} <select aria-label={text(language, 'Choose a project', 'เลือกโครงการ')} value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.target.value)}><option value="">{text(language, 'Select a project', 'เลือกโครงการ')}</option>{availableProjects.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>}
     </div>
-    <div className="placeholder-card" style={{ maxWidth: 960 }}>
-      {loading && <p role="status">{text(language, 'Loading project library…', 'กำลังโหลดคลังโครงการ…')}</p>}
-      {!loading && !error && !activeProjectId && <p>{availableProjects.length ? text(language, 'Choose a project to view its sources and outputs.', 'เลือกโครงการเพื่อดูแหล่งข้อมูลและผลงาน') : text(language, 'No projects are available yet.', 'ยังไม่มีโครงการ')} · <Link to="/projects">{text(language, 'Projects', 'โครงการ')}</Link></p>}
+    <div className="output-layout"><nav className="output-navigation" aria-label={text(language, 'Project outputs', 'ผลงานของโครงการ')}><p className="eyebrow">PROJECT OUTPUTS</p>{(['report', 'sources', 'files'] as const).map((key) => <button key={key} type="button" aria-pressed={tab === key} className={tab === key ? 'selected' : ''} onClick={() => navigate({ pathname: location.pathname, search: location.search, hash: `#outputs-${key}` })}><strong>{text(language, key === 'report' ? 'Reports & outputs' : key === 'sources' ? 'Sources' : 'Project files', key === 'report' ? 'รายงานและผลงาน' : key === 'sources' ? 'แหล่งอ้างอิง' : 'ไฟล์ประกอบ')}</strong><small>{key === 'report' ? 'Reports · Tables · Visuals' : key === 'sources' ? 'Citations · Evidence' : 'Code · Data · Files'}</small></button>)}</nav><div className="output-pane">
+      {(loading || projectsLoading) && <p role="status">{text(language, 'Loading project library…', 'กำลังโหลดคลังโครงการ…')}</p>}
+      {!loading && !projectsLoading && !error && !activeProjectId && <p>{availableProjects.length ? text(language, 'Choose a project to view its sources and outputs.', 'เลือกโครงการเพื่อดูแหล่งข้อมูลและผลงาน') : text(language, 'No projects are available yet.', 'ยังไม่มีโครงการ')} · <Link to="/projects">{text(language, 'Projects', 'โครงการ')}</Link></p>}
       {!loading && error && <div role="alert"><p>{error === 'not-found' ? text(language, 'This project was not found.', 'ไม่พบโครงการนี้') : error === 'forbidden' ? text(language, 'You do not have access to this project.', 'คุณไม่มีสิทธิ์เข้าถึงโครงการนี้') : text(language, 'Project library could not be loaded.', 'โหลดคลังโครงการไม่สำเร็จ')} {error !== 'not-found' && error !== 'forbidden' && error}</p><Link to="/projects">{text(language, 'Back to projects', 'กลับไปยังโครงการ')}</Link></div>}
       {!loading && !error && activeProjectId && <>
-        <section aria-labelledby="files-heading"><h2 id="files-heading">{text(language, 'Shared files', 'ไฟล์ที่แชร์ในโครงการ')}</h2>
+        <section hidden={tab !== 'files'} aria-labelledby="files-heading"><h2 id="files-heading">{text(language, 'Shared files', 'ไฟล์ที่แชร์ในโครงการ')}</h2>
           <p>{text(language, `Accepted formats: ${readableTypes || 'unavailable'} · Maximum size: ${policy ? formatSize(policy.max_upload_bytes) : 'unavailable'}`, `รูปแบบที่รับ: ${readableTypes || 'ไม่มีข้อมูล'} · ขนาดสูงสุด: ${policy ? formatSize(policy.max_upload_bytes) : 'ไม่มีข้อมูล'}`)}</p>
           <button className="button button-quiet" type="button" onClick={() => void refreshFiles()}>{text(language, 'Refresh file status', 'รีเฟรชสถานะไฟล์')}</button>
           <label htmlFor="library-upload">{text(language, 'Upload project files', 'อัปโหลดไฟล์โครงการ')}</label><input id="library-upload" type="file" disabled={!policy || uploading} accept={acceptedTypes.join(',')} onChange={(event) => { const selected = event.target.files?.[0]; event.target.value = ''; void upload(selected); }} />
@@ -202,12 +222,13 @@ export function Library() {
             {preview.text !== undefined ? <pre style={{ whiteSpace: 'pre-wrap', overflow: 'auto', maxHeight: 520 }}>{preview.text}{preview.file.size > 1024 * 1024 ? `\n\n${text(language, 'Preview truncated to 1 MiB.', 'แสดงตัวอย่างไม่เกิน 1 MiB')}` : ''}</pre> : <iframe title={`${text(language, 'Authorized preview', 'ตัวอย่างที่ได้รับอนุญาต')}: ${preview.file.filename}`} src={preview.url} style={{ width: 'min(80vw, 900px)', minHeight: '70vh', border: 0 }} />}
           </>}
         </dialog>
-        <section aria-labelledby="outputs-heading"><h2 id="outputs-heading">{text(language, 'Reports and outputs', 'รายงานและผลงาน')}</h2>
-          {artifacts.length === 0 ? <p>{text(language, 'No research outputs are available yet.', 'ยังไม่มีผลงานวิจัย')}</p> : <ul>{artifacts.map((artifact) => <li key={artifact.artifact_id} id={`artifact-${artifact.artifact_id}`}>
-            <strong>{artifact.title}</strong> · {artifactKind(artifact.kind, language)} · {artifact.partial ? text(language, 'Partial', 'บางส่วน') : text(language, 'Complete', 'สมบูรณ์')} · {text(language, 'Session', 'เซสชัน')}: <Link to={`/projects/${activeProjectId}/sessions/${artifact.sessionId}`}>{artifact.sessionId}</Link>
-          </li>)}</ul>}
+        <section hidden={tab !== 'report'} aria-labelledby="outputs-heading"><h2 id="outputs-heading">{text(language, 'Reports and outputs', 'รายงานและผลงาน')}</h2>
+          {artifacts.length === 0 ? <div className="original-empty"><p>{text(language, 'No outputs have been created yet.', 'ยังไม่มีรายงานหรือผลงาน')}</p>{activeProjectId && <Link className="button button-quiet" to={`/projects/${activeProjectId}`}>{text(language, 'Open project', 'เปิดโครงการ')}</Link>}</div> : <>
+          <label className="output-picker">{text(language, 'Choose output', 'เลือกผลงาน')}<select value={selectedArtifact?.artifact_id ?? ''} onChange={(event) => navigate({ pathname: location.pathname, search: location.search, hash: `#artifact-${event.target.value}` })}>{artifacts.map((artifact) => <option key={artifact.artifact_id} value={artifact.artifact_id}>{artifact.title}{artifact.partial ? ` · ${text(language, 'Partial', 'บางส่วน')}` : ''}</option>)}</select></label>
+          {selectedArtifact && <div id={`artifact-${selectedArtifact.artifact_id}`}><span className="state-badge">{artifactKind(selectedArtifact.kind, language)}{selectedArtifact.partial ? ` · ${text(language, 'Partial', 'บางส่วน')}` : ''}</span><ArtifactCard artifact={selectedArtifact} language={language} onExpand={(opener) => { artifactOpener.current = opener; setExpandedArtifactId(selectedArtifact.artifact_id); }} /><p>{text(language, 'Created in', 'สร้างใน')} <Link to={`/projects/${activeProjectId}/sessions/${selectedArtifact.sessionId}`}>{text(language, 'Open research conversation', 'เปิดบทสนทนาวิจัย')}</Link></p></div>}
+        </>}
         </section>
-        <section aria-labelledby="citations-heading"><h2 id="citations-heading">{text(language, 'Sources', 'แหล่งอ้างอิง')}</h2>
+        <section hidden={tab !== 'sources'} aria-labelledby="citations-heading"><h2 id="citations-heading">{text(language, 'Sources', 'แหล่งอ้างอิง')}</h2>
           {citations.length === 0 ? <p>{text(language, 'No sources are available yet.', 'ยังไม่มีแหล่งอ้างอิง')}</p> : <ul>{citations.map((citation) => <li key={citation.id} id={`citation-${citation.id}`}>
             <strong>{citation.title}</strong>{citation.authors.length > 0 && <> · {citation.authors.join(', ')}</>}{citation.year && <> · {citation.year}</>}{citation.identifier && <> · {citation.identifier}</>}
             <span> · {text(language, `Access: ${citation.access ?? 'unknown'}; verification: ${citation.verification ?? 'unknown'}`, `การเข้าถึง: ${translateAccess(citation.access, language)}; การยืนยัน: ${translateVerification(citation.verification, language)}`)}</span>
@@ -215,7 +236,9 @@ export function Library() {
           </li>)}</ul>}
         </section>
       </>}
+      </div>
     </div>
+    {expandedArtifact && <ArtifactViewer artifact={expandedArtifact} onClose={closeArtifact} language={language} />}
     <dialog ref={removeDialog} aria-labelledby="remove-shared-file-title" onCancel={(event) => { event.preventDefault(); setFileToRemove(null); setRemoveError(''); }}>
       <h2 id="remove-shared-file-title">{text(language, 'Remove shared file?', 'นำไฟล์ที่แชร์ออกหรือไม่')}</h2>
       <p>{text(language, 'This hides the file from this project. Existing reports, findings, and source provenance remain.', 'ไฟล์จะถูกซ่อนจากโครงการนี้ รายงาน ข้อค้นพบ และที่มาของข้อมูลที่มีอยู่จะยังคงอยู่')}</p>
@@ -237,6 +260,7 @@ function formatSize(size: number) { if (size >= 1024 * 1024) return `${(size / 1
 function safeExternalUrl(value: string) { try { const url = new URL(value); return url.protocol === 'https:' || url.protocol === 'http:'; } catch { return false; } }
 function translateVerification(value: CitationView['verification'], language: 'th' | 'en') { if (language === 'en') return value ?? 'unknown'; return value === 'verified' ? 'ยืนยันแล้ว' : value === 'contradictory' ? 'ข้อมูลขัดแย้ง' : value === 'unverified' ? 'ยังไม่ยืนยัน' : 'ไม่ทราบ'; }
 function translateAccess(value: CitationView['access'], language: 'th' | 'en') { if (language === 'en') return value ?? 'unknown'; return value === 'full_text' ? 'ฉบับเต็ม' : value === 'abstract' ? 'บทคัดย่อ' : value === 'metadata' ? 'ข้อมูลบรรณานุกรม' : value === 'unavailable' ? 'เข้าถึงไม่ได้' : 'ไม่ทราบ'; }
+
 function artifactKind(kind: string, language: 'th' | 'en') { const labels: Record<string, [string, string]> = { report: ['Report', 'รายงาน'], table: ['Table', 'ตาราง'], plot: ['Plot', 'กราฟ'], file: ['File', 'ไฟล์'] }; const pair = labels[kind]; return pair ? text(language, pair[0], pair[1]) : text(language, 'Output', 'ผลงาน'); }
 
 export default Library;

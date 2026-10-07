@@ -4,15 +4,18 @@ import { FINDING_ID, FILE_ID, OTHER_PROJECT_ID, PROJECT_ID, SESSION_ID, installP
 test('projects create and open a project-scoped workspace; browser back and forward restore routes', async ({ page }) => {
   await installProjectFixtureRoutes(page);
   await page.goto('/projects');
-  await expect(page.getByRole('heading', { name: 'Projects', level: 1 })).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Diffusion study' })).toBeVisible();
-  await page.getByRole('link', { name: 'Diffusion study' }).click();
+  await expect(page.getByRole('heading', { name: 'Research starts here', level: 1 })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Diffusion study', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Diffusion study', exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/projects/${PROJECT_ID}$`));
   await expect(page.getByRole('link', { name: 'Membrane transport' }).first()).toBeVisible();
-  await page.locator(`a[href="/projects/${PROJECT_ID}/library"]`).click();
+  await page.locator(`a[href="/projects/${PROJECT_ID}/library"]`).first().click();
+  await page.getByRole('navigation', { name: 'Project outputs' }).getByRole('button', { name: /^Project files/ }).click();
   await expect(page.getByText('diffusion-notes.pdf')).toBeVisible();
   await page.goBack();
+  await page.goBack();
   await expect(page).toHaveURL(new RegExp(`/projects/${PROJECT_ID}$`));
+  await page.goForward();
   await page.goForward();
   await expect(page.getByText('diffusion-notes.pdf')).toBeVisible();
 });
@@ -20,8 +23,9 @@ test('projects create and open a project-scoped workspace; browser back and forw
 test('creating a project trims its name and opens the returned project', async ({ page }) => {
   const fixture = await installProjectFixtureRoutes(page);
   await page.goto('/projects');
-  await page.getByLabel('New project name').fill('  New science space  ');
-  await page.getByRole('button', { name: 'Create project' }).click();
+  await page.getByRole('button', { name: '＋ Create project', exact: true }).click();
+  await page.getByRole('dialog').getByLabel('Project name').fill('  New science space  ');
+  await page.getByRole('dialog').getByRole('button', { name: 'Create and open project' }).click();
   await expect(page).toHaveURL(new RegExp(`/projects/${PROJECT_ID}$`));
   expect(fixture.writes.find((item) => item.method === 'POST' && item.url === '/projects')?.body).toEqual({ name: 'New science space' });
 });
@@ -33,8 +37,11 @@ test('removing a saved finding leaves its report and source intact', async ({ pa
   await expect(page.getByRole('dialog')).toBeVisible();
   await page.getByRole('button', { name: 'Confirm removal' }).click();
   await expect(page.getByText('Example finding', { exact: true })).toHaveCount(0);
-  await page.locator(`a[href="/projects/${PROJECT_ID}/library"]`).click();
-  await expect(page.getByText('Example report', { exact: true }).first()).toBeVisible();
+  await page.locator(`a[href="/projects/${PROJECT_ID}/library"]`).first().click();
+  await page.getByRole('navigation', { name: 'Project outputs' }).getByRole('button', { name: /^Project files/ }).click();
+  await page.getByRole('navigation', { name: 'Project outputs' }).getByRole('button', { name: /^Reports/ }).click();
+  await expect(page.getByRole('heading', { name: 'Example report', exact: true }).first()).toBeVisible();
+  await page.getByRole('navigation', { name: 'Project outputs' }).getByRole('button', { name: /^Project files/ }).click();
   await expect(page.getByText('diffusion-notes.pdf')).toBeVisible();
   expect(fixture.deleted).toEqual([`/projects/${PROJECT_ID}/findings/${FINDING_ID}`]);
 });
@@ -58,20 +65,21 @@ test('finding removal CSRF failure and manual recovery stay inside the open conf
 
 test('removing a shared file keeps its finding, report, and citation provenance', async ({ page }) => {
   const fixture = await installProjectFixtureRoutes(page);
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.getByRole('button', { name: 'Remove shared file' }).first().click();
   await expect(page.getByRole('dialog', { name: 'Remove shared file?' })).toBeVisible();
   await page.getByRole('button', { name: 'Confirm removal' }).click();
   await expect(page.getByText('diffusion-notes.pdf')).toHaveCount(0);
   expect(fixture.deleted).toContain(`/projects/${PROJECT_ID}/files/${FILE_ID}`);
-  await expect(page.getByText('Example report').first()).toBeVisible();
+  await page.getByRole('navigation', { name: 'Project outputs' }).getByRole('button', { name: /^Reports/ }).click();
+  await expect(page.getByRole('heading', { name: 'Example report', exact: true }).first()).toBeVisible();
   await page.goto(`/projects/${PROJECT_ID}`);
   await expect(page.getByText('Example finding')).toBeVisible();
 });
 
 test('shared file removal can be retried after explicit CSRF refresh without replaying the first delete', async ({ page }) => {
   const fixture = await installProjectFixtureRoutes(page, { rotateCsrfOnFirstFileDelete: true });
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.getByRole('button', { name: 'Remove shared file' }).first().click();
   await page.getByRole('button', { name: 'Confirm removal' }).click();
   await expect(page.getByText('Your owner session may have changed.').first()).toBeVisible();
@@ -103,19 +111,19 @@ test('invalid project links show a not-found state with a return path', async ({
 
 test('global sources and history destinations require an explicit project context', async ({ page }) => {
   await installProjectFixtureRoutes(page);
-  await page.goto('/sources');
+  await page.goto('/sources#outputs-files');
   const sourceProject = page.getByRole('combobox', { name: 'Choose a project' });
   await sourceProject.selectOption(OTHER_PROJECT_ID);
   await expect(page.getByText('diffusion-notes.pdf')).toHaveCount(0);
   await expect(page.getByText('No files have been added to this project.')).toBeVisible();
   await page.goto('/history');
   await page.getByRole('combobox', { name: 'Choose a project' }).selectOption(OTHER_PROJECT_ID);
-  await expect(page.getByText('No research runs have been started in this project.')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'No research runs yet' })).toBeVisible();
 });
 
 test('library exposes accepted formats, server size limit and distinct preparation status', async ({ page }) => {
   await installProjectFixtureRoutes(page, { preparationOutcome: 'ready' });
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await expect(page.getByRole('listitem').filter({ hasText: 'pending.csv' })).toContainText('Preparing');
   await expect(page.getByText(/25 MiB/)).toBeVisible();
   await expect(page.getByText(/PDF|CSV|Markdown/)).toBeVisible();
@@ -129,7 +137,7 @@ test('library exposes accepted formats, server size limit and distinct preparati
 
 test('preparation failure is shown as failed and does not claim progress', async ({ page }) => {
   await installProjectFixtureRoutes(page, { preparationOutcome: 'failed' });
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.getByRole('button', { name: 'Refresh file status' }).click();
   const pending = page.getByRole('listitem').filter({ hasText: 'pending.csv' });
   await expect(pending).toContainText('Failed');
@@ -139,7 +147,7 @@ test('preparation failure is shown as failed and does not claim progress', async
 
 test('empty MIME XLSX uses its extension and unsupported and oversize files remain in the library', async ({ page }) => {
   const fixture = await installProjectFixtureRoutes(page);
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.getByLabel('Upload project files').setInputFiles({ name: 'table.xlsx', mimeType: '', buffer: Buffer.from('xlsx') });
   await expect.poll(() => fixture.writes.some((item) => item.method === 'POST' && item.url === `/projects/${PROJECT_ID}/files`)).toBe(true);
   await page.getByLabel('Upload project files').setInputFiles({ name: 'oversize.pdf', mimeType: 'application/pdf', buffer: Buffer.alloc(25 * 1024 * 1024 + 1) });
@@ -153,7 +161,7 @@ test('delayed preview and upload responses from a prior project are discarded', 
     await page.waitForTimeout(500);
     try { await route.fulfill({ status: 200, contentType: 'application/pdf', body: '%PDF-fixture' }); } catch { /* request was aborted on project switch */ }
   });
-  await page.goto('/sources');
+  await page.goto('/sources#outputs-files');
   const projectPicker = page.getByRole('combobox', { name: 'Choose a project' });
   await projectPicker.selectOption(PROJECT_ID);
   await page.locator(`#file-${FILE_ID}`).getByRole('button', { name: 'Preview' }).click();
@@ -177,7 +185,7 @@ test('delayed preview and upload responses from a prior project are discarded', 
 test('preview Escape and close button close the native dialog and restore its opener focus', async ({ page }) => {
   await installProjectFixtureRoutes(page);
   await page.route(`**/api/v1/projects/${PROJECT_ID}/files/${FILE_ID}/content`, (route) => route.fulfill({ status: 200, contentType: 'application/pdf', body: '%PDF-preview' }));
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   const opener = page.locator(`#file-${FILE_ID}`).getByRole('button', { name: 'Preview' });
   await opener.click();
   const dialog = page.getByRole('dialog', { name: /Preview/ });
@@ -254,7 +262,7 @@ test('API, CSRF acquisition, and blob requests reject redirects', async ({ page 
 
 test('Thai upload error text is localized and removal dialog Escape restores focus', async ({ page }) => {
   await installProjectFixtureRoutes(page);
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.getByRole('button', { name: 'TH' }).click();
   await page.getByLabel('อัปโหลดไฟล์โครงการ').setInputFiles({ name: 'unsafe.exe', mimeType: 'application/x-msdownload', buffer: Buffer.from('x') });
   await expect(page.getByText('ไม่รองรับไฟล์ชนิดนี้')).toBeVisible();
@@ -268,10 +276,13 @@ test('Thai upload error text is localized and removal dialog Escape restores foc
 test('Thai API failures, citation access, artifact kinds, and run errors use localized labels', async ({ page }) => {
   await installProjectFixtureRoutes(page);
   await page.route(`**/api/v1/projects/${PROJECT_ID}/files/${FILE_ID}/content`, (route) => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ code: 'storage_unavailable', message: 'Secure storage is unavailable.', request_id: 'localized-error' }) }));
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.getByRole('button', { name: 'TH' }).click();
+  await page.getByRole('navigation', { name: 'ผลงานของโครงการ' }).getByRole('button', { name: /^แหล่งอ้างอิง/ }).click();
   await expect(page.getByText('บทคัดย่อ')).toBeVisible();
+  await page.getByRole('navigation', { name: 'ผลงานของโครงการ' }).getByRole('button', { name: /^รายงานและผลงาน/ }).click();
   await expect(page.getByText('รายงาน').first()).toBeVisible();
+  await page.getByRole('navigation', { name: 'ผลงานของโครงการ' }).getByRole('button', { name: /^ไฟล์ประกอบ/ }).click();
   await page.locator(`#file-${FILE_ID}`).getByRole('button', { name: 'ดูตัวอย่าง' }).click();
   await expect(page.getByText('พื้นที่จัดเก็บที่ปลอดภัยไม่พร้อมใช้งาน')).toBeVisible();
   await expect(page.getByText('Secure storage is unavailable.')).toHaveCount(0);
@@ -285,7 +296,7 @@ test('Thai API failures, citation access, artifact kinds, and run errors use loc
 test('Thai network failures use a localized generic message instead of English caller fallbacks', async ({ page }) => {
   await installProjectFixtureRoutes(page);
   await page.route(`**/api/v1/projects/${PROJECT_ID}/files/${FILE_ID}/content`, (route) => route.abort('failed'));
-  await page.goto(`/projects/${PROJECT_ID}/library`);
+  await page.goto(`/projects/${PROJECT_ID}/library#outputs-files`);
   await page.getByRole('button', { name: 'TH' }).click();
   await page.locator(`#file-${FILE_ID}`).getByRole('button', { name: 'ดูตัวอย่าง' }).click();
   await expect(page.getByText('เชื่อมต่อบริการไม่สำเร็จ โปรดลองอีกครั้ง')).toBeVisible();
