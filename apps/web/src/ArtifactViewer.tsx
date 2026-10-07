@@ -138,11 +138,17 @@ export function ArtifactCard({ artifact, onExpand, language }: { artifact: Artif
   </article>;
 }
 
-export function ArtifactViewer({ artifact, onClose, language }: { artifact: ArtifactView; onClose: () => void; language: Language }) {
+export function ArtifactViewer({ artifact, projectName, onClose, language }: { artifact: ArtifactView; projectName?: string; onClose: () => void; language: Language }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => { const node = dialog.current; if (node && !node.open) node.showModal(); }, []);
   return <dialog ref={dialog} className="artifact-dialog" aria-labelledby="artifact-dialog-title" onCancel={(event) => { event.preventDefault(); onClose(); }} onClose={onClose}>
-    <div className="drawer-head"><h2 id="artifact-dialog-title">{artifact.title}</h2><button type="button" className="button button-quiet button-small" onClick={onClose}>{text(language, 'Close', 'ปิด')}</button></div>
-    <ArtifactBody artifact={artifact} language={language} />
+    <div className="drawer-head"><div><p className="eyebrow">{text(language, 'OUTPUT DETAIL', 'รายละเอียดผลลัพธ์')}</p><h2 id="artifact-dialog-title">{artifact.title}</h2></div><button type="button" className="button button-quiet button-small" onClick={onClose}>{text(language, 'Close', 'ปิด')}</button></div>
+    <div className="artifact-inspector-layout"><div className="artifact-detail-content"><ArtifactBody artifact={artifact} language={language} /></div>
+      <aside className="artifact-inspector" aria-label={text(language, 'Artifact details', 'รายละเอียดผลลัพธ์')}>
+        <p className="notebook-label">{text(language, 'PROVENANCE', 'ที่มา')}</p>
+        <dl><dt>{text(language, 'Project', 'โครงการ')}</dt><dd>{projectName ?? artifact.project_id.slice(0, 8)}</dd><dt>{text(language, 'Run', 'การทำงาน')}</dt><dd>{artifact.run_id.slice(0, 8)}</dd><dt>{text(language, 'Type', 'ประเภท')}</dt><dd>{artifact.kind}</dd><dt>{text(language, 'Size', 'ขนาด')}</dt><dd>{artifact.size.toLocaleString()} {text(language, 'bytes', 'ไบต์')}</dd><dt>SHA-256</dt><dd className="hash-value">{artifact.sha256}</dd></dl>
+        {artifact.partial && <p className="partial-output">{text(language, 'Partial output', 'ผลลัพธ์บางส่วน')}</p>}
+      </aside>
+    </div>
   </dialog>;
 }

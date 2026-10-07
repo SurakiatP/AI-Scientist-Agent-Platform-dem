@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunReadinessView, RunView, ScientificBindingV2 } from '../../../contracts/api-types';
+import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, ProjectView, RunReadinessView, RunView, ScientificBindingV2, SessionView } from '../../../contracts/api-types';
 import { ApiError, apiErrorMessage, preparePlan, request, requestBlob, strictPlanView, strictReadiness, validUuid, type CsvSelection, type ResearchWorkflow } from './api';
 import { useAppPreferences } from './App';
 import { ArtifactCard, ArtifactViewer } from './ArtifactViewer';
@@ -44,6 +44,25 @@ const json = (body: unknown): RequestInit => ({ method: 'POST', headers: { 'Cont
 type DecisionBody = { decision_id: string; expected_revision: number; idempotency_key: string; choice: DecisionChoice; add_tokens?: number; add_elapsed_ms?: number; usage_tokens?: number };
 const submitDecision = (runId: string, body: DecisionBody) => request<RunView>(`/api/v1/runs/${runId}/decisions`, json(body));
 
+function ProjectNavigation({ projectId, sessionId, project, sessions, language }: { projectId: string; sessionId: string; project: ProjectView | null; sessions: SessionView[]; language: 'th' | 'en' }) {
+  const tx = (en: string, th: string) => text(language, en, th);
+  const current = sessions.find((session) => session.id === sessionId && session.project_id === projectId);
+  return <div className="project-navigation-content">
+    <Link className="notebook-wordmark" to="/projects">{tx('AI Scientist', 'AI Scientist')}</Link>
+    <div className="notebook-project">
+      <span className="notebook-label">{tx('Project', 'โครงการ')}</span>
+      <Link to={`/projects/${encodeURIComponent(projectId)}`} className="notebook-project-link">{project?.name ?? `#${projectId.slice(0, 8)}`}</Link>
+      <Link to={`/projects/${encodeURIComponent(projectId)}/library`} className="notebook-subtle-link">{tx('Project files', 'ไฟล์ของโครงการ')}</Link>
+    </div>
+    <nav className="notebook-sessions" aria-label={tx('Sessions', 'บทสนทนา')}>
+      <span className="notebook-label">{tx('Sessions', 'บทสนทนา')}</span>
+      <Link to={`/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}`} className="notebook-session selected" aria-current="page">{current?.title ?? `${tx('Session', 'บทสนทนา')} ${sessionId.slice(0, 8)}`}</Link>
+      {sessions.filter((session) => session.id !== sessionId && session.project_id === projectId).map((session) => <Link key={session.id} to={`/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(session.id)}`} className="notebook-session">{session.title}</Link>)}
+    </nav>
+    <div className="notebook-lower-links"><Link to={`/projects/${encodeURIComponent(projectId)}/runs`}>{tx('Run history', 'ประวัติการทำงาน')}</Link></div>
+  </div>;
+}
+
 function ChatSession({ pollMs }: { pollMs: number }) {
   const { projectId = '', sessionId = '' } = useParams();
   const { language } = useAppPreferences();
@@ -56,6 +75,8 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const requestedRun = searchParams.get('run');
   const base = `/api/v1/projects/${encodeURIComponent(projectId)}`;
   const draftKey = `research-draft:${sessionId}`; // question text and file ids only; never secrets
+  const [project, setProject] = useState<ProjectView | null>(null);
+  const [sessions, setSessions] = useState<SessionView[]>([]);
   const [messages, setMessages] = useState<MessageView[]>([]);
   const [files, setFiles] = useState<FileView[]>([]);
   const [connections, setConnections] = useState<ConnectionView[] | null>(null);
@@ -112,6 +133,8 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     const controller = new AbortController();
     const signal = controller.signal;
     // Independent loads: a missing connections route must not hide messages or files.
+    void request<ProjectView>(base, { signal }).then((next) => { if (!signal.aborted && next.id === projectId) setProject(next); }).catch(() => { if (!signal.aborted) setProject(null); });
+    void request<SessionView[]>(`${base}/sessions`, { signal }).then((items) => { if (!signal.aborted) setSessions(items.filter((item) => item.project_id === projectId)); }).catch(() => { if (!signal.aborted) setSessions([]); });
     void request<MessageView[]>(`/api/v1/sessions/${sessionId}/messages`, { signal }).then((m) => { if (!signal.aborted) setMessages(m); }).catch((reason: unknown) => { if (!signal.aborted) setError(apiErrorMessage(reason, language, 'Unable to load this conversation.')); });
     void request<FileView[]>(`${base}/files`, { signal }).then((f) => { if (!signal.aborted) setFiles(f); }).catch((reason: unknown) => { if (!signal.aborted) setError(apiErrorMessage(reason, language, 'Unable to load project files.')); });
     // TODO(contract): no connections route exists yet; failure leaves connections null ("Settings unavailable").
@@ -133,8 +156,13 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       if (!controller.signal.aborted) {
         const scoped = all.filter((r) => r.project_id === projectId && r.session_id === sessionId && validUuid(r.run_id));
         if (requestedRun !== null) {
-          const selectedRun = scoped.find((item) => item.run_id === requestedRun) ?? null;
-          setRunSelectionError(selectedRun === null); setActiveRun(selectedRun);
+          const listedRun = scoped.find((item) => item.run_id === requestedRun);
+          if (listedRun) { setRunSelectionError(false); setActiveRun(listedRun); }
+          else request<RunView>(`/api/v1/runs/${encodeURIComponent(requestedRun)}`, { signal: controller.signal }).then((candidate) => {
+            if (controller.signal.aborted) return;
+            const selectedRun = candidate.run_id === requestedRun && validUuid(candidate.run_id) && candidate.project_id === projectId && candidate.session_id === sessionId ? candidate : null;
+            setRunSelectionError(selectedRun === null); setActiveRun(selectedRun);
+          }).catch(() => { if (!controller.signal.aborted) { setRunSelectionError(true); setActiveRun(null); } });
         } else setActiveRun((current) => current ?? scoped.at(-1) ?? null);
       }
     }).catch(() => { if (!controller.signal.aborted && requestedRun !== null) setRunSelectionError(true); });
@@ -368,9 +396,14 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   const expandedArtifact = [run, ...archived].flatMap((r) => r?.artifacts ?? []).find((a) => a.artifact_id === expanded);
 
   return <section className="research-chat">
-    <div className="page-heading"><p className="eyebrow">{text(language, 'Research conversation', 'บทสนทนาวิจัย')}</p><h1 className="route-heading" tabIndex={-1}>{text(language, 'Research chat', 'แชตวิจัย')}</h1>
-      <p><Link to={`/projects/${projectId}`}>{text(language, 'Project details', 'รายละเอียดโครงการ')}</Link></p></div>
-    <section aria-label={text(language, 'Conversation', 'บทสนทนา')}><ol>{messages.map((m) => <li key={m.id}><strong>{m.role === 'assistant' ? text(language, 'Assistant', 'ผู้ช่วย') : text(language, 'You', 'คุณ')}:</strong> <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span></li>)}</ol></section>
+    <aside className="notebook-rail" aria-label={text(language, 'Project and sessions', 'โครงการและบทสนทนา')}><ProjectNavigation projectId={projectId} sessionId={sessionId} project={project} sessions={sessions} language={language} /></aside>
+    <details className="mobile-project-navigation"><summary>{text(language, 'Project and sessions', 'โครงการและบทสนทนา')}</summary><ProjectNavigation projectId={projectId} sessionId={sessionId} project={project} sessions={sessions} language={language} /></details>
+    <div className="notebook-main">
+    <div className="page-heading"><p className="eyebrow">{text(language, 'RESEARCH NOTEBOOK', 'สมุดบันทึกวิจัย')}</p><h1 className="route-heading" tabIndex={-1}>{text(language, 'Research chat', 'แชตวิจัย')}</h1>
+      <p>{project?.name ?? text(language, 'Current project', 'โครงการปัจจุบัน')} · {sessions.find((item) => item.id === sessionId)?.title ?? text(language, 'Current session', 'บทสนทนาปัจจุบัน')}</p>
+      <p><Link to={`/projects/${projectId}`}>{text(language, 'Project details', 'รายละเอียดโครงการ')}</Link></p>
+    </div>
+    <section className="notebook-conversation" aria-label={text(language, 'Conversation', 'บทสนทนา')}><ol className="notebook-messages">{messages.map((m) => <li key={m.id} className={`notebook-message ${m.role === 'assistant' ? 'assistant' : 'owner'}`}><strong>{m.role === 'assistant' ? text(language, 'Assistant', 'ผู้ช่วย') : text(language, 'You', 'คุณ')}:</strong> <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span></li>)}</ol></section>
     {runSelectionError && <p role="alert">{text(language, 'The requested run is unavailable in this project and conversation.', 'ไม่พบการทำงานที่ร้องขอในโครงการและบทสนทนานี้')}</p>}
     {planError !== null && <p role="alert">{apiErrorMessage(planError, language)}</p>}
     {run && <RunProgress run={run} events={events} pendingDecisions={pendingDecisions} connected={connected} onStop={() => void stop()} stopPending={stopPending} onDecision={(d, choice, usage) => void decide(d, choice, usage)} onRetry={retry} />}
@@ -406,9 +439,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       <button type="button" className="button button-small" disabled={dirty || !approvalReady || approving || preparingPlan} onClick={() => void approve()}>{approving ? text(language, 'Checking approval…', 'กำลังตรวจสอบการอนุมัติ…') : text(language, 'Approve plan', 'อนุมัติแผน')}</button>
       {dirty && <p>{text(language, 'Save your edits and review the new plan; the previous approval no longer applies.', 'บันทึกการแก้ไขและตรวจทานแผนใหม่ การอนุมัติก่อนหน้าไม่มีผลแล้ว')}</p>}
     </section>}
-    {run && run.artifacts.length > 0 && <section aria-label={text(language, 'Outputs', 'ผลลัพธ์')}><h2>{text(language, 'Outputs', 'ผลลัพธ์')}</h2>{run.artifacts.map(card)}</section>}
-    {archived.map((old) => <section key={old.run_id} aria-label={text(language, 'Previous run', 'การทำงานก่อนหน้า')}><h2>{text(language, 'Previous run (kept)', 'การทำงานก่อนหน้า (เก็บไว้)')}</h2>{old.artifacts.map(card)}</section>)}
-    <section aria-label={text(language, 'Composer', 'ส่งคำถาม')}>
+    <section className="notebook-composer" aria-label={text(language, 'Composer', 'ส่งคำถาม')}>
       {retryOf && <p role="status">{text(language, 'Retrying a previous run. Review the question and files, then approve a new plan; earlier outputs stay separate.', 'กำลังลองงานก่อนหน้าใหม่ ตรวจทานคำถามและไฟล์ แล้วอนุมัติแผนใหม่ ผลลัพธ์เดิมยังแยกไว้')}</p>}
       <label htmlFor="question">{text(language, 'Research question', 'คำถามวิจัย')}</label>
       <textarea id="question" value={question} onChange={(e) => setQuestion(e.target.value)} />
@@ -434,7 +465,14 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       {error && <p role="alert">{error}</p>}
       <button type="button" className="button button-primary" disabled={submitting || connectionsLoading} onClick={() => void submit()}>{submitting ? text(language, 'Creating…', 'กำลังสร้าง…') : text(language, 'Review plan', 'ตรวจทานแผน')}</button>
     </section>
-    {expandedArtifact && <ArtifactViewer artifact={expandedArtifact} onClose={closeOutput} language={language} />}
+    </div>
+    <aside className="notebook-outputs" aria-label={text(language, 'Outputs', 'ผลลัพธ์')}>
+      <p className="notebook-label">{text(language, 'SESSION OUTPUTS', 'ผลลัพธ์บทสนทนา')}</p><h2>{text(language, 'Outputs', 'ผลลัพธ์')}</h2>
+      {run && run.artifacts.length > 0 && <section aria-label={text(language, 'Current run outputs', 'ผลลัพธ์งานปัจจุบัน')}>{run.artifacts.map(card)}</section>}
+      {archived.map((old) => <section key={old.run_id} aria-label={text(language, 'Previous run (kept)', 'การทำงานก่อนหน้า (เก็บไว้)')}><h3>{text(language, 'Previous run (kept)', 'การทำงานก่อนหน้า (เก็บไว้)')}</h3>{old.artifacts.map(card)}</section>)}
+      {(!run || run.artifacts.length === 0) && archived.length === 0 && <p>{text(language, 'Completed work and outputs will appear here.', 'งานและผลลัพธ์ที่เสร็จแล้วจะแสดงที่นี่')}</p>}
+    </aside>
+    {expandedArtifact && <ArtifactViewer artifact={expandedArtifact} projectName={project?.name} onClose={closeOutput} language={language} />}
   </section>;
 }
 export function Chat({ pollMs = 400 }: { pollMs?: number }) {

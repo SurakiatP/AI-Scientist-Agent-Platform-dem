@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { RunEvent } from '../../../contracts/api-types';
 import { CONNECTION_ID, DECISION_BUDGET, DECISION_UNKNOWN, NEW_RUN_ID, PROJECT_ID, RUN_ID, SESSION_ID, SESSION_URL, event, installResearchFixtureRoutes, makeRun, report } from './fixtures/research';
-import { REPORT_ID } from './fixtures/project';
+import { OTHER_PROJECT_ID, REPORT_ID } from './fixtures/project';
 
 type ChatEventSource = { url: string; closed: boolean; emit: (item: unknown) => void; fail: () => void };
 
@@ -40,6 +40,48 @@ async function emitChatEvent(page: Page, index: number, item: unknown) {
 async function failChatStream(page: Page, index: number) {
   await page.evaluate((index) => (window as typeof window & { __chatEventSources: ChatEventSource[] }).__chatEventSources[index].fail(), index);
 }
+
+test('notebook workspace keeps scoped navigation, messages, outputs, and expanded artifact usable on mobile', async ({ page }) => {
+  await installResearchFixtureRoutes(page, { messages: [
+    { id: 'm1', sequence: 1, role: 'user', content: 'Original question about diffusion' },
+    { id: 'm2', sequence: 2, role: 'assistant', content: 'Compare the available evidence.' },
+  ] });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(SESSION_URL);
+
+  const projectNav = page.getByRole('complementary', { name: 'Project and sessions' });
+  const conversation = page.getByRole('region', { name: 'Conversation' });
+  const outputs = page.getByRole('complementary', { name: 'Outputs' });
+  await expect(projectNav.getByText('Diffusion study', { exact: true })).toBeVisible();
+  await expect(projectNav.getByRole('link', { name: 'Temperature effects', exact: true })).toHaveAttribute('href', `/projects/${PROJECT_ID}/sessions/44444444-4444-4444-8444-444444444444`);
+  await expect(conversation.getByText('Original question about diffusion')).toBeVisible();
+  await expect(conversation.getByText('Compare the available evidence.')).toBeVisible();
+  expect(await conversation.locator('.notebook-message.owner').evaluate((node) => getComputedStyle(node).alignSelf)).toBe('flex-end');
+  expect(await conversation.locator('.notebook-message.assistant').evaluate((node) => getComputedStyle(node).alignSelf)).toBe('flex-start');
+  expect(await conversation.locator('ol').evaluate((node) => getComputedStyle(node).listStyleType)).toBe('none');
+  await expect(outputs.getByText('Concentration profile', { exact: true })).toBeVisible();
+  const columns = await Promise.all([projectNav, conversation, outputs].map((region) => region.boundingBox()));
+  expect(columns.every(Boolean)).toBe(true);
+  expect(columns[0]!.x + columns[0]!.width).toBeLessThan(columns[1]!.x);
+  expect(columns[1]!.x + columns[1]!.width).toBeLessThan(columns[2]!.x);
+
+  const expand = outputs.getByRole('button', { name: 'Expand visual: Concentration profile' });
+  await expand.click();
+  const dialog = page.getByRole('dialog', { name: 'Concentration profile' });
+  await expect(dialog.getByText('Diffusion study', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('Project', { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/output=dddddddd-dddd-4ddd-8ddd-dddddddddddd/);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+  await expect(expand).toBeFocused();
+  await expect(page).not.toHaveURL(/output=/);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  const mobileNav = page.locator('details.mobile-project-navigation');
+  await mobileNav.locator('summary').click();
+  await expect(mobileNav.getByRole('link', { name: 'Temperature effects', exact: true })).toBeVisible();
+});
 
 async function publishChatEvents(page: Page, fixture: { pushEvents: (...items: RunEvent[]) => void }, ...items: RunEvent[]) {
   fixture.pushEvents(...items);
@@ -652,6 +694,21 @@ test('terminal run snapshots show final status instead of a disconnected active-
   await expect(page.getByRole('heading', { name: 'หยุดแล้ว' })).toBeVisible();
   await expect(thaiProgress.getByText('งานสิ้นสุดแล้ว', { exact: true })).toBeVisible();
   await expect(thaiProgress.getByText(/งานอาจยังทำงานอยู่/)).toHaveCount(0);
+});
+
+test('an unlisted requested run is restored only when its project and session match', async ({ page }) => {
+  await installResearchFixtureRoutes(page);
+  let directRun = makeRun({ project_id: OTHER_PROJECT_ID, artifacts: [] });
+  await page.route(`**/api/v1/projects/${PROJECT_ID}/runs`, (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
+  await page.route(`**/api/v1/runs/${RUN_ID}`, (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(directRun) }));
+  await page.goto(`${SESSION_URL}?run=${RUN_ID}`);
+  await expect(page.getByRole('alert').filter({ hasText: 'requested run is unavailable' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Waiting approval' })).toHaveCount(0);
+
+  directRun = makeRun({ state: 'awaiting_approval', artifacts: [] });
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Waiting approval' })).toBeVisible();
+  await expect(page.getByRole('alert').filter({ hasText: 'requested run is unavailable' })).toHaveCount(0);
 });
 
 test('a delayed empty session bootstrap cannot erase a run submitted while it was pending', async ({ page }) => {
