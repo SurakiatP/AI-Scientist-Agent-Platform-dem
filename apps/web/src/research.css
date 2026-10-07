@@ -49,12 +49,17 @@
   --notebook-blue-soft: var(--soft);
   display: grid;
   grid-template-columns: 210px minmax(0, 1fr) 280px;
-  align-items: start;
-  gap: 22px;
+  align-items: stretch;
+  gap: 0;
   width: 100%;
   max-width: 1560px;
+  min-height: 530px;
   margin: 0 auto;
-  padding: 24px 22px 60px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
 }
 .research-chat > section, .research-chat > .notebook-main > section, .artifact-card {
   padding: 16px;
@@ -66,15 +71,15 @@
 .research-chat .page-heading { padding: 10px 4px 14px; }
 .research-chat .page-heading > p:last-child { color: var(--muted); }
 .notebook-rail, .notebook-outputs {
-  position: sticky;
-  top: 18px;
+  position: static;
   min-width: 0;
-  padding: 16px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-card);
+  min-height: 100%;
+  padding: 22px 16px;
+  border: 0;
+  border-radius: 0;
   background: var(--surface);
 }
-.notebook-rail { color: var(--sidebar-ink); border-color: var(--sidebar); background: var(--sidebar); }
+.notebook-rail { color: var(--sidebar-ink); border-right: 1px solid var(--line); background: var(--sidebar); }
 .notebook-rail .notebook-wordmark, .notebook-rail .notebook-project-link, .notebook-rail .notebook-subtle-link, .notebook-rail .notebook-lower-links a, .notebook-rail .notebook-session { color: var(--sidebar-ink); }
 .notebook-rail .notebook-label { color: var(--sidebar-ink); }
 .notebook-rail .notebook-session.selected { color: var(--accent); background: var(--soft); }
@@ -87,20 +92,30 @@
 .notebook-sessions { display: grid; gap: 5px; }
 .notebook-session { display: block; overflow-wrap: anywhere; padding: 8px 9px; border-radius: 8px; color: var(--ink); text-decoration: none; }
 .notebook-session.selected { background: var(--notebook-blue-soft); color: var(--notebook-blue); font-weight: 700; }
-.notebook-main { display: grid; min-width: 0; gap: 16px; }
+.notebook-main { display: grid; min-width: 0; gap: 0; padding: 28px 18px; background: var(--canvas); }
 .notebook-main > .page-heading { margin: 0; }
 .notebook-conversation { min-height: 150px; }
 .notebook-messages { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; list-style: none; }
 .notebook-message { max-width: min(92%, 720px); padding: 12px 15px; border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
-.notebook-message.assistant { align-self: flex-start; background: var(--soft); }
-.notebook-message.owner { align-self: flex-end; color: var(--sidebar-ink); background: var(--sidebar); border-color: var(--sidebar); }
+.notebook-message.assistant { align-self: flex-start; padding: 0; border-color: transparent; background: transparent; }
+.notebook-message.owner { align-self: flex-end; padding: 11px 16px; color: var(--ink); background: var(--notebook-blue-soft); border-color: var(--notebook-blue-soft); border-radius: 12px 12px 2px 12px; }
 .notebook-message strong { display: block; margin-bottom: 3px; font-size: .76rem; }
-.notebook-composer { display: grid; gap: 10px; }
-.notebook-composer > label { font-size: .86rem; font-weight: 700; }
+.research-chat > .notebook-main > .notebook-conversation, .research-chat > .notebook-main > .notebook-composer { padding: 0; border: 0; border-radius: 0; background: transparent; }
+.notebook-composer { display: grid; gap: 9px; margin-top: 18px; }
+.notebook-composer > label { font-size: .8rem; font-weight: 650; }
 .notebook-composer textarea#question { min-height: 72px; }
-.notebook-composer > select, .notebook-composer > input { width: 100%; }
+.notebook-composer textarea, .notebook-composer select, .notebook-composer input:not([type="checkbox"]):not([type="radio"]) {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--surface);
+  font: inherit;
+  line-height: 1.5;
+}
 .notebook-composer ul { display: grid; gap: 6px; margin: 0; padding-left: 20px; }
-.notebook-outputs { display: grid; gap: 12px; }
+.notebook-outputs { display: grid; align-content: start; gap: 12px; padding: 23px 18px; border-left: 1px solid var(--line); }
 .notebook-outputs h2 { margin: 0; color: var(--notebook-blue); font-size: 1.08rem; }
 .notebook-outputs > section { display: grid; gap: 10px; padding: 12px; }
 .notebook-outputs > section h3 { margin: 0; font-size: .88rem; }
@@ -125,7 +140,7 @@
 
 @media (max-width: 1080px) {
   .research-chat { grid-template-columns: 190px minmax(0, 1fr); }
-  .notebook-outputs { position: static; grid-column: 2; }
+  .notebook-outputs { grid-column: 2; border-left: 0; border-top: 1px solid var(--line); }
   .notebook-outputs > section { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
 }
 @media (max-width: 700px) {
@@ -134,8 +149,8 @@
   .mobile-project-navigation { display: block; grid-row: 1; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface); }
   .mobile-project-navigation summary { padding: 12px 14px; color: var(--notebook-blue); font-weight: 700; cursor: pointer; }
   .mobile-project-navigation > .project-navigation-content { padding: 0 14px 14px; }
-  .notebook-main { grid-row: 2; }
-  .notebook-outputs { grid-column: 1; grid-row: 3; }
+  .notebook-main { grid-row: 2; gap: 12px; padding: 16px 14px; }
+  .notebook-outputs { grid-column: 1; grid-row: 3; padding: 16px 14px; }
   .artifact-dialog { padding: 14px; }
   .artifact-inspector-layout { grid-template-columns: minmax(0, 1fr); gap: 12px; }
 }
