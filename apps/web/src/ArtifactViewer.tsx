@@ -95,11 +95,13 @@ function Report({ artifact, language }: { artifact: ArtifactView; language: Lang
     setContent(null); setError(null);
     void requestBlob(`/api/v1/artifacts/${encodeURIComponent(artifact.artifact_id)}/content`, controller.signal).then(async ({ blob, contentType }) => {
       if (controller.signal.aborted) return;
+      const svgFileFallback = contentType === 'application/octet-stream' && artifact.kind === 'file' && artifact.title.toLowerCase().endsWith('.svg');
       const media = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml', 'application/pdf'].includes(contentType);
       const readable = ['text/plain', 'text/markdown', 'text/csv', 'application/json'].includes(contentType);
-      if (media) {
-        objectUrl = URL.createObjectURL(blob);
-        setContent({ type: contentType, body: null, url: objectUrl });
+      if (media || svgFileFallback) {
+        const preview = svgFileFallback ? new Blob([blob], { type: 'image/svg+xml' }) : blob;
+        objectUrl = URL.createObjectURL(preview);
+        setContent({ type: svgFileFallback ? 'image/svg+xml' : contentType, body: null, url: objectUrl });
       } else if (readable && blob.size <= MAX_TEXT_BYTES) {
         let body = await blob.text();
         if (controller.signal.aborted) return;
@@ -114,7 +116,7 @@ function Report({ artifact, language }: { artifact: ArtifactView; language: Lang
       } else setContent({ type: 'unsupported', body: null, url: null, truncated: readable });
     }).catch((reason) => { if (!controller.signal.aborted) setError(reason); });
     return () => { controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [artifact.project_id, artifact.artifact_id, artifact.sha256]);
+  }, [artifact.project_id, artifact.artifact_id, artifact.sha256, artifact.kind, artifact.title]);
   if (error !== null) return <p role="alert">{apiErrorMessage(error, language)}</p>;
   if (!content) return <p role="status">{text(language, 'Loading output…', 'กำลังโหลดผลลัพธ์…')}</p>;
   if (content.type.startsWith('image/') && content.url) return <img className="artifact-image" src={content.url} alt={artifact.title} />;
