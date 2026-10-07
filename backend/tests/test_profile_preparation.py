@@ -361,6 +361,20 @@ def test_idempotency_and_project_bound_readback(db, owner):
         prep.get_job(db, outsider, project, first.id)
 
 
+def test_verified_preparation_can_be_bound_to_another_project_without_rebuilding(db, owner):
+    first_project, second_project = new_project(db), new_project(db)
+    builder_calls = []
+    prep.configure_builder(lambda profile, job_id: builder_calls.append(job_id) or proof(profile, job_id), expected_image_digest="sha256:" + "a" * 64, evidence_key=b"k" * 32)
+    first = prep.request_preparation(db, owner, first_project, submission())
+    db.commit()
+    assert prep.process_next_job(db, owner_identity=owner.identity) == first.id
+    assert prep.get_job(db, owner, first_project, first.id).evidence_verified
+
+    reused = prep.request_preparation(db, owner, second_project, submission())
+    assert reused.id == first.id and reused.state == "ready"
+    assert [item.id for item in prep.get_setup(db, owner, second_project).preparations] == [first.id]
+    assert builder_calls == [first.id]
+
 def test_concurrent_requests_share_one_recorded_job(db, owner):
     project = new_project(db)
 
