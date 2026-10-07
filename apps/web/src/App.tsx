@@ -70,9 +70,19 @@ function InternalNavigation({ language, close }: { language: 'th' | 'en'; close?
   const activePath = /^\/projects\/[^/]+\/library$/.test(pathname) ? '/sources' : /^\/projects\/[^/]+\/runs$/.test(pathname) ? '/history' : pathname;
   return <nav aria-label={t('navLabel', language)}>
     {internalLinks.map(([to, key, glyph]) => <Link key={to} to={to} onClick={close} aria-current={activePath === to || activePath.startsWith(`${to}/`) ? 'page' : undefined} className={`workspace-link${activePath === to || activePath.startsWith(`${to}/`) ? ' active' : ''}`}>
-      <span className={`nav-glyph glyph-${glyph}`} aria-hidden="true" />{t(key, language)}
+      <NavigationGlyph name={glyph} /><span className="workspace-link-label">{t(key, language)}</span>
     </Link>)}
   </nav>;
+}
+
+function NavigationGlyph({ name }: { name: typeof internalLinks[number][2] }) {
+  const paths = {
+    projects: <><rect x="4" y="4" width="6.5" height="6.5" rx="1.5" /><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5" /><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5" /><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5" /></>,
+    sources: <><path d="M3.5 7.5h6l2 2h9v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" /><path d="M3.5 7.5v-2a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v2" /></>,
+    history: <><path d="M3.5 11a8.5 8.5 0 1 1 2.3 5.8" /><path d="M3.5 5.5v5h5" /><path d="M12 7v5l3.4 2" /></>,
+    settings: <><path d="M4 6h16M4 12h16M4 18h16" /><circle cx="9" cy="6" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="8" cy="18" r="2" /></>,
+  };
+  return <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">{paths[name]}</svg>;
 }
 
 export function AppShell() {
@@ -98,11 +108,11 @@ export function AppShell() {
       <LanguageSwitch language={language} setLanguage={preferences.setLanguage} />
     </header>}
     {!isLanding && !isChat && <aside className="workspace-sidebar">
-      <Link to="/" className="sidebar-brand"><span>AI Scientist<br />Agent Platform</span></Link>
-      <p className="sidebar-section-label">YOUR RESEARCH SPACE</p>
+      <Link to="/" className="sidebar-brand" aria-label={t('brand', language)}><span className="sidebar-brand-mark"><FlaskMark /></span><span className="sidebar-brand-copy"><strong>AI Scientist</strong><small>{language === 'th' ? 'พื้นที่วิจัย' : 'RESEARCH WORKSPACE'}</small></span><span className="sidebar-brand-spark" aria-hidden="true">✳</span></Link>
+      <p className="sidebar-section-label">{language === 'th' ? 'พื้นที่วิจัยของคุณ' : 'YOUR RESEARCH SPACE'}</p>
       <InternalNavigation language={language} />
       <LanguageSwitch language={language} setLanguage={preferences.setLanguage} />
-      <footer className="sidebar-footer"><span className="footer-workspace-icon" aria-hidden="true">⌂</span><span>{language === 'th' ? 'พื้นที่ทำงานในเครื่อง' : 'Local workspace'}</span></footer>
+      <footer className="sidebar-footer"><span className="footer-workspace-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="m3.5 10 8.5-7 8.5 7" /><path d="M5.5 9v11h13V9M9.5 20v-6h5v6" /></svg></span><span>{language === 'th' ? 'พื้นที่ทำงานในเครื่อง' : 'Local workspace'}</span></footer>
     </aside>}
     <div className="app-content">
       <main id="main" tabIndex={-1}>

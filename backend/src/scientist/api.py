@@ -18,7 +18,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from scientist import domain, files, objects, research, supervisor, profile_preparation
+from scientist import domain, files, objects, research, supervisor, profile_preparation, settings
+from scientist.provider_catalog import catalog as provider_catalog
 from scientist import secrets as secret_store
 from scientist.auth import DomainError, authenticate_owner_session
 from scientist.contracts import CsvResearchSelection, DecisionSubmit, ObjectRef, PlanSpec, Principal, PreparationSubmit
@@ -167,6 +168,13 @@ def _error(request: Request, status: int, code: str, **extra) -> JSONResponse:
 def capabilities():
     return {"file_types": sorted(files._TYPES), "max_upload_bytes": MAX_UPLOAD_BYTES,
             "protocols": {"mcp": "not_configured", "a2a": "not_configured"}}
+
+
+@router.get("/providers")
+def providers(request: Request):
+    if _principal(request).kind != "owner":
+        raise DomainError("forbidden", 403)
+    return JSONResponse(provider_catalog(settings.provider_destinations()), headers={"Cache-Control": "no-store"})
 
 
 @router.get("/connections")

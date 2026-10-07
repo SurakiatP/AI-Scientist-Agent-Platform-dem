@@ -10,7 +10,7 @@ const SYNTHETIC_PEER_SECRET = 'synthetic-peer-secret-settings-test';
 const ONE_TIME_TOKEN = 'synthetic-once-only-scoped-token';
 
 type Write = { method: string; path: string; body: unknown };
-type SettingsOverrides = { connectionFailure?: boolean; connectionMutationFailure?: boolean; legacyManualToken?: boolean };
+type SettingsOverrides = { connectionFailure?: boolean; connectionMutationFailure?: boolean; legacyManualToken?: boolean; providerFailure?: boolean };
 
 async function mockSettingsApi(page: Page, overrides: SettingsOverrides = {}) {
   const writes: Write[] = [];
@@ -46,6 +46,14 @@ async function mockSettingsApi(page: Page, overrides: SettingsOverrides = {}) {
       { id: PROJECT_ID, name: 'Cell signaling', revision: 1, instructions: '' },
       { id: SECOND_PROJECT_ID, name: 'Protein folding', revision: 1, instructions: '' },
     ]);
+    if (method === 'GET' && path === '/providers') {
+      if (overrides.providerFailure) return json({ code: 'storage_unavailable', request_id: 'providers-test' }, 503);
+      return json([
+        { slug: 'openai', name: 'OpenAI', origin: 'https://api.openai.com', provider_id: PROVIDER_ID, available: true, reason: null, model_hint: 'Your model ID' },
+        { slug: 'openrouter', name: 'OpenRouter', origin: 'https://openrouter.ai', provider_id: SECOND_PROJECT_ID, available: true, reason: null, model_hint: 'openai/gpt-4.1-mini' },
+        { slug: 'anthropic', name: 'Anthropic', origin: 'https://api.anthropic.com', provider_id: null, available: false, reason: 'native_adapter_required', model_hint: '' },
+      ]);
+    }
     if (method === 'GET' && path === '/connections') {
       if (connectionFailure) return json({ code: 'storage_unavailable', message: 'Secure storage is unavailable.', request_id: 'settings-test' }, 503);
       return json(connections);
@@ -133,12 +141,12 @@ test('settings saves masked credentials, keeps peer grants scoped, and never off
 
   await expect(page.getByRole('heading', { name: 'Configure your research workspace', level: 1 })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Connections' })).toBeVisible();
-  await page.getByLabel('Configured provider ID').fill(PROVIDER_ID);
+  await page.getByRole('combobox', { name: 'Provider', exact: true }).selectOption(PROVIDER_ID);
   await page.getByLabel('Connection name').fill('Literature model');
   await page.getByLabel('Model').fill('research-model-v1');
-  await page.getByLabel('Provider credential').fill(SYNTHETIC_PROVIDER_SECRET);
+  await page.getByLabel('API key', { exact: true }).fill(SYNTHETIC_PROVIDER_SECRET);
   await page.getByRole('button', { name: 'Save connection' }).click();
-  await expect(page.getByLabel('Provider credential')).toHaveValue('');
+  await expect(page.getByLabel('API key', { exact: true })).toHaveValue('');
   await expect(page.getByText('Configured; verification not run')).toBeVisible();
   await expect(page.getByText(SYNTHETIC_PROVIDER_SECRET)).toHaveCount(0);
 
@@ -182,6 +190,38 @@ test('settings saves masked credentials, keeps peer grants scoped, and never off
   ).join(' '));
   expect(persistedSecrets).not.toContain(SYNTHETIC_PROVIDER_SECRET);
   expect(persistedSecrets).not.toContain(SYNTHETIC_PEER_SECRET);
+});
+
+test('provider dropdown clears credentials on change and disables unsupported transports', async ({ page }) => {
+  const api = await mockSettingsApi(page);
+  await page.addInitScript(() => localStorage.setItem('scientist-platform.language', 'en'));
+  await page.goto('/settings');
+  const provider = page.getByRole('combobox', { name: 'Provider', exact: true });
+  await expect(page.getByRole('button', { name: 'Save connection' })).toBeDisabled();
+  await expect(provider.locator('option').filter({ hasText: 'Anthropic' })).toHaveAttribute('disabled', '');
+  await provider.selectOption(PROVIDER_ID);
+  await page.getByLabel('Model').fill('first-model');
+  await page.getByLabel('API key', { exact: true }).fill(SYNTHETIC_PROVIDER_SECRET);
+  await provider.selectOption(SECOND_PROJECT_ID);
+  await expect(page.getByLabel('Model')).toHaveValue('');
+  await expect(page.getByLabel('API key', { exact: true })).toHaveValue('');
+  await expect(page.getByLabel('Connection name')).toHaveValue('OpenRouter');
+  await expect(page.getByLabel('Model')).toHaveAttribute('placeholder', 'openai/gpt-4.1-mini');
+  await page.getByLabel('Model').fill('openai/research-model');
+  await page.getByLabel('API key', { exact: true }).fill(SYNTHETIC_PROVIDER_SECRET);
+  await page.getByRole('button', { name: 'Save connection' }).click();
+  await expect(page.getByLabel('API key', { exact: true })).toHaveValue('');
+  expect(api.writes.find((write) => write.path === '/connections')?.body).toEqual({ provider_id: SECOND_PROJECT_ID, label: 'OpenRouter', model: 'openai/research-model', secret: SYNTHETIC_PROVIDER_SECRET });
+});
+
+test('provider metadata failure prevents credential submission', async ({ page }) => {
+  const api = await mockSettingsApi(page, { providerFailure: true });
+  await page.addInitScript(() => localStorage.setItem('scientist-platform.language', 'en'));
+  await page.goto('/settings');
+  await expect(page.getByRole('combobox', { name: 'Provider', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Save connection' })).toBeDisabled();
+  await expect(page.getByRole('alert')).toBeVisible();
+  expect(api.writes).toHaveLength(0);
 });
 
 test('scoped tokens display once, list only metadata, copy, and revoke', async ({ page }) => {
@@ -251,10 +291,10 @@ test('connection mutation errors follow the current language in both directions'
   const api = await mockSettingsApi(page, { connectionMutationFailure: true });
   await page.addInitScript(() => localStorage.setItem('scientist-platform.language', 'en'));
   await page.goto('/settings');
-  await page.getByLabel('Configured provider ID').fill(PROVIDER_ID);
+  await page.getByRole('combobox', { name: 'Provider', exact: true }).selectOption(PROVIDER_ID);
   await page.getByLabel('Connection name').fill('Unavailable storage test');
   await page.getByLabel('Model').fill('fixture-model');
-  await page.getByLabel('Provider credential').fill(SYNTHETIC_PROVIDER_SECRET);
+  await page.getByLabel('API key', { exact: true }).fill(SYNTHETIC_PROVIDER_SECRET);
   await page.getByRole('button', { name: 'Save connection' }).click();
   const error = page.getByRole('region', { name: 'Connections' }).getByRole('alert');
   await expect(error).toContainText('Secure storage is unavailable.');

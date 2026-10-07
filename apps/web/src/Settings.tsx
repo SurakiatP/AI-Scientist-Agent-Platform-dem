@@ -4,6 +4,7 @@ import { useAppPreferences } from './App';
 import './outputs-original.css';
 import { AppearanceSettings } from './preferences';
 import { Link, useSearchParams } from 'react-router-dom';
+import type { ProviderView } from '../../../contracts/api-types';
 
 type Language = 'en' | 'th';
 type ErrorLabel = 'load' | 'connection_save' | 'connection_remove' | 'peer_save' | 'peer_update' | 'peer_revoke' | 'token_create' | 'token_revoke';
@@ -94,6 +95,7 @@ export default function Settings() {
   const tx = (english: string, thai: string) => language === 'th' ? thai : english;
   const [projects, setProjects] = useState<Resource<Project[]>>(empty());
   const [connections, setConnections] = useState<Resource<Connection[]>>(empty());
+  const [providers, setProviders] = useState<Resource<ProviderView[]>>(empty());
   const [peers, setPeers] = useState<Resource<Peer[]>>(empty());
   const [delegations, setDelegations] = useState<Resource<Delegation[]>>(empty());
   const [tokens, setTokens] = useState<Resource<AccessToken[]>>(empty());
@@ -122,6 +124,7 @@ export default function Settings() {
     const controller = new AbortController();
     load('/api/v1/projects', setProjects, controller.signal);
     load('/api/v1/connections', setConnections, controller.signal);
+    load('/api/v1/providers', setProviders, controller.signal);
     load('/api/v1/peers', setPeers, controller.signal);
     load('/api/v1/peer-delegations', setDelegations, controller.signal);
     load('/api/v1/access-tokens', setTokens, controller.signal);
@@ -135,6 +138,7 @@ export default function Settings() {
 
   async function saveConnection(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (connectionBusy || providers.status !== 'ready' || !providers.value.some((provider) => provider.available && provider.provider_id === providerId)) return;
     setConnectionBusy(true);
     setConnectionError(null);
     try {
@@ -154,6 +158,8 @@ export default function Settings() {
       setConnectionBusy(false);
     }
   }
+
+  const selectedProvider = providers.status === 'ready' ? providers.value.find((provider) => provider.available && provider.provider_id === providerId) : undefined;
 
   async function removeConnection(id: string) {
     setConnectionError(null);
@@ -308,12 +314,22 @@ export default function Settings() {
       {connectionError && <p role="alert">{errorText(connectionError, language)}</p>}
       <form className="settings-form" style={formStyle} onSubmit={(event) => void saveConnection(event)}>
         <h3>{tx('Add a model connection', 'เพิ่มการเชื่อมต่อโมเดล')}</h3>
-        <p>{tx('Enter the configured provider ID. Do not enter an endpoint URL.', 'ป้อนรหัสผู้ให้บริการที่กำหนดไว้ ห้ามป้อน URL ปลายทาง')}</p>
-        <label style={fieldStyle}>{tx('Configured provider ID', 'รหัสผู้ให้บริการที่กำหนดไว้')}<input style={controlStyle} required value={providerId} onChange={(event) => setProviderId(event.target.value)} autoComplete="off" /></label>
+        <p>{tx('Choose a provider, then enter its API key and model name.', 'เลือกผู้ให้บริการ แล้วกรอก API key และชื่อโมเดลของผู้ให้บริการนั้น')}</p>
+        <ResourceMessage resource={providers} loading={tx('Loading providers…', 'กำลังโหลดผู้ให้บริการ…')} emptyText={tx('No providers configured.', 'ยังไม่มีผู้ให้บริการที่ตั้งค่าไว้')} language={language} />
+        <label style={fieldStyle}>{tx('Provider', 'ผู้ให้บริการ')}<select style={controlStyle} required value={providerId} disabled={connectionBusy || providers.status !== 'ready'} onChange={(event) => {
+          const next = providers.status === 'ready' ? providers.value.find((provider) => provider.available && provider.provider_id === event.target.value) : undefined;
+          setProviderId(next?.provider_id ?? ''); setConnectionName(next?.name ?? ''); setModel(''); setProviderSecret(''); setConnectionError(null);
+        }}><option value="">{tx('Choose a provider', 'เลือกผู้ให้บริการ')}</option>
+          {providers.status === 'ready' && <>
+            <optgroup label={tx('Available providers', 'ผู้ให้บริการที่พร้อมตั้งค่า')}>{providers.value.filter((provider) => provider.available && provider.provider_id).map((provider) => <option key={`${provider.slug}-${provider.provider_id}`} value={provider.provider_id!}>{provider.name}</option>)}</optgroup>
+            <optgroup label={tx('Requires additional setup', 'ต้องเตรียมการเชื่อมต่อเพิ่มเติม')}>{providers.value.filter((provider) => !provider.available).map((provider) => <option key={provider.slug} value={`unavailable:${provider.slug}`} disabled>{provider.name} · {tx(provider.reason === 'not_configured' ? 'Not configured' : provider.reason === 'oauth_required' ? 'Requires sign-in' : provider.reason === 'local_isolation_required' ? 'Requires local setup' : 'Integration pending', provider.reason === 'not_configured' ? 'ยังไม่ตั้งค่า' : provider.reason === 'oauth_required' ? 'ต้องเข้าสู่ระบบ' : provider.reason === 'local_isolation_required' ? 'ต้องเตรียมระบบ local' : 'รอเชื่อมต่อ')}</option>)}</optgroup>
+          </>}
+        </select></label>
+        {selectedProvider && <p className="provider-selection-note"><strong>{selectedProvider.name}</strong><span>{selectedProvider.origin}</span>{selectedProvider.slug === 'openrouter' && <small>{tx('Use OpenRouter model IDs to access models from several providers, including Claude.', 'ใช้ชื่อโมเดลของ OpenRouter เพื่อเลือกโมเดลจากหลายผู้ให้บริการ รวมถึง Claude')}</small>}</p>}
         <label style={fieldStyle}>{tx('Connection name', 'ชื่อการเชื่อมต่อ')}<input style={controlStyle} required value={connectionName} onChange={(event) => setConnectionName(event.target.value)} maxLength={200} /></label>
-        <label style={fieldStyle}>{tx('Model', 'โมเดล')}<input style={controlStyle} required value={model} onChange={(event) => setModel(event.target.value)} maxLength={200} /></label>
-        <label style={fieldStyle}>{tx('Provider credential', 'ข้อมูลรับรองผู้ให้บริการ')}<input style={controlStyle} required type="password" autoComplete="new-password" value={providerSecret} onChange={(event) => setProviderSecret(event.target.value)} /></label>
-        <button className="button button-primary" type="submit" disabled={connectionBusy}>{connectionBusy ? tx('Saving…', 'กำลังบันทึก…') : tx('Save connection', 'บันทึกการเชื่อมต่อ')}</button>
+        <label style={fieldStyle}>{tx('Model', 'โมเดล')}<input style={controlStyle} required value={model} placeholder={selectedProvider?.model_hint} onChange={(event) => setModel(event.target.value)} maxLength={200} /></label>
+        <label style={fieldStyle}>{tx('API key', 'API key')}<input style={controlStyle} required type="password" autoComplete="new-password" spellCheck={false} value={providerSecret} onChange={(event) => setProviderSecret(event.target.value)} /></label>
+        <button className="button button-primary" type="submit" disabled={connectionBusy || !selectedProvider}>{connectionBusy ? tx('Saving…', 'กำลังบันทึก…') : tx('Save connection', 'บันทึกการเชื่อมต่อ')}</button>
       </form>
     </section>
 

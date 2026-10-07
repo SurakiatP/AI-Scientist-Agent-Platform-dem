@@ -27,6 +27,7 @@ from scientist.auth import DomainError
 from scientist.contracts import (CsvDescribeGrantV1, CrossrefQueryV1, ObjectRef, OperationRequest, OperationResult, PeerReleaseSpec, PlanSpec, Principal, RunView, ScientificBindingV2, canonical_peer_parameters_bytes)
 from scientist.domain import _event, _run_view
 from scientist import limits
+from scientist.provider_catalog import api_path as _provider_api_path, unsupported_reason as _unsupported_provider_reason
 from scientist.model_payload import ModelPayloadError, build_chat_completion_body, llm_input_reserve
 from scientist.secrets import read_secret
 
@@ -951,6 +952,11 @@ def http_transport(request: OperationRequest, target: DispatchTarget) -> tuple[b
         return _peer_http_transport(request, target)
     host, port, path, ip = _validate_url(target.url, list(target.approved_recipients))
     if target.kind == "llm":
+        parsed = urlsplit(target.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if _unsupported_provider_reason(origin):
+            raise DomainError("provider_unavailable", 502)
+        path = _provider_api_path(origin) or path
         messages = request.payload.get("messages")
         if "prompt" in request.payload:
             messages = [{"role": "user", "content": request.payload["prompt"]}]

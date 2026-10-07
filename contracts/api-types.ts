@@ -315,6 +315,16 @@ export interface CitationView {
   verification?: "verified" | "unverified" | "contradictory" | null;
 }
 
+export interface ProviderView {
+  slug: string;
+  name: string;
+  origin: string;
+  provider_id: string | null;
+  available: boolean;
+  reason: string | null;
+  model_hint: string;
+}
+
 export interface ConnectionView {
   id: string;
   label: string;

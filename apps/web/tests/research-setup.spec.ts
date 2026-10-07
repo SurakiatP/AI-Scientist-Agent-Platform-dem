@@ -536,7 +536,7 @@ test('setup keeps return context through credential forms, language and small sc
   await page.setViewportSize({ width: 320, height: 700 });
   await page.goto(SETUP_URL);
   await page.getByRole('link', { name: 'Configure connections and access' }).click();
-  await expect(page.getByLabel('Provider credential')).toHaveAttribute('type', 'password');
+  await expect(page.getByLabel('API key')).toHaveAttribute('type', 'password');
   await page.getByRole('link', { name: 'Return to Research Setup' }).click();
   await expect(page).toHaveURL(SETUP_URL);
   await page.getByRole('button', { name: 'TH', exact: true }).click();

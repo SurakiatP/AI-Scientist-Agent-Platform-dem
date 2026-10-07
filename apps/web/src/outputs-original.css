@@ -58,3 +58,7 @@
 .original-history .run-timeline { margin-top: 25px; }
 .original-history .run-timeline > div { display: flex; gap: 12px; align-items: center; margin: 16px 0; font-size: 12px; }
 .original-history .run-timeline > div > span:first-child { display: grid; flex: 0 0 23px; height: 23px; place-items: center; border-radius: 50%; color: var(--accent); background: var(--soft); }
+
+.provider-selection-note { display: grid; gap: 3px; margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--soft); font-size: 12px; overflow-wrap: anywhere; }
+.provider-selection-note strong { color: var(--ink); }
+.provider-selection-note span, .provider-selection-note small { color: var(--muted); }
