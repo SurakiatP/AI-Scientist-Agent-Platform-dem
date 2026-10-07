@@ -275,13 +275,66 @@ def _validated_config(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _query_digest(connection: Any, statement: str) -> dict[str, Any]:
+_PG_STRING_LITERAL = r"'(?:''|[^'])*'"
+_PG_VARCHAR_LITERAL = rf"{_PG_STRING_LITERAL}::character varying"
+_PG_VARCHAR_LITERAL_LIST = rf"{_PG_VARCHAR_LITERAL}(?:\s*,\s*{_PG_VARCHAR_LITERAL})*"
+_PG_VARCHAR_TEXT_ANY = re.compile(
+    rf"(?P<prefix>\bANY\s*\(\s*)\(\s*ARRAY\[(?P<items>{_PG_VARCHAR_LITERAL_LIST})\]"
+    rf"\s*\)::text\[\]\s*\)"
+)
+_SQL_NON_CODE = re.compile(
+    r"[Ee]'(?:''|\\.|[^'])*'|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|--[^\r\n]*|/\*.*?\*/"
+    r"|\$(?P<dollar_tag>[A-Za-z_][A-Za-z_0-9]*|)\$.*?\$(?P=dollar_tag)\$",
+    re.DOTALL,
+)
+
+
+def _canonicalize_pg_varchar_text_array_cast(definition: str) -> str:
+    """Normalize one PostgreSQL deparse-only placement of varchar-to-text array casts."""
+    # Unknown dollar-quoted strings and comments must remain byte-for-byte intact.
+    # PostgreSQL permits Unicode dollar tags and nested comments, which this
+    # deliberately narrow helper does not attempt to interpret.
+    if "$" in definition or "--" in definition or "/*" in definition:
+        return definition
+
+    def normalize(match: re.Match[str]) -> str:
+        literals = re.findall(_PG_STRING_LITERAL, match.group("items"))
+        elements = ", ".join(f"({literal}::character varying)::text" for literal in literals)
+        return f"{match.group('prefix')}ARRAY[{elements}])"
+
+    protected = [(match.start(), match.end()) for match in _SQL_NON_CODE.finditer(definition)]
+    pieces = []
+    last = 0
+    protected_index = 0
+    for match in _PG_VARCHAR_TEXT_ANY.finditer(definition):
+        while protected_index < len(protected) and protected[protected_index][1] <= match.start():
+            protected_index += 1
+        if (protected_index < len(protected)
+                and protected[protected_index][0] <= match.start() < protected[protected_index][1]):
+            continue
+        pieces.append(definition[last:match.start()])
+        pieces.append(normalize(match))
+        last = match.end()
+    pieces.append(definition[last:])
+    return "".join(pieces)
+
+
+def _query_digest(
+    connection: Any,
+    statement: str,
+    *,
+    normalize_definition_columns: tuple[int, ...] = (),
+) -> dict[str, Any]:
     result = connection.execution_options(stream_results=True).execute(text(statement))
 
     def records():
         while batch := result.fetchmany(_FETCH_ROWS):
             for row in batch:
-                yield _canonical(list(row))
+                values = list(row)
+                for index in normalize_definition_columns:
+                    if isinstance(values[index], str):
+                        values[index] = _canonicalize_pg_varchar_text_array_cast(values[index])
+                yield _canonical(values)
 
     digest, count, size = _digest_records(records())
     return {"sha256": digest, "rows": count, "canonical_bytes": size}
@@ -342,7 +395,13 @@ def _schema_snapshot(connection: Any) -> dict[str, Any]:
             WHERE ns.nspname='public' ORDER BY cls.relname, pol.polname
         """,
     }
-    parts = {name: _query_digest(connection, query) for name, query in queries.items()}
+    definition_columns = {"constraints": (3,), "indexes": (2,)}
+    parts = {
+        name: _query_digest(
+            connection, query, normalize_definition_columns=definition_columns.get(name, ())
+        )
+        for name, query in queries.items()
+    }
     digest, _, _ = _digest_records(_canonical([name, parts[name]["sha256"]]) for name in sorted(parts))
     return {"sha256": digest, "parts": parts}
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import io
+import importlib.util
 import os
 import sys
 from types import SimpleNamespace
@@ -12,6 +13,76 @@ from uuid import uuid4
 import pytest
 
 from scientist.deployment_backup import RecoverySetError, restore_recovery_set
+
+
+@pytest.fixture(scope="module")
+def w2_recovery_acceptance():
+    path = Path(__file__).parent / "live" / "w2_recovery_set_acceptance.py"
+    spec = importlib.util.spec_from_file_location("w2_recovery_set_acceptance_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_SOURCE_CHECK = (
+    "CHECK (((kind)::text = ANY ((ARRAY["
+    "'report''s'::character varying, 'table'::character varying"
+    "])::text[])))"
+)
+_RESTORED_CHECK = (
+    "CHECK (((kind)::text = ANY (ARRAY["
+    "('report''s'::character varying)::text, ('table'::character varying)::text"
+    "])))"
+)
+_SOURCE_INDEX = (
+    "CREATE UNIQUE INDEX artifacts_kind_partial ON public.artifacts USING btree (run_id) "
+    "WHERE ((kind)::text = ANY ((ARRAY["
+    "'report''s'::character varying, 'table'::character varying"
+    "])::text[]))"
+)
+_RESTORED_INDEX = (
+    "CREATE UNIQUE INDEX artifacts_kind_partial ON public.artifacts USING btree (run_id) "
+    "WHERE ((kind)::text = ANY (ARRAY["
+    "('report''s'::character varying)::text, ('table'::character varying)::text"
+    "]))"
+)
+
+
+class _SchemaRows:
+    def __init__(self, rows):
+        self.rows = rows
+        self.fetched = False
+
+    def fetchmany(self, _count):
+        if self.fetched:
+            return []
+        self.fetched = True
+        return self.rows
+
+
+class _SchemaConnection:
+    def __init__(self, check_definition, index_definition):
+        self.check_definition = check_definition
+        self.index_definition = index_definition
+
+    def execution_options(self, **_options):
+        return self
+
+    def execute(self, statement):
+        sql = str(statement)
+        if "FROM pg_constraint" in sql:
+            return _SchemaRows([("artifacts", "artifacts_kind_check", "c", self.check_definition,
+                                 False, False, True)])
+        if "FROM pg_indexes" in sql:
+            return _SchemaRows([("artifacts", "artifacts_kind_partial", self.index_definition)])
+        return _SchemaRows([])
+
+
+def _schema_snapshot(w2_recovery_acceptance, check_definition, index_definition):
+    return w2_recovery_acceptance._schema_snapshot(
+        _SchemaConnection(check_definition, index_definition)
+    )
 
 
 class _Result:
@@ -362,3 +433,76 @@ def test_fresh_database_ignores_internal_namespaces_and_rejects_user_schema_obje
             assert verification.execute(text("SELECT to_regnamespace(:schema)"), {"schema": schema}).scalar_one() is None
     finally:
         engine.dispose()
+
+
+def test_recovery_schema_snapshot_matches_postgres_array_cast_rewrite(w2_recovery_acceptance):
+    source = _schema_snapshot(w2_recovery_acceptance, _SOURCE_CHECK, _SOURCE_INDEX)
+    restored = _schema_snapshot(w2_recovery_acceptance, _RESTORED_CHECK, _RESTORED_INDEX)
+
+    assert source == restored
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "CHECK (description = 'ANY ((ARRAY[''report''::character varying])::text[])')",
+        r"CHECK (description = E'ANY ((ARRAY[\'report\'::character varying])::text[])')",
+        "CHECK (description = $fmt$ANY ((ARRAY['report'::character varying])::text[])$fmt$)",
+        'CHECK ("ANY ((ARRAY[\'report\'::character varying])::text[])" = description)',
+        "CHECK (description /* ANY ((ARRAY['report'::character varying])::text[]) */ = 'x')",
+        "-- ANY ((ARRAY['report'::character varying])::text[])\nCHECK (description = 'x')",
+    ],
+    ids=("single-quoted", "escaped-e-string", "dollar-quoted", "quoted-identifier", "block-comment", "line-comment"),
+)
+def test_recovery_schema_normalization_preserves_quoted_and_comment_text(
+    w2_recovery_acceptance, definition
+):
+    assert w2_recovery_acceptance._canonicalize_pg_varchar_text_array_cast(definition) == definition
+
+
+def test_recovery_schema_normalization_preserves_unicode_dollar_quoted_values(w2_recovery_acceptance):
+    canonicalize = w2_recovery_acceptance._canonicalize_pg_varchar_text_array_cast
+    before = "CHECK (note = $é$before$é$)"
+    after = "CHECK (note = $é$after$é$)"
+    thai = "CHECK (note = $ไทย$before$ไทย$)"
+
+    assert canonicalize(before) == before
+    assert canonicalize(after) == after
+    assert canonicalize(thai) == thai
+    assert canonicalize(before) != canonicalize(after)
+    assert canonicalize(before) != canonicalize(thai)
+
+
+def test_recovery_schema_normalization_preserves_nested_comments(w2_recovery_acceptance):
+    definition = "CHECK (note /* outer /* inner */ ANY ((ARRAY['report'::character varying])::text[]) */ = 'x')"
+
+    assert w2_recovery_acceptance._canonicalize_pg_varchar_text_array_cast(definition) == definition
+
+
+def test_recovery_schema_normalization_finds_code_after_ordinary_trailing_backslash(w2_recovery_acceptance):
+    definition = r"CHECK (note = 'ends with backslash\' AND kind = ANY ((ARRAY['report'::character varying])::text[]))"
+    expected = r"CHECK (note = 'ends with backslash\' AND kind = ANY (ARRAY[('report'::character varying)::text]))"
+
+    assert w2_recovery_acceptance._canonicalize_pg_varchar_text_array_cast(definition) == expected
+
+
+@pytest.mark.parametrize(
+    ("check_definition", "index_definition"),
+    [
+        (_SOURCE_CHECK.replace("'report''s'", "'summary'", 1), _SOURCE_INDEX),
+        (_SOURCE_CHECK.replace("'report''s'::character varying, 'table'", "'table'::character varying, 'report''s'", 1), _SOURCE_INDEX),
+        (_SOURCE_CHECK.replace("(kind)::text", "(status)::text", 1), _SOURCE_INDEX),
+        (_SOURCE_CHECK.replace(" = ANY", " <> ANY", 1), _SOURCE_INDEX),
+        (_SOURCE_CHECK.replace("::character varying", "::varchar", 1), _SOURCE_INDEX),
+        (_SOURCE_CHECK.replace("])::text[]", "])::varchar[]", 1), _SOURCE_INDEX),
+        (_SOURCE_CHECK, _RESTORED_INDEX + " AND (project_id IS NOT NULL)"),
+    ],
+    ids=("literal", "literal-order", "column", "operator", "element-type", "array-type", "index-predicate"),
+)
+def test_recovery_schema_snapshot_rejects_non_cast_schema_changes(
+    w2_recovery_acceptance, check_definition, index_definition
+):
+    changed = _schema_snapshot(w2_recovery_acceptance, check_definition, index_definition)
+    restored = _schema_snapshot(w2_recovery_acceptance, _RESTORED_CHECK, _RESTORED_INDEX)
+
+    assert changed != restored
