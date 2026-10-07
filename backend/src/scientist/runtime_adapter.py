@@ -50,10 +50,13 @@ from scientist.runtime_contracts import (
     ScientificResultReceipt,
     ScientificOutputReceiptV2,
     ScientificResultReceiptV2,
+    MAX_COMPUTE_OUTPUT_BYTES,
+    MAX_WORKSPACE_BYTES,
     canonical_bytes,
     operation_fingerprint,
     validate_workspace_path,
 )
+from scientist.scientific_render import render_plot_svg
 
 _MAX_PROVIDER_RESPONSE = 2 * 1024 * 1024
 _MAX_BROKER_RESPONSE = 3 * 1024 * 1024
@@ -66,6 +69,7 @@ _REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES = frozenset({
     "scientific_resources",
     "scientific_search",
     "scientific_csv_describe",
+    "scientific_plot",
 })
 _NATIVE_TOOL_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "scientist_native_tool_call_id", default=None
@@ -205,6 +209,13 @@ def _validate_native_tool_arguments(name: str, arguments: Any, binding: Scientif
             or arguments.get("capability_id") not in binding.capability_ids
         ):
             raise RuntimeAdapterError("instruction request outside approved authority")
+    elif name == "scientific_plot":
+        if binding is None or "scientific-visualization" not in binding.capability_ids:
+            raise RuntimeAdapterError("plot request outside approved visualization authority")
+        try:
+            render_plot_svg(arguments)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeAdapterError("invalid scientific plot arguments") from exc
     else:
         raise RuntimeAdapterError("native tool outside reviewed scientific surface")
 
@@ -270,7 +281,51 @@ def _native_scientific_tool_definitions(
                 },
             },
         ])
-    return definitions
+    if "scientific-visualization" in binding.capability_ids:
+        definitions.append({
+            "name": "scientific_plot",
+            "description": "Render a bounded line chart from numeric series as inert SVG.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "maxLength": 100},
+                    "x_label": {"type": "string", "maxLength": 100},
+                    "y_label": {"type": "string", "maxLength": 100},
+                    "series": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "maxLength": 64},
+                                "values": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 64,
+                                    "items": {"type": "number"},
+                                },
+                            },
+                            "required": ["label", "values"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["title", "x_label", "y_label", "series"],
+                "additionalProperties": False,
+            },
+        })
+    enabled = {"instruction_view"}
+    if "get-available-resources" in binding.capability_ids:
+        enabled.add("scientific_resources")
+    if isinstance(binding, ScientificBindingV2):
+        if "paper-lookup" in binding.capability_ids and binding.approved_crossref_queries:
+            enabled.add("scientific_search")
+        if "exploratory-data-analysis" in binding.capability_ids and binding.csv_describe_grants:
+            enabled.add("scientific_csv_describe")
+    if "scientific-visualization" in binding.capability_ids:
+        enabled.add("scientific_plot")
+    return [definition for definition in definitions if definition["name"] in enabled]
 
 
 def _validate_native_todo_call(agent: Any, call: Any) -> tuple[str, dict[str, Any]]:
@@ -352,6 +407,31 @@ def _write_scientific_result(workspace_dir: Path, path: str, content: bytes) -> 
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _persist_scientific_plot(
+    workspace_dir: Path,
+    binding: ScientificBinding | ScientificBindingV2,
+    tool_call_id: str,
+    svg: str,
+) -> tuple[ScientificResultReceipt, WorkspaceEntry]:
+    content = svg.encode("utf-8")
+    path = f"outputs/plots/{hashlib.sha256(tool_call_id.encode('utf-8')).hexdigest()[:24]}.svg"
+    max_bytes = binding.max_result_bytes if isinstance(binding, ScientificBinding) else MAX_COMPUTE_OUTPUT_BYTES
+    if len(content) > max_bytes:
+        raise RuntimeAdapterError("scientific plot exceeds approved output limits")
+    _write_or_verify_scientific_result(workspace_dir, path, content)
+    digest = hashlib.sha256(content).hexdigest()
+    receipt = ScientificResultReceipt(
+        tool_call_id=tool_call_id,
+        capability_id="scientific-visualization",
+        binding_sha256=hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest(),
+        recipe_version="1",
+        path=path,
+        sha256=digest,
+        size=len(content),
+    )
+    return receipt, WorkspaceEntry(path=path, sha256=digest, size=len(content))
 
 
 def _wire_messages(messages: Any) -> list[dict[str, Any]]:
@@ -1416,11 +1496,39 @@ def build_native_agent(adapter: RuntimeAdapter, *, workspace_dir: Path) -> Any:
             }
             return report
 
+        def scientific_plot_handler(arguments: dict[str, Any], **_kwargs: Any) -> str:
+            call_id = require_active_call("scientific_plot", arguments)
+            svg = render_plot_svg(arguments)
+            if binding is None:
+                raise RuntimeAdapterError("approved visualization binding is unavailable")
+            raw_call_id = adapter._native_active_tool_calls[call_id]
+            if (
+                sum(entry.size for entry in adapter.context.workspace_manifest) + len(svg.encode("utf-8"))
+                > (binding.workspace_limit_bytes if isinstance(binding, ScientificBinding) else MAX_WORKSPACE_BYTES)
+            ):
+                raise RuntimeAdapterError("scientific plot exceeds approved output limits")
+            receipt, entry = _persist_scientific_plot(workspace_dir, binding, raw_call_id, svg)
+            adapter._native_scientific_outputs[call_id] = {
+                "receipt": receipt,
+                "workspace_entry": entry,
+            }
+            return json.dumps(
+                {
+                    "chart_spec": arguments,
+                    "content_type": "image/svg+xml",
+                    "path": receipt.path,
+                    "sha256": receipt.sha256,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
         handlers = {
             "instruction_view": instruction_view_handler,
             "scientific_resources": scientific_resources_handler,
             "scientific_search": scientific_search_handler,
             "scientific_csv_describe": scientific_csv_describe_handler,
+            "scientific_plot": scientific_plot_handler,
         }
         for schema in _native_scientific_tool_definitions(binding):
             name = schema["name"]

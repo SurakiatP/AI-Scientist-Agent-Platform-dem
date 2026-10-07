@@ -149,7 +149,7 @@ def test_registry_loads_all_pinned_records_but_selection_uses_explicit_allowlist
     with pytest.raises(RegistryError, match="allowlist"):
         registry.select(["literature-review"])
     assert REVIEWED_CAPABILITY_ALLOWLIST == frozenset(
-        {"get-available-resources", "paper-lookup", "exploratory-data-analysis"}
+        {"get-available-resources", "paper-lookup", "exploratory-data-analysis", "scientific-visualization"}
     )
 
 

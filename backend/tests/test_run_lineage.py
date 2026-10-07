@@ -126,9 +126,12 @@ def test_external_may_retry_only_own_submission(db, project_session):
 def test_one_user_question_per_run_but_other_roles_allowed(db, project_session):
     project_id, session_id = project_session
     run = _submit(db, project_id, session_id, "m1")
-    for _ in range(2):
-        db.execute(text("INSERT INTO messages (id, project_id, session_id, role, content, run_id) VALUES (:i, :p, :s, 'assistant', 'a', :r)"),
-                   {"i": uuid4(), "p": project_id, "s": session_id, "r": run.run_id})
+    db.execute(text("INSERT INTO messages (id, project_id, session_id, role, content, run_id) VALUES (:i, :p, :s, 'assistant', 'a', :r)"),
+               {"i": uuid4(), "p": project_id, "s": session_id, "r": run.run_id})
+    with pytest.raises(IntegrityError):
+        with db.begin_nested():
+            db.execute(text("INSERT INTO messages (id, project_id, session_id, role, content, run_id) VALUES (:i, :p, :s, 'assistant', 'again', :r)"),
+                       {"i": uuid4(), "p": project_id, "s": session_id, "r": run.run_id})
     with pytest.raises(IntegrityError):
         with db.begin_nested():
             db.execute(text("INSERT INTO messages (id, project_id, session_id, role, content, run_id) VALUES (:i, :p, :s, 'user', 'again', :r)"),

@@ -17,6 +17,7 @@ from scientist.private_worker_api import RuntimePins, WorkerController
 from scientist.runtime_contracts import (
     BoundaryRequest, ComputeOutputEntryV2, ComputeResultEnvelopeV2, OperationMapping,
     RuntimeContextV1, ScientificOutputReceiptV2, ScientificResultReceiptV2,
+    ScientificResultReceipt,
     WorkspaceEntry, WorkspaceFile, canonical_bytes, compute_input_manifest_sha256,
     operation_fingerprint,
 )
@@ -94,11 +95,44 @@ def test_scientific_artifact_is_registered_once_and_finalized(receipt_boundary):
     artifact = db.execute(text("SELECT * FROM artifacts WHERE run_id=:run"), {"run": boundary.context.run_id}).one()
     assert artifact.sha256.strip() == boundary.context.scientific_results[0].sha256
     assert artifact.partial is True
+    final_data = boundary.context.model_dump(mode="json")
+    final_data["boundary"] = "final"
+    final_data["messages"][0]["content"] = "Measure resources"
+    final_data["messages"].append({"role": "assistant", "content": "The resource report is ready."})
     final = boundary.model_copy(update={"boundary_id": uuid4(), "expected_checkpoint_revision": 1,
-        "context": boundary.context.model_copy(update={"boundary": "final"})})
+        "context": RuntimeContextV1.model_validate(final_data)})
     controller.boundary(db, token, final)
     assert db.execute(text("SELECT COUNT(*) FROM scientific_artifact_receipts WHERE run_id=:run"), {"run": boundary.context.run_id}).scalar_one() == 1
     assert db.execute(text("SELECT partial FROM artifacts WHERE id=:id"), {"id": artifact.id}).scalar_one() is False
+
+
+def test_plot_receipt_registers_svg_artifact_once(receipt_boundary):
+    from types import SimpleNamespace
+
+    db, token, controller, boundary, _ = receipt_boundary
+    controller.boundary(db, token, boundary)
+    raw = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+    digest = sha256(raw).hexdigest()
+    path = "outputs/plots/demo.svg"
+    receipt = ScientificResultReceipt(tool_call_id="plot-call", capability_id="scientific-visualization",
+                                      binding_sha256="a" * 64, path=path, sha256=digest, size=len(raw))
+    row = SimpleNamespace(id=boundary.context.run_id, project_id=boundary.context.project_id,
+                          revision=boundary.context.revision)
+    checkpoint_id = db.execute(text("SELECT id FROM checkpoints WHERE run_id=:run ORDER BY revision DESC LIMIT 1"),
+                               {"run": row.id}).scalar_one()
+    entry = WorkspaceEntry(path=path, sha256=digest, size=len(raw))
+    ref = ObjectRef(project_id=row.project_id, key=path, sha256=digest, size=len(raw),
+                    content_type="image/svg+xml")
+    context = SimpleNamespace(scientific_results=[receipt], scientific_results_v2=[], boundary="tool_committed")
+    manifest = SimpleNamespace(workspace=[ref])
+    controller._register_scientific_results(db, row, context, [entry], manifest, checkpoint_id)
+    controller._register_scientific_results(db, row, context, [entry], manifest, checkpoint_id)
+    artifact = db.execute(text("SELECT title,kind,content_type,partial FROM artifacts "
+                               "WHERE run_id=:run AND kind='plot'"), {"run": row.id}).one()
+    assert (artifact.title, artifact.kind, artifact.content_type, artifact.partial) == (
+        "Scientific plot", "plot", "image/svg+xml", True)
+    assert db.execute(text("SELECT COUNT(*) FROM scientific_artifact_receipts "
+                           "WHERE run_id=:run AND tool_call_id='plot-call'"), {"run": row.id}).scalar_one() == 1
 
 
 def test_missing_scientific_bytes_never_capture_or_publish(receipt_boundary):

@@ -337,7 +337,7 @@ def _native_dispatch_seam(calls=None, capability_ids=("get-available-resources",
             name = "todo_list"
         if name == "tool_call":
             name, args = args["name"], args["arguments"]
-        if name not in {"todo_list", "todo", "instruction_view", "scientific_resources"}:
+        if name not in {"todo_list", "todo", "instruction_view", "scientific_resources", "scientific_plot"}:
             raise runtime.RuntimeAdapterError("outside test dispatch surface")
         if name in runtime._REVIEWED_NATIVE_SCIENTIFIC_TOOL_NAMES:
             runtime._validate_native_tool_arguments(name, args, binding)
@@ -447,6 +447,27 @@ def test_native_resource_dispatch_accepts_issued_identity():
     assert seam["native_tool_call_context"]("scientific_resources", {}, tool_call_id="applied-2")
     assert len(forwarded) == 1
     assert runtime._NATIVE_TOOL_CALL_ID.get() is None
+
+
+def test_native_plot_dispatch_requires_issued_call_and_selected_capability():
+    plot = {
+        "title": "Series",
+        "x_label": "Point",
+        "y_label": "Value",
+        "series": [{"label": "A", "values": [1, 2]}],
+    }
+    runtime, seam, forwarded = _native_dispatch_seam(
+        calls=[("scientific_plot", plot)], capability_ids=("scientific-visualization",)
+    )
+    with pytest.raises(runtime.RuntimeAdapterError):
+        seam["native_tool_call_context"]("scientific_plot", plot, tool_call_id="never-issued")
+    seam["native_tool_call_context"]("scientific_plot", plot, tool_call_id="applied-1")
+    assert len(forwarded) == 1
+
+    runtime, seam, forwarded = _native_dispatch_seam(calls=[("scientific_plot", plot)])
+    with pytest.raises(runtime.RuntimeAdapterError):
+        seam["native_tool_call_context"]("scientific_plot", plot, tool_call_id="applied-1")
+    assert forwarded == []
 
 
 def test_native_dispatch_rejects_issued_identity_with_a_different_tool_name():

@@ -301,6 +301,26 @@ class WorkerController:
     def boundary(self, db: Session, capability: str, request: BoundaryRequest) -> BoundaryAck:
         # Revalidate even programmatically supplied model_copy values at the trust boundary.
         request = BoundaryRequest.model_validate_json(request.model_dump_json())
+        if request.context.boundary == "final":
+            claims = broker._verify_capability(capability)
+            try:
+                run_id = UUID(claims["run_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DomainError("forbidden", 403) from exc
+            completed = broker._load_run(db, run_id, lock=True)
+            if completed.state == "completed":
+                digest = hashlib.sha256(canonical_bytes(request.model_dump(mode="json"))).hexdigest()
+                previous = db.execute(text(
+                    "SELECT generation,payload_hash,ack FROM checkpoint_boundaries "
+                    "WHERE run_id=:run AND boundary_id=:boundary"
+                ), {"run": run_id, "boundary": request.boundary_id}).one_or_none()
+                if (claims.get("generation") == completed.generation
+                        and claims.get("revision") == completed.revision
+                        and claims.get("plan_digest") == completed.plan_digest.strip()
+                        and previous is not None and previous.generation == completed.generation
+                        and previous.payload_hash.strip() == digest):
+                    return BoundaryAck.model_validate(previous.ack)
+                raise DomainError("forbidden", 403)
         row = self._run(db, capability, lock=True)
         self._context_authority(db, row, request.context)
         digest = hashlib.sha256(canonical_bytes(request.model_dump(mode="json"))).hexdigest()
@@ -320,12 +340,21 @@ class WorkerController:
             entry = files_by_path.get(receipt.path)
             if entry is None or entry.sha256 != receipt.sha256 or entry.size != receipt.size:
                 raise DomainError("invalid_scientific_result", 422)
-            from scientist.resource_recipe import validate_resource_result
             binding = request.context.plan.scientific
             try:
-                validate_resource_result(entry.decoded_data(), profile_id=binding.profile_id,
-                                         instruction_fingerprint=binding.instruction_fingerprint,
-                                         max_bytes=binding.max_result_bytes)
+                if receipt.capability_id == "scientific-visualization":
+                    from scientist.scientific_render import render_plot_svg
+                    calls = [call for message in request.context.messages for call in message.tool_calls or []
+                             if call.id == receipt.tool_call_id and call.function.name == "scientific_plot"]
+                    if len(calls) != 1 or entry.decoded_data() != render_plot_svg(
+                        json.loads(calls[0].function.arguments)
+                    ).encode("utf-8"):
+                        raise ValueError("plot bytes differ from approved renderer")
+                else:
+                    from scientist.resource_recipe import validate_resource_result
+                    validate_resource_result(entry.decoded_data(), profile_id=binding.profile_id,
+                                             instruction_fingerprint=binding.instruction_fingerprint,
+                                             max_bytes=binding.max_result_bytes)
             except (ValueError, TypeError, AttributeError) as exc:
                 raise DomainError("invalid_scientific_result", 422) from exc
         self._validate_scientific_compute_results(db, row, request.context, files_by_path)
@@ -364,6 +393,8 @@ class WorkerController:
         if checkpoint is None or CheckpointManifest.model_validate(checkpoint.manifest) != manifest:
             raise DomainError("storage_unavailable", 503)
         self._register_scientific_results(db, row, authoritative_context, files, manifest, checkpoint.id)
+        if authoritative_context.boundary == "final":
+            self._persist_final_assistant(db, row, authoritative_context)
         ack = BoundaryAck(schema_version=1,boundary_id=request.boundary_id,checkpoint_id=checkpoint.id,
                           checkpoint_revision=manifest.revision,manifest=manifest)
         db.execute(text("INSERT INTO checkpoint_boundaries(id,run_id,boundary_id,checkpoint_revision,generation,"
@@ -374,11 +405,53 @@ class WorkerController:
                     "ack":ack.model_dump_json()})
         return ack
 
+    @staticmethod
+    def _persist_final_assistant(db: Session, row, context: RuntimeContextV1) -> None:
+        if row.state != "running" or row.cancel_requested:
+            raise DomainError("revision_conflict", 409)
+        unresolved = db.execute(text(
+            "SELECT 1 FROM operations WHERE run_id=:run AND state IN ('reserved','unknown') LIMIT 1"
+        ), {"run": row.id}).scalar_one_or_none()
+        if unresolved is not None:
+            raise DomainError("unknown_outcome", 409)
+
+        snapshot = db.execute(text("SELECT manifest FROM input_snapshots WHERE run_id=:run"),
+                              {"run": row.id}).scalar_one()
+        question = snapshot["question"]
+        user_index = context.current_turn_user_index
+        if user_index is None:
+            user_index = next((i for i in range(len(context.messages) - 1, -1, -1)
+                               if context.messages[i].role == "user"), None)
+        if user_index is None or context.messages[user_index].content != question:
+            raise DomainError("revision_conflict", 409)
+        answer = next((message.content for message in reversed(context.messages[user_index + 1:])
+                       if message.role == "assistant" and not message.tool_calls and message.content), None)
+        if answer is None or len(answer.encode("utf-8")) > 64 * 1024:
+            raise DomainError("invalid_final_answer", 422)
+
+        existing = db.execute(text(
+            "SELECT content FROM messages WHERE run_id=:run AND role='assistant' FOR UPDATE"
+        ), {"run": row.id}).scalar_one_or_none()
+        if existing is not None and existing != answer:
+            raise DomainError("revision_conflict", 409)
+        if existing is None:
+            db.execute(text(
+                "INSERT INTO messages (id, project_id, session_id, role, content, run_id) "
+                "VALUES (:id, :project, :session, 'assistant', :content, :run)"
+            ), {"id": uuid4(), "project": row.project_id, "session": row.session_id,
+                "content": answer, "run": row.id})
+        # Final ACK persists the answer. The supervisor completes the run after
+        # the worker exits and its executor has been fenced.
+
     def _register_scientific_results(self, db, row, context, files, manifest, checkpoint_id):
         """Reuse captured immutable objects; receipt and event commit with the ACK."""
         from scientist.domain import _event
         references = {entry.path: ref for entry, ref in zip(files, manifest.workspace, strict=True)}
         for receipt in context.scientific_results:
+            is_plot = receipt.capability_id == "scientific-visualization"
+            title = "Scientific plot" if is_plot else "Resource measurements"
+            kind = "plot" if is_plot else "file"
+            content_type = "image/svg+xml" if is_plot else "application/json"
             digest = hashlib.sha256(canonical_bytes(receipt.model_dump(mode="json"))).hexdigest()
             prior = db.execute(text("SELECT artifact_id,receipt_sha256 FROM scientific_artifact_receipts "
                                     "WHERE run_id=:run AND tool_call_id=:call"),
@@ -392,25 +465,26 @@ class WorkerController:
                                          {"id": prior.artifact_id, "project": row.project_id, "run": row.id}).rowcount
                     if changed:
                         view = ArtifactView(artifact_id=prior.artifact_id, project_id=row.project_id,
-                                            run_id=row.id, title="Resource measurements", kind="file",
+                                            run_id=row.id, title=title, kind=kind,
                                             sha256=receipt.sha256, size=receipt.size,
-                                            content_type="application/json", partial=False)
+                                            content_type=content_type, partial=False)
                         _event(db, row.id, row.revision, "artifact.ready", {"artifact": view.model_dump(mode="json")})
                 continue
             ref = references[receipt.path]
             artifact_id = uuid4()
             partial = context.boundary != "final"
             db.execute(text("INSERT INTO artifacts(id,project_id,run_id,title,kind,object_key,sha256,size,content_type,partial) "
-                            "VALUES(:id,:project,:run,'Resource measurements','file',:key,:sha,:size,'application/json',:partial)"),
+                            "VALUES(:id,:project,:run,:title,:kind,:key,:sha,:size,:content_type,:partial)"),
                        {"id": artifact_id, "project": row.project_id, "run": row.id, "key": ref.key,
-                        "sha": receipt.sha256, "size": receipt.size, "partial": partial})
+                        "sha": receipt.sha256, "size": receipt.size, "partial": partial,
+                        "title": title, "kind": kind, "content_type": content_type})
             db.execute(text("INSERT INTO scientific_artifact_receipts(run_id,tool_call_id,project_id,checkpoint_id,"
                             "artifact_id,receipt_sha256) VALUES(:run,:call,:project,:checkpoint,:artifact,:sha)"),
                        {"run": row.id, "call": receipt.tool_call_id, "project": row.project_id,
                         "checkpoint": checkpoint_id, "artifact": artifact_id, "sha": digest})
             view = ArtifactView(artifact_id=artifact_id, project_id=row.project_id, run_id=row.id,
-                                title="Resource measurements", kind="file", sha256=receipt.sha256,
-                                size=receipt.size, content_type="application/json", partial=partial)
+                                title=title, kind=kind, sha256=receipt.sha256,
+                                size=receipt.size, content_type=content_type, partial=partial)
             _event(db, row.id, row.revision, "artifact.ready", {"artifact": view.model_dump(mode="json")})
 
         self._register_scientific_results_v2(db, row, context, files, references, checkpoint_id)

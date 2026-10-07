@@ -1,7 +1,8 @@
 import type { CsvResearchSelection, PlanView, PreparationJobView, RunReadinessView, RunView } from '../../../contracts/api-types';
 
-export type ResearchWorkflow = 'literature' | 'resources' | 'crossref_csv';
+export type ResearchWorkflow = 'chat' | 'literature' | 'resources' | 'crossref_csv';
 export type CsvSelection = CsvResearchSelection;
+export type RunCreate = { submission_key: string; question: string; input_ids: string[]; provider_id: string; model: string; retry_of?: string; chat_turn: true };
 export const preparePlan = (runId: string, expectedRevision: number, searchTerms: string[], workflow: ResearchWorkflow = 'literature', csvSelection?: CsvSelection) => request<RunView>(`/api/v1/runs/${encodeURIComponent(runId)}/prepare-plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_revision: expectedRevision, workflow, search_terms: searchTerms, ...(workflow === 'crossref_csv' && csvSelection ? { csv_selection: csvSelection } : {}) }) });
 export const getPreparation = (projectId: string, jobId: string, signal?: AbortSignal) => request<PreparationJobView>(`/api/v1/projects/${encodeURIComponent(projectId)}/preparations/${encodeURIComponent(jobId)}`, { signal });
 
@@ -36,8 +37,11 @@ export function strictPlanView(value: unknown, currentRun: RunView): value is Pl
       ((typeof item.query === 'string' && item.query.trim().length > 0 && item.query.length <= 512 && !/[\u0000-\u001f\u007f-\u009f]/.test(item.query) && item.doi === null) ||
        (item.query === null && typeof item.doi === 'string' && item.doi.length <= 255 && !/[\u0000-\u001f\u007f-\u009f]/.test(item.doi) && /^10\.[0-9]{4,9}\/[^\s<>"']+$/.test(item.doi)));
     if (!exactKeys(pins, ['image_digest', 'skills_digest', 'environment_digest'], ['runtime_commit']) ||
-        (pins.runtime_commit !== undefined && pins.runtime_commit !== 'bd0affe5e5f723579df8902852f5d0c47795f355') ||
-        typeof pins.image_digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(pins.image_digest) || !digest(pins.skills_digest) || !digest(pins.environment_digest)) return false;
+      (pins.runtime_commit !== undefined && pins.runtime_commit !== 'bd0affe5e5f723579df8902852f5d0c47795f355') ||
+      typeof pins.image_digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(pins.image_digest) || !digest(pins.skills_digest) || !digest(pins.environment_digest)) return false;
+    if (sameStrings(binding.capability_ids, ['scientific-visualization'])) {
+      return exactKeys(queries, []) && Array.isArray(profiles) && profiles.length === 0 && exactKeys(grants, []);
+    }
     if (!exactKeys(queries, ['crossref']) || !validQuery(queries.crossref)) return false;
     if (!Array.isArray(profiles) || profiles.length !== 1 || !profiles.every((item) => exactKeys(item, ['profile_id', 'version', 'image_digest']) && item.profile_id === 'prof.csv-stdlib@py3.14.7' && item.version === '1' && typeof item.image_digest === 'string' && /^sha256:[0-9a-f]{64}$/.test(item.image_digest))) return false;
     if (!exactKeys(grants, ['csv_describe'])) return false;
@@ -173,7 +177,7 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
 
 export async function requestBlob(path: string, signal?: AbortSignal, maxBytes = 8 * 1024 * 1024): Promise<{ blob: Blob; contentType: string }> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new TypeError('Invalid content limit.');
-  const response = await fetch(safePath(path), { credentials: 'same-origin', redirect: 'error', headers: { Accept: 'application/pdf, text/plain, text/markdown, text/csv, application/json, image/png, image/jpeg, image/webp, image/gif' }, signal });
+  const response = await fetch(safePath(path), { credentials: 'same-origin', redirect: 'error', headers: { Accept: 'application/pdf, text/plain, text/markdown, text/csv, application/json, image/png, image/jpeg, image/webp, image/gif, image/svg+xml' }, signal });
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
     throw toApiError(response.status, body);

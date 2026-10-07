@@ -78,6 +78,28 @@ def test_build_plan_has_stages_for_search_verify_synthesize(db, project_session)
     assert plan.input_snapshot_digest == get_plan(db, owner, run.run_id).plan.input_snapshot_digest
 
 
+def test_chat_plan_limits_destinations_and_selects_visualization(db, project_session, monkeypatch):
+    from types import SimpleNamespace
+    from scientist import scientific_authority
+    selected = []
+    monkeypatch.setattr(scientific_authority, "visualization_binding", lambda digest: (
+        selected.append(digest) or SimpleNamespace(capability_ids=["scientific-visualization"])
+    ))
+    owner, run = _run(db, project_session)
+    plan = build_plan(db, owner, run.run_id, [], workflow="chat")
+    assert plan.allowed_ops == ["llm"]
+    assert plan.data_recipients == ["https://llm.example"]
+    assert plan.scientific is not None
+    assert plan.scientific.capability_ids == ["scientific-visualization"]
+    assert selected == [plan.input_snapshot_digest]
+
+
+def test_chat_plan_request_accepts_conversation_workflow():
+    from scientist.api import PreparePlan
+    body = PreparePlan(expected_revision=1, workflow="chat", search_terms=[])
+    assert body.workflow == "chat"
+
+
 @pytest.mark.parametrize("terms", [[], [" "], ["x"] * 0 + ["t" * 151], [str(i) for i in range(11)]])
 def test_build_plan_rejects_unbounded_terms(db, project_session, terms):
     owner, run = _run(db, project_session)
@@ -158,4 +180,3 @@ def test_origin_is_canonical():
     assert _origin("HTTPS://LLM.Example.:443/") is None  # explicit ports are refused outright
     assert _origin("HTTPS://LLM.Example./x") == "https://llm.example"
     assert _origin("https://[2606:4700::1111]/") == "https://[2606:4700::1111]"
-

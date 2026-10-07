@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
-from scientist.contracts import PlanSpec, ScientificBinding, PreparationSubmit, PreparationJobView
+from scientist.contracts import PlanSpec, ScientificBinding, ScientificBindingV2, RuntimePins, PreparationSubmit, PreparationJobView
 from scientist.runtime_contracts import ScientificResultReceipt
 from scientist.runtime_contracts import RuntimeContextV1, canonical_bytes
 from test_runtime_contracts import context_data
@@ -89,6 +89,43 @@ def scientific_context(context_data):
         "path": "outputs/resources.json", "sha256": "e" * 64, "size": 10,
     }]
     return context_data
+
+
+def test_visualization_v2_receipt_requires_issued_plot_call(context_data):
+    pins = RuntimePins(
+        runtime_commit=context_data["runtime_commit"],
+        image_digest=context_data["image_digest"],
+        skills_digest=context_data["skills_digest"],
+        environment_digest=context_data["environment_digest"],
+    )
+    authority = ScientificBindingV2(
+        binding_version=2,
+        catalog_commit="154988403bb5a18e9d3c0ce4e6d5e2e4b184a298",
+        registry_sha256="a" * 64,
+        capability_ids=["scientific-visualization"],
+        instruction_fingerprint="b" * 64,
+        agent_runtime_pins=pins,
+        input_snapshot_digest=context_data["input_snapshot_digest"],
+    )
+    context_data["plan"]["scientific"] = authority.model_dump(mode="json")
+    context_data["plan_digest"] = sha256(canonical_bytes(context_data["plan"])).hexdigest()
+    context_data["messages"] += [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "plot-call", "type": "function", "function": {
+            "name": "scientific_plot", "arguments": '{"title":"Test","series":[{"label":"A","values":[1,2]}]}'}}]},
+        {"role": "tool", "tool_call_id": "plot-call", "content": "Plot ready"},
+    ]
+    context_data["scientific_results"] = [{
+        "tool_call_id": "plot-call", "capability_id": "scientific-visualization",
+        "binding_sha256": sha256(canonical_bytes(authority.model_dump(mode="json"))).hexdigest(),
+        "path": "outputs/plots/" + "a" * 24 + ".svg", "sha256": "e" * 64, "size": 10,
+    }]
+    context_data["workspace_manifest"] = [{
+        "path": context_data["scientific_results"][0]["path"], "sha256": "e" * 64, "size": 10,
+    }]
+    assert RuntimeContextV1.model_validate(context_data).scientific_results[0].capability_id == "scientific-visualization"
+    context_data["messages"][-2]["tool_calls"][0]["function"]["name"] = "scientific_resources"
+    with pytest.raises(ValidationError):
+        RuntimeContextV1.model_validate(context_data)
 
 
 def test_receipt_requires_issued_tool_and_exact_binding(context_data):

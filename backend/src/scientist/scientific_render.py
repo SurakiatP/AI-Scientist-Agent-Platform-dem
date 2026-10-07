@@ -37,6 +37,89 @@ def render_outputs(summary: dict[str, object]) -> dict[str, bytes]:
     return outputs
 
 
+def render_plot_svg(plot: dict[str, object]) -> str:
+    """Render a small, inert line chart from bounded numeric series."""
+    if type(plot) is not dict or set(plot) != {"title", "x_label", "y_label", "series"}:
+        raise ValueError("plot shape is invalid")
+    labels = [plot[key] for key in ("title", "x_label", "y_label")]
+    if any(
+        not isinstance(label, str)
+        or not label
+        or len(label) > 100
+        or _has_controls(label)
+        or not _xml10_legal(label)
+        for label in labels
+    ):
+        raise ValueError("plot label is invalid")
+    series = plot["series"]
+    if type(series) is not list or not 1 <= len(series) <= 3:
+        raise ValueError("plot series are invalid")
+    names: set[str] = set()
+    for item in series:
+        if type(item) is not dict or set(item) != {"label", "values"}:
+            raise ValueError("plot series shape is invalid")
+        label, values = item["label"], item["values"]
+        if (
+            not isinstance(label, str)
+            or not label
+            or len(label) > 64
+            or _has_controls(label)
+            or not _xml10_legal(label)
+            or label in names
+        ):
+            raise ValueError("plot series label is invalid")
+        names.add(label)
+        if (
+            type(values) is not list
+            or not 2 <= len(values) <= 64
+            or any(
+                type(value) not in (int, float)
+                or (type(value) is float and not math.isfinite(value))
+                or abs(value) > 1e100
+                for value in values
+            )
+        ):
+            raise ValueError("plot values must contain 2 to 64 bounded finite numbers")
+
+    scale = max((abs(value) for item in series for value in item["values"]), default=1.0) or 1.0
+    colors = ("#3568a8", "#c34f4f", "#33845b")
+    x0, x1 = 82.0, 680.0
+    parts = [
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 410" role="img" aria-labelledby="title desc">',
+        f'<title id="title">{html.escape(plot["title"], quote=True)}</title>',
+        f'<desc id="desc">{html.escape(plot["y_label"], quote=True)} by {html.escape(plot["x_label"], quote=True)}</desc>',
+        '<path d="M82 54V334H680" fill="none" stroke="#667085" stroke-width="1"/>',
+    ]
+    for series_index, item in enumerate(series):
+        values = item["values"]
+        points = [
+            (x0 + index * (x1 - x0) / (len(values) - 1), 194.0 - (value / scale) * 126.0)
+            for index, value in enumerate(values)
+        ]
+        encoded_points = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
+        color = colors[series_index]
+        parts.append(f'<polyline points="{encoded_points}" fill="none" stroke="{color}" stroke-width="3"/>')
+        for x, y in points:
+            parts.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3" fill="{color}"/>')
+        legend_y = 367 + series_index * 14
+        parts.append(f'<path d="M{x0} {legend_y}h18" stroke="{color}" stroke-width="3"/>')
+        parts.append(
+            f'<text x="{x0 + 24}" y="{legend_y + 4}" font-size="12">'
+            f'{html.escape(item["label"], quote=True)}</text>'
+        )
+    parts.extend(
+        [
+            f'<text x="381" y="402" text-anchor="middle" font-size="13">{html.escape(plot["x_label"], quote=True)}</text>',
+            f'<text x="18" y="194" text-anchor="middle" font-size="13" transform="rotate(-90 18 194)">{html.escape(plot["y_label"], quote=True)}</text>',
+            "</svg>",
+        ]
+    )
+    svg = "".join(parts)
+    if len(svg.encode("utf-8")) > 32 * 1024:
+        raise ValueError("rendered plot exceeds the byte limit")
+    return svg
+
+
 def _validate_summary(summary: dict[str, object]) -> list[dict[str, object]]:
     if type(summary) is not dict or set(summary) != {"schema_version", "input_sha256", "rows", "columns"}:
         raise ValueError("summary shape is invalid")

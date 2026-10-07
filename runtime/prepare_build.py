@@ -15,7 +15,7 @@ RUNTIME_COMMIT = "bd0affe5e5f723579df8902852f5d0c47795f355"
 RUNTIME_ARCHIVE_SHA256 = "e97403574699e253952c14dcfe03682f62985f59f529d624d92553694c7e8fea"
 CATALOG_COMMIT = "154988403bb5a18e9d3c0ce4e6d5e2e4b184a298"
 MODULES = ("__init__.py", "contracts.py", "model_payload.py", "runtime_adapter.py", "runtime_contracts.py",
-           "capability_registry.py", "instruction_loader.py", "resource_recipe.py")
+           "capability_registry.py", "instruction_loader.py", "resource_recipe.py", "scientific_render.py")
 
 
 def archive(source: Path, commit: str, *paths: str) -> bytes:

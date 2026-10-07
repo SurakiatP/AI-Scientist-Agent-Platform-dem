@@ -23,7 +23,7 @@ for (const workflow of ['literature', 'resources'] as const) {
     await page.getByLabel('Research question').fill(question);
     await page.getByText('Workflow options', { exact: true }).click();
     await page.getByLabel('Research workflow').selectOption(workflow);
-    await page.getByRole('button', { name: 'Review plan', exact: true }).click();
+    await page.getByRole('button', { name: 'Send question', exact: true }).click();
     await expect.poll(() => preparations.length).toBe(1);
     expect(preparations[0]).toEqual({ expected_revision: 1, workflow, search_terms: workflow === 'resources' ? [] : [question.slice(0, 150)] });
     expect(fixture.writes.filter((write) => write.path.endsWith('/approve'))).toHaveLength(0);
@@ -130,7 +130,7 @@ test('Crossref CSV preparation requires explicit query and ready CSV, then reche
   const plan = validCsvPlanV2();
   const readyRun = makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] });
   let revision = 1;
-  await page.route(`**/api/v1/projects/${PROJECT_ID}/runs`, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify([readyRun]) }));
+  await page.route(`**/api/v1/projects/${PROJECT_ID}/runs`, (route) => route.fulfill({ contentType: 'application/json', body: '[]' }));
   await page.route(`**/api/v1/sessions/${SESSION_ID}/runs`, async (route) => {
     const body = route.request().postDataJSON();
     expect(body.input_ids).toEqual([READY_FILE]);
@@ -148,7 +148,6 @@ test('Crossref CSV preparation requires explicit query and ready CSV, then reche
 
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Describe these measurements and find related studies.');
-  await page.getByText('Next question', { exact: true }).click();
   await page.getByText('Workflow options', { exact: true }).click();
   await page.getByLabel('Research workflow').selectOption('crossref_csv');
   await page.getByLabel('Crossref query').fill('microplastic exposure');
@@ -158,7 +157,7 @@ test('Crossref CSV preparation requires explicit query and ready CSV, then reche
   await expect(page.getByLabel('คำค้น Crossref')).toHaveValue('microplastic exposure');
   await expect(page.getByLabel('คอลัมน์ตัวเลข')).toHaveValue('x,y');
   await page.getByRole('button', { name: 'EN', exact: true }).click();
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
   await expect.poll(() => prepareBodies.length).toBe(1);
   await expect(page.getByRole('button', { name: 'Approve plan', exact: true })).toBeEnabled();

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, ProjectView, RunReadinessView, RunView, ScientificBindingV2, SessionView } from '../../../contracts/api-types';
-import { ApiError, apiErrorMessage, preparePlan, request, requestBlob, strictPlanView, strictReadiness, validUuid, type CsvSelection, type ResearchWorkflow } from './api';
+import { ApiError, apiErrorMessage, preparePlan, request, requestBlob, strictPlanView, strictReadiness, validUuid, type CsvSelection, type ResearchWorkflow, type RunCreate } from './api';
 import { useAppPreferences } from './App';
 import { ArtifactCard, ArtifactViewer } from './ArtifactViewer';
 import type { DecisionRequiredPayload } from '../../../contracts/api-types';
@@ -12,7 +12,7 @@ import './research.css';
 import './chat-original.css';
 
 const text = (language: 'th' | 'en', en: string, th: string) => language === 'th' ? th : en;
-type MessageView = { id: string; sequence: number; role: string; content: string; created_at?: string };
+type MessageView = { id: string; sequence: number; role: string; content: string; created_at?: string; run_id?: string | null };
 type PreparationDraft = { workflow: ResearchWorkflow; searchTerm: string; csvSelection?: CsvSelection; modelId: string; model: string };
 const fileStateLabels: Record<FileView['state'], [string, string]> = { uploading: ['Uploading', 'กำลังอัปโหลด'], preparing: ['Preparing', 'กำลังเตรียมไฟล์'], ready: ['Ready', 'พร้อมใช้งาน'], failed: ['Failed', 'ไม่สำเร็จ'] };
 const fileStateLabel = (state: FileView['state'], language: 'th' | 'en') => fileStateLabels[state][language === 'th' ? 1 : 0];
@@ -29,14 +29,14 @@ function readDraft(key: string): { question: string; selected: string[]; workflo
     return {
       question: typeof v?.question === 'string' ? v.question : '',
       selected: Array.isArray(v?.selected) ? v.selected.filter((x): x is string => typeof x === 'string') : [],
-      workflow: v?.workflow === 'resources' || v?.workflow === 'crossref_csv' ? v.workflow : 'literature',
+      workflow: v?.workflow === 'resources' || v?.workflow === 'crossref_csv' || v?.workflow === 'literature' ? v.workflow : 'chat',
       crossrefMode: v?.crossrefMode === 'doi' ? 'doi' : 'query',
       crossrefTerm: typeof v?.crossrefTerm === 'string' ? v.crossrefTerm : '',
       csvFileId: typeof v?.csvFileId === 'string' ? v.csvFileId : '',
       csvColumnsText: typeof v?.csvColumnsText === 'string' ? v.csvColumnsText : '',
       modelId: typeof v?.modelId === 'string' ? v.modelId : '',
     };
-  } catch { return { question: '', selected: [], workflow: 'literature', crossrefMode: 'query', crossrefTerm: '', csvFileId: '', csvColumnsText: '', modelId: '' }; }
+    } catch { return { question: '', selected: [], workflow: 'chat', crossrefMode: 'query', crossrefTerm: '', csvFileId: '', csvColumnsText: '', modelId: '' }; }
 }
 const parseCsvColumns = (value: string) => value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
 const normalizedDoi = (value: string) => value.trim().toLowerCase().replace(/^(https?:\/\/(dx\.)?doi\.org\/|doi:)/, '').trim();
@@ -163,6 +163,20 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     });
     return () => controller.abort();
   }, [base, sessionId]);
+  useEffect(() => {
+    if (!run) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const current = await request<MessageView[]>(`/api/v1/sessions/${sessionId}/messages`, { signal: controller.signal });
+        if (!controller.signal.aborted) { setMessages(current); setMessagesLoaded(true); }
+      } catch { /* The run event stream will trigger another read. */ }
+      if (!controller.signal.aborted && !TERMINAL.includes(run.state)) timer = setTimeout(() => void refresh(), 1000);
+    };
+    void refresh();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [run?.run_id, run?.state, run?.latest_cursor, sessionId]);
   useEffect(() => { // an explicit return target must not select another run
     const controller = new AbortController();
     setRunSelectionError(false);
@@ -176,6 +190,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
         setRunListLoaded(true);
         const scoped = all.filter((r) => r.project_id === projectId && r.session_id === sessionId && validUuid(r.run_id));
         if (requestedRun !== null) {
+          setArchived(scoped.filter((item) => item.run_id !== requestedRun));
           const listedRun = scoped.find((item) => item.run_id === requestedRun);
           if (listedRun) { setRunSelectionError(false); setActiveRun(listedRun); }
           else request<RunView>(`/api/v1/runs/${encodeURIComponent(requestedRun)}`, { signal: controller.signal }).then((candidate) => {
@@ -183,7 +198,11 @@ function ChatSession({ pollMs }: { pollMs: number }) {
             const selectedRun = candidate.run_id === requestedRun && validUuid(candidate.run_id) && candidate.project_id === projectId && candidate.session_id === sessionId ? candidate : null;
             setRunSelectionError(selectedRun === null); setActiveRun(selectedRun);
           }).catch(() => { if (!controller.signal.aborted) { setRunSelectionError(true); setActiveRun(null); } });
-        } else setActiveRun((current) => current ?? scoped.at(-1) ?? null);
+        } else {
+          const latest = scoped.at(-1) ?? null;
+          setArchived(scoped.filter((item) => item.run_id !== latest?.run_id));
+          setActiveRun((current) => current ?? latest);
+        }
       }
     }).catch((reason: unknown) => { if (!controller.signal.aborted) { setError(apiErrorMessage(reason, language, 'Unable to load research runs.')); if (requestedRun !== null) setRunSelectionError(true); } });
     return () => controller.abort();
@@ -278,7 +297,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     if (!run || run.state !== 'awaiting_approval' || pendingPreparation?.runId === run.run_id) return;
     try {
       const stored = JSON.parse(sessionStorage.getItem(`research-preparation:${sessionId}:${run.run_id}`) ?? 'null') as PreparationDraft | null;
-      if (stored && ['literature', 'resources', 'crossref_csv'].includes(stored.workflow) && typeof stored.modelId === 'string' && typeof stored.model === 'string') {
+      if (stored && ['chat', 'literature', 'resources', 'crossref_csv'].includes(stored.workflow) && typeof stored.modelId === 'string' && typeof stored.model === 'string') {
         setPendingPreparation({ runId: run.run_id, draft: stored });
       }
     } catch { /* malformed session draft cannot authorize a prepare request */ }
@@ -316,7 +335,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     csvSelection.numeric_columns.length === savedCsvGrant.numeric_columns.length &&
     csvSelection.numeric_columns.every((column, index) => column === savedCsvGrant.numeric_columns[index]) && savedInputMatches,
   );
-  const csvDraftDiffers = Boolean(v2Binding && !csvDraftMatchesSaved);
+  const csvDraftDiffers = Boolean(savedCsvGrant && !csvDraftMatchesSaved);
   const signature = useMemo(() => JSON.stringify([question.trim(), selectedInputIds, workflow, crossrefMode, crossrefTerm.trim(), csvFileId, csvColumns, selectedConnection?.id ?? null, selectedConnection?.model ?? null]), [question, selectedInputIds, workflow, crossrefMode, crossrefTerm, csvFileId, csvColumns, selectedConnection?.id, selectedConnection?.model]);
 
   async function sendPreparation(currentRun: RunView, draft: PreparationDraft) {
@@ -353,6 +372,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
   }
   async function submit() {
     setError('');
+    if (run && !TERMINAL.includes(run.state)) { setError(text(language, 'Wait for this turn to finish before starting another.', 'รอรอบนี้เสร็จก่อนเริ่มรอบถัดไป')); return; }
     if (!question.trim()) { setError(text(language, 'Enter a research question first.', 'กรุณาพิมพ์คำถามวิจัยก่อน')); return; }
     if (!hasModel) { setError(text(language, 'No model is ready. Open Settings to choose and check one.', 'ยังไม่มีโมเดลที่พร้อมใช้ เปิดการตั้งค่าเพื่อเลือกและตรวจสอบ')); return; }
     if (workflow === 'crossref_csv' && !csvSelection) { setError(text(language, 'Choose a ready CSV, enter one Crossref query or DOI, and name up to eight numeric columns.', 'เลือกไฟล์ CSV ที่พร้อม ป้อนคำค้นหรือ DOI ของ Crossref หนึ่งรายการ และระบุคอลัมน์ตัวเลขไม่เกินแปดคอลัมน์')); return; }
@@ -373,11 +393,15 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     setSubmitting(true);
     try {
       // retry_of is NOT sent: the server rejects unknown fields (422). TODO(contract): link a retry to its predecessor once the API allows it.
-      const created = await request<RunView>(`/api/v1/sessions/${sessionId}/runs`, json({ submission_key: attempt.current.key, question: submittedQuestion, input_ids: submittedInputIds, provider_id: connection.id, model: connection.model }));
+      const submission: RunCreate = { submission_key: attempt.current.key, question: submittedQuestion, input_ids: submittedInputIds, provider_id: connection.id, model: connection.model, chat_turn: true };
+      const created = await request<RunView>(`/api/v1/sessions/${sessionId}/runs`, json(submission));
       if (!mounted.current || latestSearchParams.current.get('run') !== requestedRun) return;
       attempt.current = null; setRetryOf(null);
+      if (run && !archived.some((previous) => previous.run_id === run.run_id)) setArchived((old) => [...old, run]);
       setSubmissions((old) => ({ ...old, [created.run_id]: { question: submittedQuestion, selected: submittedInputIds } }));
-      setMessages((old) => [...old, { id: `local-${created.run_id}`, sequence: old.length + 1, role: 'owner', content: submittedQuestion }]);
+      setMessages((old) => [...old, { id: `local-${created.run_id}`, sequence: old.length + 1, role: 'user', content: submittedQuestion, run_id: created.run_id }]);
+      void request<MessageView[]>(`/api/v1/sessions/${sessionId}/messages`).then((current) => { if (mounted.current) { setMessages(current); setMessagesLoaded(true); } }).catch(() => undefined);
+      setQuestion(''); setSelected([]);
       setSearchTerm(preparationDraft.searchTerm);
       searchScopeRevision.current += 1; setSearchScopePending(false);
       latestRunId.current = created.run_id;
@@ -501,6 +525,14 @@ function ChatSession({ pollMs }: { pollMs: number }) {
     const search = new URLSearchParams(location.search); search.set('output', a.artifact_id);
     navigate({ search: search.toString() });
   }} />;
+  const outputCard = (a: ArtifactView) => <div key={a.artifact_id} className="chat-output-card">
+    {card(a)}
+    {a.kind === 'plot' && <button type="button" className="button button-quiet button-small" disabled={!!run && !TERMINAL.includes(run.state)} onClick={() => {
+      setWorkflow('chat');
+      setQuestion(`Please revise graph “${a.title}” (artifact ID: ${a.artifact_id}). Keep the same data and units if they are available in this chat; otherwise ask me for them instead of guessing. Explain what changed.`);
+      questionInput.current?.focus();
+    }}>{text(language, 'Ask to revise this graph', 'ขอให้ปรับกราฟนี้')}</button>}
+  </div>;
   const expandedArtifact = [run, ...archived].flatMap((r) => r?.artifacts ?? []).find((a) => a.artifact_id === expanded);
 
   return <section className="research-chat">
@@ -517,7 +549,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
         <p>{text(language, 'Add project files, then review the plan before any research run begins.', 'เพิ่มไฟล์ของโปรเจกต์ แล้วตรวจทานแผนก่อนเริ่มงานวิจัย')}</p>
         <button type="button" className="button button-quiet" onClick={() => { setQuestion(text(language, 'Find research on how temperature affects molecular diffusion.', 'ช่วยค้นงานวิจัยเรื่องอุณหภูมิที่มีผลต่อการแพร่ของโมเลกุล')); questionInput.current?.focus(); }}>{text(language, 'Try a sample question', 'ลองคำถามตัวอย่าง')}</button>
       </div> : <ol className="notebook-messages">{messages.map((m) => <li key={m.id} className={`notebook-message ${m.role === 'assistant' ? 'assistant' : 'owner'}`}><strong>{m.role === 'assistant' ? text(language, 'Assistant', 'ผู้ช่วย') : text(language, 'You', 'คุณ')}:</strong> <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span></li>)}</ol>}
-    </section>
+      <div className="chat-turn-feed">
     {runSelectionError && <p role="alert">{text(language, 'The requested run is unavailable in this project and conversation.', 'ไม่พบการทำงานที่ร้องขอในโครงการและบทสนทนานี้')}</p>}
     {planError !== null && <p role="alert">{apiErrorMessage(planError, language)}</p>}
     {error && run?.state === 'awaiting_approval' && <p role="alert">{error}</p>}
@@ -563,6 +595,8 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       <button type="button" className="button button-small" disabled={dirty || !approvalReady || approving || preparingPlan} onClick={() => void approve()}>{approving ? text(language, 'Checking approval…', 'กำลังตรวจสอบการอนุมัติ…') : text(language, 'Approve plan', 'อนุมัติแผน')}</button>
       {dirty && <p>{text(language, 'Save your edits and review the new plan; the previous approval no longer applies.', 'บันทึกการแก้ไขและตรวจทานแผนใหม่ การอนุมัติก่อนหน้าไม่มีผลแล้ว')}</p>}
     </section>}
+      </div>
+    </section>
     <dialog className="chat-scope-dialog" ref={scopeDialog} aria-labelledby="scope-dialog-title" onCancel={(event) => { event.preventDefault(); setScopeDialogOpen(false); }}>
       <form onSubmit={(event) => { event.preventDefault(); const next = scopeDraft.trim(); searchScopeRevision.current += 1; setSearchScopePending((pending) => pending || next !== searchTerm.trim()); setSearchTerm(next); setScopeDialogOpen(false); }}>
         <p className="project-eyebrow">PLAN SCOPE</p><h2 id="scope-dialog-title">{text(language, 'Adjust literature search scope', 'ปรับขอบเขตการค้นวรรณกรรม')}</h2>
@@ -586,7 +620,7 @@ function ChatSession({ pollMs }: { pollMs: number }) {
         {workflow === 'crossref_csv' && csvFile && <span className="file-chip">{csvFile.filename}</span>}
       </div>
       <details className="chat-options"><summary>{text(language, 'Workflow options', 'ตัวเลือกเวิร์กโฟลว์')}</summary>
-      <label htmlFor="research-workflow">{text(language, 'Research workflow', 'รูปแบบงานวิจัย')}</label><select id="research-workflow" value={workflow} onChange={(event) => changeWorkflow(event.target.value as ResearchWorkflow)}><option value="literature">{text(language, 'Review literature', 'ตรวจทานวรรณกรรม')}</option><option value="resources">{text(language, 'Measure workspace resources', 'ตรวจทรัพยากรของงาน')}</option><option value="crossref_csv">{text(language, 'Find papers and describe a CSV', 'ค้นหาบทความและสรุปไฟล์ CSV')}</option></select>
+      <label htmlFor="research-workflow">{text(language, 'Research workflow', 'รูปแบบงานวิจัย')}</label><select id="research-workflow" value={workflow} onChange={(event) => changeWorkflow(event.target.value as ResearchWorkflow)}><option value="chat">{text(language, 'Conversational research', 'สนทนาเพื่อการวิจัย')}</option><option value="literature">{text(language, 'Review literature', 'ตรวจทานวรรณกรรม')}</option><option value="resources">{text(language, 'Measure workspace resources', 'ตรวจทรัพยากรของงาน')}</option><option value="crossref_csv">{text(language, 'Find papers and describe a CSV', 'ค้นหาบทความและสรุปไฟล์ CSV')}</option></select>
       </details>
       {workflow === 'crossref_csv' && <fieldset className="scientific-inputs">
         <legend>{text(language, 'Scientific inputs', 'ข้อมูลวิจัย')}</legend>
@@ -608,14 +642,15 @@ function ChatSession({ pollMs }: { pollMs: number }) {
       </div>
       </details>
       {error && <p role="alert">{error}</p>}
-      <button type="button" className="button button-primary" disabled={submitting || connectionsLoading} onClick={() => void submit()}>{submitting ? text(language, 'Creating…', 'กำลังสร้าง…') : text(language, 'Review plan', 'ตรวจทานแผน')}</button>
+      <button type="button" className="button button-primary" disabled={submitting || connectionsLoading || (!!run && !TERMINAL.includes(run.state))} onClick={() => void submit()}>{submitting ? text(language, 'Sending…', 'กำลังส่ง…') : text(language, 'Send question', 'ส่งคำถาม')}</button>
+      {!!run && !TERMINAL.includes(run.state) && <p>{text(language, 'Wait for this turn to finish before sending another. You can stop it above.', 'รอรอบนี้เสร็จก่อนส่งคำถามถัดไป หรือกดหยุดด้านบน')}</p>}
     </section>
     </details>
     </div>
     <aside className="notebook-outputs" aria-label={text(language, 'Outputs', 'ผลลัพธ์')}>
       <p className="notebook-label">{text(language, 'SESSION OUTPUTS', 'ผลลัพธ์บทสนทนา')}</p><h2>{text(language, 'Outputs', 'ผลลัพธ์')}</h2>
-      {run && run.artifacts.length > 0 && <section aria-label={text(language, 'Current run outputs', 'ผลลัพธ์งานปัจจุบัน')}>{run.artifacts.map(card)}</section>}
-      {archived.map((old) => <section key={old.run_id} aria-label={text(language, 'Previous run (kept)', 'การทำงานก่อนหน้า (เก็บไว้)')}><h3>{text(language, 'Previous run (kept)', 'การทำงานก่อนหน้า (เก็บไว้)')}</h3>{old.artifacts.map(card)}</section>)}
+      {run && run.artifacts.length > 0 && <section aria-label={text(language, 'Current run outputs', 'ผลลัพธ์งานปัจจุบัน')}>{run.artifacts.map(outputCard)}</section>}
+      {archived.map((old) => old.artifacts.length > 0 && <section key={old.run_id} aria-label={text(language, 'Previous run (kept)', 'การทำงานก่อนหน้า (เก็บไว้)')}><h3>{text(language, 'Previous run (kept)', 'การทำงานก่อนหน้า (เก็บไว้)')}</h3>{old.artifacts.map(outputCard)}</section>)}
       {(!run || run.artifacts.length === 0) && archived.length === 0 && <p>{text(language, 'Completed work and outputs will appear here.', 'งานและผลลัพธ์ที่เสร็จแล้วจะแสดงที่นี่')}</p>}
     </aside>
     {expandedArtifact && <ArtifactViewer artifact={expandedArtifact} projectName={project?.name} onClose={closeOutput} language={language} />}

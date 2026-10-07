@@ -95,7 +95,10 @@ function Report({ artifact, language }: { artifact: ArtifactView; language: Lang
     setContent(null); setError(null);
     void requestBlob(`/api/v1/artifacts/${encodeURIComponent(artifact.artifact_id)}/content`, controller.signal).then(async ({ blob, contentType }) => {
       if (controller.signal.aborted) return;
-      const svgFileFallback = contentType === 'application/octet-stream' && artifact.kind === 'file' && artifact.title.toLowerCase().endsWith('.svg');
+      const svgFileFallback = contentType === 'application/octet-stream' && (
+        (artifact.kind === 'plot' && artifact.content_type === 'image/svg+xml')
+        || (artifact.kind === 'file' && artifact.title.toLowerCase().endsWith('.svg'))
+      );
       const media = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml', 'application/pdf'].includes(contentType);
       const readable = ['text/plain', 'text/markdown', 'text/csv', 'application/json'].includes(contentType);
       if (media || svgFileFallback) {

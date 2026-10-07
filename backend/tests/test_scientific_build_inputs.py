@@ -24,7 +24,8 @@ def test_full_catalog_manifest_preserves_all_instruction_hashes_without_enableme
         json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     assert registry['skills']['get-available-resources']['runtime']['image'] == 'prof.worker-base@py3.14.7'
     assert not any(s['statuses']['enabled']['value'] for s in registry['skills'].values())
-    assert {'instruction_loader.py', 'capability_registry.py', 'resource_recipe.py'} <= set(build.MODULES)
+    assert {'instruction_loader.py', 'capability_registry.py', 'resource_recipe.py',
+            'scientific_render.py'} <= set(build.MODULES)
 
 
 def test_catalog_extra_private_file_or_changed_bytes_fail_before_source_manifest(tmp_path, monkeypatch):

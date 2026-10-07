@@ -121,6 +121,52 @@ def test_boundary_stores_ledger_budget_snapshot_not_worker_value(controller_fixt
     assert stored.budget_remaining_tokens == 2000 - 30 - 20
 
 
+def _final_boundary(db, boundary):
+    data = boundary.context.model_dump(mode="json")
+    data["messages"][0]["content"] = db.execute(
+        text("SELECT manifest->>'question' FROM input_snapshots WHERE run_id=:run"),
+        {"run": boundary.context.run_id},
+    ).scalar_one()
+    data["messages"].append({"role": "assistant", "content": "The graph is ready."})
+    data["current_turn_user_index"] = 0
+    data["boundary"] = "final"
+    context = RuntimeContextV1.model_validate(data)
+    return boundary.model_copy(update={"context": context})
+
+
+def test_final_boundary_persists_one_assistant_message_tied_to_run(controller_fixture):
+    db, run, token, boundary, controller, _ = controller_fixture
+    final = _final_boundary(db, boundary)
+
+    first = controller.boundary(db, token, final)
+    assert controller.boundary(db, token, final) == first
+    rows = db.execute(text("SELECT role, content, run_id FROM messages WHERE run_id=:run AND role='assistant'"),
+                      {"run": run}).mappings().all()
+
+    assert [(row["role"], row["content"], row["run_id"]) for row in rows] == [
+        ("assistant", "The graph is ready.", run)
+    ]
+    assert db.execute(text("SELECT state FROM runs WHERE id=:run"), {"run": run}).scalar_one() == "running"
+
+
+@pytest.mark.parametrize("state,waiting_reason,cancel_requested", [
+    ("waiting_input", "unknown_outcome", False),
+    ("canceled", None, True),
+])
+def test_final_boundary_never_persists_unknown_or_canceled_answer(
+    controller_fixture, state, waiting_reason, cancel_requested
+):
+    db, run, token, boundary, controller, _ = controller_fixture
+    db.execute(text("UPDATE runs SET state=:state, waiting_reason=:reason, cancel_requested=:cancel WHERE id=:run"),
+               {"state": state, "reason": waiting_reason, "cancel": cancel_requested, "run": run})
+    final = _final_boundary(db, boundary)
+
+    with pytest.raises(DomainError):
+        controller.boundary(db, token, final)
+    assert db.execute(text("SELECT count(*) FROM messages WHERE run_id=:run AND role='assistant'"),
+                      {"run": run}).scalar_one() == 0
+
+
 @pytest.mark.parametrize('field,value', [('project_id',uuid4()),('image_digest','sha256:'+'e'*64),('environment_digest','e'*64)])
 def test_controller_binds_context_to_actual_run_and_trusted_pins(controller_fixture,field,value):
     db, run, token, boundary, controller, calls = controller_fixture

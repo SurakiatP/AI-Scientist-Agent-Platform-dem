@@ -493,8 +493,10 @@ class RuntimeContextV1(RuntimeRecord):
                     or agent.skills_digest != self.skills_digest
                     or agent.environment_digest != self.environment_digest):
                 raise ValueError("scientific agent runtime pins differ from worker context")
-            if self.scientific_results:
-                raise ValueError("V2 scientific bindings cannot carry V1 receipts")
+            if self.scientific_results and any(
+                receipt.capability_id != "scientific-visualization" for receipt in self.scientific_results
+            ):
+                raise ValueError("V2 scientific bindings only allow plot receipts")
             binding_digest = hashlib.sha256(canonical_bytes(binding.model_dump(mode="json"))).hexdigest()
             issued = {call.id: call for message in self.messages for call in (message.tool_calls or [])
                       if call.function.name == "scientific_csv_describe"}
@@ -546,19 +548,27 @@ class RuntimeContextV1(RuntimeRecord):
         if scientific is not None and scientific.image_digest != self.image_digest:
             raise ValueError("scientific profile differs from the worker image")
         if self.scientific_results:
-            if scientific is None:
+            if scientific is None and v2_binding is None:
                 raise ValueError("scientific result has no approved binding")
-            binding_digest = hashlib.sha256(canonical_bytes(scientific.model_dump(mode="json"))).hexdigest()
+            active_binding = v2_binding or scientific
+            binding_digest = hashlib.sha256(canonical_bytes(active_binding.model_dump(mode="json"))).hexdigest()
+            expected_tool = "scientific_plot" if v2_binding is not None else "scientific_resources"
             issued = {call.id for message in self.messages for call in message.tool_calls or []
-                      if call.function.name == "scientific_resources"}
+                      if call.function.name == expected_tool}
             completed = {message.tool_call_id for message in self.messages if message.role == "tool"}
+            manifest = {entry.path: (entry.sha256, entry.size) for entry in self.workspace_manifest}
             receipt_ids, result_paths = set(), set()
             for receipt in self.scientific_results:
                 if (receipt.tool_call_id not in issued or receipt.tool_call_id not in completed
                         or receipt.tool_call_id in receipt_ids
                         or receipt.path in result_paths or receipt.binding_sha256 != binding_digest
-                        or receipt.capability_id not in scientific.capability_ids
-                        or receipt.size > scientific.max_result_bytes):
+                        or receipt.capability_id not in active_binding.capability_ids
+                        or (v2_binding is not None and (
+                            receipt.capability_id != "scientific-visualization"
+                            or not receipt.path.startswith("outputs/plots/")
+                            or not receipt.path.endswith(".svg")
+                            or manifest.get(receipt.path) != (receipt.sha256, receipt.size)))
+                        or (scientific is not None and receipt.size > scientific.max_result_bytes)):
                     raise ValueError("scientific receipt differs from issued approved computation")
                 receipt_ids.add(receipt.tool_call_id)
                 result_paths.add(receipt.path)

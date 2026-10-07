@@ -119,6 +119,7 @@ class RunCreate(Body):
     provider_id: UUID
     model: str
     retry_of: UUID | None = None
+    chat_turn: bool = False
 
 
 class PlanPatch(Body):
@@ -129,7 +130,7 @@ class PlanPatch(Body):
 class PreparePlan(Body):
     expected_revision: int
     search_terms: list[str] = Field(default_factory=list, max_length=10)
-    workflow: Literal['literature', 'resources', 'crossref_csv'] = 'literature'
+    workflow: Literal['chat', 'literature', 'resources', 'crossref_csv'] = 'literature'
     csv_selection: CsvResearchSelection | None = None
 
     @model_validator(mode="after")
@@ -366,7 +367,8 @@ def create_run(request: Request, session_id: UUID, body: RunCreate):
     with database_session() as db:
         project_id = domain.session_project(db, _principal(request), session_id, "work:submit")
         run = domain.submit_run(db, _principal(request), project_id, session_id, body.submission_key, body.question,
-                                body.input_ids, body.provider_id, body.model, body.retry_of)
+                                body.input_ids, body.provider_id, body.model, body.retry_of,
+                                serialize_session=body.chat_turn)
         db.commit()
         return run
 

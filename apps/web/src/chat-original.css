@@ -134,5 +134,9 @@
 .chat-prepare-recovery p { margin: 0; }
 .chat-plan-review > details > summary { min-height: 44px; display: flex; align-items: center; color: var(--accent); font-weight: 600; cursor: pointer; }
 .research-chat :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.chat-turn-feed { display: grid; gap: 12px; margin-top: 18px; }
+.chat-turn-feed > .run-progress, .chat-turn-feed > .chat-prepare-recovery, .chat-turn-feed > .chat-plan-review { margin: 0; }
+.chat-output-card { display: grid; justify-items: start; gap: 8px; min-width: 0; }
+.chat-output-card .artifact-card { width: 100%; margin: 0; }
 @media (prefers-reduced-motion: reduce) { .research-chat *, .research-chat *::before, .research-chat *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
 @media (max-width: 520px) { .chat-prepare-recovery { align-items: stretch; flex-direction: column; } .chat-prepare-recovery .button { width: 100%; } .research-chat .chat-model-notice select { flex-basis: 100%; } }

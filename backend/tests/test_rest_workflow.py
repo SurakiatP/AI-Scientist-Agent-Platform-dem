@@ -69,6 +69,21 @@ def new_session(client, project_id):
     return r.json()
 
 
+def test_chat_turn_rejects_overlapping_unfinished_submission(client):
+    project = new_project(client)
+    session = new_session(client, project["id"])
+    url = f"/api/v1/sessions/{session['id']}/runs"
+    body = {"question": "Explain this topic", "input_ids": [], "provider_id": str(uuid4()),
+            "model": "fixture", "chat_turn": True}
+    first = client.post(url, json={**body, "submission_key": str(uuid4())})
+    assert first.status_code == 201, first.text
+    second = client.post(url, json={**body, "submission_key": str(uuid4())})
+    assert second.status_code == 409, second.text
+    oversized = client.post(url, json={**body, "submission_key": str(uuid4()),
+                                       "question": "x" * (64 * 1024 + 1)})
+    assert oversized.status_code == 413, oversized.text
+
+
 def ready_file(client, db, project_id, name="data.txt", body=b"hello"):
     r = client.post(f"/api/v1/projects/{project_id}/files", params={"filename": name}, content=body)
     assert r.status_code == 201, r.text

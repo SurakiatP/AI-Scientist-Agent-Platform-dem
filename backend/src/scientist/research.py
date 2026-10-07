@@ -28,6 +28,21 @@ def build_plan(db: Session, owner: Principal, run_id: UUID, search_terms: list[s
         return _csv_plan(db, owner, run_id, csv_selection)
     if csv_selection is not None:
         raise DomainError('invalid_request', 400)
+    if workflow == 'chat':
+        if search_terms:
+            raise DomainError('invalid_request', 400)
+        from scientist.scientific_authority import visualization_binding
+        current = get_plan(db, owner, run_id).plan
+        provider = settings.provider_endpoint(current.provider_id)
+        if not provider:
+            raise DomainError('data_destinations_not_configured', 409)
+        return current.model_copy(update={
+            'scientific': visualization_binding(current.input_snapshot_digest),
+            'stages': ['Discuss the question', 'Render approved graphs when useful'],
+            'allowed_ops': ['llm'],
+            'data_recipients': [provider],
+            'packages': [],
+        })
     if workflow == 'resources':
         from scientist.scientific_authority import resource_binding
         current = get_plan(db, owner, run_id).plan

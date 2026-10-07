@@ -506,6 +506,53 @@ def _stopping_or_waiting(run_id, state, reason=None, cancel=False):
 
 
 # review 2: the snapshot can go stale between the read and recover()
+def test_fresh_bootstrap_replays_frozen_dialogue_and_artifact_identity(iso, monkeypatch):
+    first = _approved_run()
+    _sql("UPDATE runs SET state='completed' WHERE id=:r", r=first)
+    prior = _sql("SELECT project_id, session_id, caller_identity FROM runs WHERE id=:r", r=first)[0]
+    _sql("UPDATE messages SET content='Make a graph' WHERE run_id=:r AND role='user'", r=first)
+    artifact_id = uuid4()
+    _sql("""
+        INSERT INTO messages (id, project_id, session_id, role, content, run_id)
+        VALUES (:id, :project, :session, 'assistant', 'Graph is ready.', :run)
+    """, id=uuid4(), project=prior["project_id"], session=prior["session_id"], run=first)
+    _sql("""
+        INSERT INTO artifacts (id, project_id, run_id, title, kind, object_key, sha256, size, content_type)
+        VALUES (:id, :project, :run, 'Electron flow', 'plot', 'private/object-key', :sha, 12, 'image/svg+xml')
+    """, id=artifact_id, project=prior["project_id"], run=first, sha="a" * 64)
+    owner = Principal(identity=prior["caller_identity"], kind="owner")
+    with session() as db:
+        second = submit_run(db, owner, prior["project_id"], prior["session_id"],
+                            uuid4().hex, QUESTION, [], PROVIDER, "fixture")
+        digest = db.execute(text("SELECT digest FROM input_snapshots WHERE run_id=:r"),
+                            {"r": second.run_id}).scalar_one().strip()
+        plan = PlanSpec(input_snapshot_digest=digest, provider_id=PROVIDER, model="fixture",
+                        stages=["search"], allowed_ops=["llm"], data_recipients=[ORIGIN], packages=[],
+                        token_limit=10000, elapsed_limit_ms=60000)
+        prepared = revise_plan(db, owner, second.run_id, second.revision, plan)
+        approve_run(db, owner, second.run_id, prepared.revision, prepared.plan_digest)
+        db.execute(text("UPDATE runs SET state='running', generation=1 WHERE id=:r"), {"r": second.run_id})
+        db.commit()
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(
+        image_digest=WORKER_DIGEST, skills_digest="b" * 64, environment_digest="d" * 64,
+        runtime_commit=RUNTIME_COMMIT,
+    ))
+    monkeypatch.setattr(host, "_destinations", {PROVIDER: ORIGIN})
+
+    with session() as db:
+        boot = host.bootstrap(db, second.run_id, 1)
+    context = RuntimeContextV1.model_validate_json(boot.context)
+    assert [(message.role, message.content) for message in context.messages[:2]] == [
+        ("user", "Make a graph"), ("assistant", "Graph is ready.")
+    ]
+    assert context.messages[-1].role == "user" and context.messages[-1].content == QUESTION
+    assert sum(message.role == "user" and message.content == QUESTION for message in context.messages) == 1
+    assert context.current_turn_user_index == len(context.messages) - 1
+    assert context.native_message_metadata[0].message_index == context.current_turn_user_index
+    assert str(artifact_id) in context.messages[-2].content
+    assert "private/object-key" not in context.messages[-2].content
+
+
 def test_reap_rechecks_state_under_lock(iso, recorders):
     _, recovers = recorders
     run_id = _approved_run()

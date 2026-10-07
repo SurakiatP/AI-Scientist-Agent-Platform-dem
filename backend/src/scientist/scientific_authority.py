@@ -243,3 +243,29 @@ def resource_binding(input_snapshot_digest: str) -> ScientificBinding:
         return binding
     except (OSError, ValueError, TypeError) as exc:
         raise DomainError('scientific_binding_unavailable', 409) from exc
+
+
+def visualization_binding(input_snapshot_digest: str) -> ScientificBindingV2:
+    """Select reviewed plot instructions; the runtime exposes only its bounded SVG tool."""
+    from scientist.capability_registry import load_registry
+    from scientist.instruction_loader import load_instruction_bundle, load_instruction_pins
+    registry_path = ROOT / 'docs/skills/capability-registry.json'
+    if not registry_path.is_file():
+        registry_path = ROOT / 'runtime/capability-registry.json'
+    try:
+        selection = load_registry(registry_path).select(['scientific-visualization'])
+        instructions = load_instruction_bundle(selection, _bundle_root,
+            load_instruction_pins(ROOT / 'runtime/skills-manifest.json'),
+            token_counter=lambda value: len(value.encode('utf-8')), token_budget=65536)
+        binding = ScientificBindingV2(
+            binding_version=2, catalog_commit=selection.catalog_commit,
+            registry_sha256=selection.registry_sha256,
+            capability_ids=list(selection.capability_ids),
+            instruction_fingerprint=instructions.instruction_fingerprint,
+            agent_runtime_pins=_current_runtime_pins(),
+            input_snapshot_digest=input_snapshot_digest,
+        )
+        validate_instruction(binding, current_image_digest())
+        return binding
+    except (OSError, ValueError, TypeError) as exc:
+        raise DomainError('scientific_binding_unavailable', 409) from exc

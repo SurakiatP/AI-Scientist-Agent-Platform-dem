@@ -2,7 +2,7 @@ import type { Page } from '@playwright/test';
 import type { ArtifactView, ConnectionView, FileView, PendingDecisionView, PlanView, RunEvent, RunView } from '../../../../contracts/api-types';
 import { PROJECT_ID, SESSION_ID, installProjectFixtureRoutes } from './project';
 
-const SUBMIT_FIELDS = ['submission_key', 'question', 'input_ids', 'provider_id', 'model'];
+const SUBMIT_FIELDS = ['submission_key', 'question', 'input_ids', 'provider_id', 'model', 'chat_turn'];
 
 export { PROJECT_ID, SESSION_ID };
 export const SESSION_URL = `/projects/${PROJECT_ID}/sessions/${SESSION_ID}`;
@@ -18,7 +18,7 @@ export const BAD_FILE = 'f2222222-2222-4222-8222-222222222222';
 export const REPORT_MARKDOWN = 'Findings summary.\n\n$$E = mc^2$$\n\n```python\nprint("diffusion")\n```\n';
 export const PLOT_CSV = 'sample,measured concentration\ncontrol,8.25\ntreated,3.75\n';
 
-const artifact = (id: string, kind: ArtifactView['kind'], title: string, partial = false): ArtifactView => ({ artifact_id: id, project_id: PROJECT_ID, run_id: RUN_ID, title, kind, sha256: 'a'.repeat(64), size: 100, content_type: kind === 'report' ? 'text/markdown' : 'application/json', partial });
+const artifact = (id: string, kind: ArtifactView['kind'], title: string, partial = false, plotSvg = false): ArtifactView => ({ artifact_id: id, project_id: PROJECT_ID, run_id: RUN_ID, title, kind, sha256: 'a'.repeat(64), size: 100, content_type: kind === 'report' ? 'text/markdown' : plotSvg && kind === 'plot' ? 'image/svg+xml' : 'application/json', partial });
 export const plot = artifact(PLOT_ID, 'plot', 'Concentration profile');
 export const report = artifact(REPORT_ID, 'report', 'Evidence report');
 
@@ -31,14 +31,15 @@ export function event<K extends RunEvent['kind']>(sequence: number, kind: K, pay
 
 type Options = {
   run?: RunView | null; pendingDecisions?: PendingDecisionView[]; conflictOnDecision?: boolean;
-  messages?: Array<{ id: string; sequence: number; role: string; content: string; created_at: string }>;
-  connection?: ConnectionView['state'] | 'missing'; expireCursorOnce?: boolean; pageSize?: number; conflictOnApprove?: boolean; failFirstSubmit?: boolean; holdSubmit?: boolean; reportMarkdown?: string; failFirstDecision?: boolean;
+  messages?: Array<{ id: string; sequence: number; role: string; content: string; created_at: string; run_id?: string | null }>;
+  connection?: ConnectionView['state'] | 'missing'; expireCursorOnce?: boolean; pageSize?: number; conflictOnApprove?: boolean; failFirstSubmit?: boolean; holdSubmit?: boolean; reportMarkdown?: string; plotSvg?: boolean; chatVisualization?: boolean; failFirstDecision?: boolean;
 };
 
 // Deterministic contract events and snapshots; nothing here depends on production timers.
 export async function installResearchFixtureRoutes(page: Page, options: Options = {}) {
   await installProjectFixtureRoutes(page);
-  let run: RunView | null = options.run === undefined ? makeRun() : options.run;
+  const fixturePlot = options.plotSvg ? artifact(PLOT_ID, 'plot', 'Concentration profile', false, true) : plot;
+  let run: RunView | null = options.run === undefined ? makeRun({ artifacts: [fixturePlot, report] }) : options.run;
   let pendingDecisions: PendingDecisionView[] = [...(options.pendingDecisions ?? [])];
   let events: RunEvent[] = [];
   let plan = makePlan(1);
@@ -56,7 +57,7 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
   const submitted = new Map<string, RunView>();
   const writes: Array<{ method: string; path: string; body?: any; headers: Record<string, string> }> = [];
   const deletes: string[] = [];
-  const messages = options.messages ?? [{ id: 'm1', sequence: 1, role: 'user', content: 'Original question about diffusion', created_at: '2026-10-05T00:00:00Z' }];
+  let messages = options.messages ?? [{ id: 'm1', sequence: 1, role: 'user', content: 'Original question about diffusion', run_id: RUN_ID, created_at: '2026-10-05T00:00:00Z' }];
   const connection: ConnectionView = { id: CONNECTION_ID, label: 'Fixture', provider: 'fixture-provider', model: 'fixture-model', state: options.connection === 'missing' ? 'unconfigured' : options.connection ?? 'ready', has_secret: true };
   const baseFiles: FileView[] = [
     { id: READY_FILE, project_id: PROJECT_ID, filename: 'example.csv', size: 10, content_type: 'text/csv', state: 'ready' },
@@ -81,17 +82,26 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
     if (method === 'POST' && path === `/projects/${PROJECT_ID}/files`) { uploaded = { id: 'f3333333-3333-4333-8333-333333333333', project_id: PROJECT_ID, filename: 'uploaded.csv', size: 5, content_type: 'text/csv', state: 'preparing' }; fileListCount = 0; return json(uploaded, 201); }
     if (method === 'DELETE') { deletes.push(path); return json({}); }
     if (method === 'GET' && path === `/artifacts/${REPORT_ID}/content`) return route.fulfill({ status: 200, contentType: 'text/markdown', body: options.reportMarkdown ?? REPORT_MARKDOWN });
-    if (method === 'GET' && path === `/artifacts/${PLOT_ID}/content`) return route.fulfill({ status: 200, contentType: 'text/csv', body: PLOT_CSV });
+  if (method === 'GET' && path === `/artifacts/${PLOT_ID}/content`) return route.fulfill(options.plotSvg
+      ? { status: 200, contentType: 'application/octet-stream', body: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4"/></svg>' }
+      : { status: 200, contentType: 'text/csv', body: PLOT_CSV });
     if (method === 'POST' && path === `/sessions/${SESSION_ID}/runs`) {
       const unknown = Object.keys(body ?? {}).filter((k) => !SUBMIT_FIELDS.includes(k));
-      if (unknown.length || SUBMIT_FIELDS.some((k) => !(k in (body ?? {})))) return json({ detail: [{ type: 'extra_forbidden', loc: ['body'], msg: 'Extra inputs are not permitted' }] }, 422);
+      if (unknown.length || SUBMIT_FIELDS.some((k) => !(k in (body ?? {}))) || body.chat_turn !== true) return json({ detail: [{ type: 'extra_forbidden', loc: ['body'], msg: 'Extra inputs are not permitted' }] }, 422);
       submitCount += 1;
       if (gate) await gate;
       const existing = submitted.get(body.submission_key);
       if (existing) return json(existing, 201);
-      if (options.failFirstSubmit && submitCount === 1) { submitted.set(body.submission_key, makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] })); return route.abort('failed'); }
+      if (options.failFirstSubmit && submitCount === 1) {
+        const accepted = makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] });
+        submitted.set(body.submission_key, accepted); run = accepted;
+        messages = [...messages, { id: `m-${accepted.run_id}`, sequence: messages.length + 1, role: 'user', content: body.question, run_id: accepted.run_id, created_at: '2026-10-05T00:00:00Z' }];
+        return route.abort('failed');
+      }
       const created = makeRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] });
-      submitted.set(body.submission_key, created); run = created; return json(created, 201);
+      submitted.set(body.submission_key, created); run = created;
+      messages = [...messages, { id: `m-${created.run_id}`, sequence: messages.length + 1, role: 'user', content: body.question, run_id: created.run_id, created_at: '2026-10-05T00:00:00Z' }];
+      return json(created, 201);
     }
     const runMatch = /^\/runs\/([0-9a-f-]+)(\/.*)?$/.exec(path);
     if (runMatch) {
@@ -107,9 +117,21 @@ export async function installResearchFixtureRoutes(page: Page, options: Options 
         return json({ events: events.filter((e) => e.sequence > after).slice(0, size), latest_cursor: latest });
       }
       if (method === 'GET' && sub === '/plan') return json({ ...plan, run_id: runMatch[1] });
-      if (method === 'GET' && sub === '/readiness') return json({ run_id: runMatch[1], revision: plan.revision, plan_digest: plan.plan_digest, state: 'ready', requirements: [] });
-      if (method === 'POST' && sub === '/prepare-plan') {
-        plan = makePlan(plan.revision + 1, plan.plan.stages);
+      if (method === 'GET' && sub === '/readiness') return json({ run_id: runMatch[1], revision: plan.revision, plan_digest: plan.plan_digest, ...(plan.plan.scientific ? { binding_sha256: '9'.repeat(64) } : {}), state: 'ready', requirements: [] });
+    if (method === 'POST' && sub === '/prepare-plan') {
+      const next = makePlan(plan.revision + 1, plan.plan.stages);
+      plan = options.chatVisualization && body.workflow === 'chat' ? {
+        ...next, plan: { ...next.plan, scientific: {
+          binding_version: 2 as const,
+          catalog_commit: '154988403bb5a18e9d3c0ce4e6d5e2e4b184a298' as const,
+          registry_sha256: 'a'.repeat(64),
+          capability_ids: ['scientific-visualization'],
+          instruction_fingerprint: 'b'.repeat(64),
+          agent_runtime_pins: { image_digest: 'sha256:' + 'c'.repeat(64), skills_digest: 'd'.repeat(64), environment_digest: 'e'.repeat(64) },
+          input_snapshot_digest: next.plan.input_snapshot_digest,
+          approved_crossref_queries: {}, required_compute_profiles: [], csv_describe_grants: {},
+        } },
+      } : next;
         run = { ...run!, revision: run!.revision + 1 };
         return json(run);
       }

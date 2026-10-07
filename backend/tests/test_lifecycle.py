@@ -23,6 +23,88 @@ def test_submission_is_idempotent_and_changed_body_conflicts(db, project_session
         submit_run(db, owner, project_id, session_id, "same-key", "changed", [], provider_id, "fixture")
 
 
+def test_session_rejects_a_second_unfinished_turn(db, project_session):
+    project_id, session_id = project_session
+    owner = Principal(identity=uuid4(), kind="owner")
+    submit_run(db, owner, project_id, session_id, "active-one", "first", [], uuid4(), "fixture",
+               serialize_session=True)
+
+    with pytest.raises(DomainError, match="revision_conflict"):
+        submit_run(db, owner, project_id, session_id, "active-two", "second", [], uuid4(), "fixture",
+                   serialize_session=True)
+
+
+def test_concurrent_different_keys_still_create_one_active_session_turn(db, project_session):
+    project_id, session_id = project_session
+    db.commit()
+    owner = Principal(identity=uuid4(), kind="owner")
+
+    def submit(key):
+        with database_session() as worker_db:
+            try:
+                result = submit_run(worker_db, owner, project_id, session_id, key, key, [], uuid4(), "fixture",
+                                    serialize_session=True)
+                worker_db.commit()
+                return result.run_id
+            except DomainError as exc:
+                worker_db.rollback()
+                return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(submit, ("concurrent-a", "concurrent-b")))
+
+    assert sum(result != "revision_conflict" for result in results) == 1
+    assert results.count("revision_conflict") == 1
+
+
+def test_new_snapshot_freezes_prior_dialogue_and_completed_artifacts(db, project_session):
+    project_id, session_id = project_session
+    owner = Principal(identity=uuid4(), kind="owner")
+    first = submit_run(db, owner, project_id, session_id, "first-turn", "Make a graph", [], uuid4(), "fixture")
+    db.execute(text("UPDATE runs SET state='completed' WHERE id=:run"), {"run": first.run_id})
+    db.execute(
+        text("INSERT INTO messages (id, project_id, session_id, role, content, run_id) "
+             "VALUES (:id, :project, :session, 'assistant', :content, :run)"),
+        {"id": uuid4(), "project": project_id, "session": session_id, "content": "Graph is ready.", "run": first.run_id},
+    )
+    artifact_id = uuid4()
+    db.execute(
+        text("INSERT INTO artifacts (id, project_id, run_id, title, kind, object_key, sha256, size, content_type) "
+             "VALUES (:id, :project, :run, 'Electron flow', 'plot', 'private/object-key', :sha, 12, 'image/svg+xml')"),
+        {"id": artifact_id, "project": project_id, "run": first.run_id, "sha": "a" * 64},
+    )
+
+    second = submit_run(db, owner, project_id, session_id, "second-turn", "Modify that graph", [], uuid4(), "fixture")
+    snapshot = db.execute(text("SELECT manifest FROM input_snapshots WHERE run_id=:run"), {"run": second.run_id}).scalar_one()
+
+    assert [(message["role"], message["content"]) for message in snapshot["conversation"]] == [
+        ("user", "Make a graph"), ("assistant", "Graph is ready.")
+    ]
+    assert snapshot["prior_artifacts"] == [{
+        "artifact_id": str(artifact_id), "run_id": str(first.run_id), "title": "Electron flow",
+        "kind": "plot", "sha256": "a" * 64, "size": 12, "content_type": "image/svg+xml", "partial": False,
+    }]
+    assert "private/object-key" not in str(snapshot)
+
+
+def test_snapshot_keeps_only_bounded_recent_dialogue(db, project_session):
+    project_id, session_id = project_session
+    for index in range(40):
+        db.execute(text(
+            "INSERT INTO messages (id, project_id, session_id, role, content) "
+            "VALUES (:id, :project, :session, 'user', :content)"
+        ), {"id": uuid4(), "project": project_id, "session": session_id,
+            "content": f"turn-{index:02d}:" + "x" * 5000})
+    run = submit_run(db, Principal(identity=uuid4(), kind="owner"), project_id, session_id,
+                     "bounded-history", "next", [], uuid4(), "fixture")
+    manifest = db.execute(text("SELECT manifest FROM input_snapshots WHERE run_id=:run"),
+                          {"run": run.run_id}).scalar_one()
+
+    assert 0 < len(manifest["conversation"]) < 32
+    assert manifest["conversation"][0]["content"].startswith("turn-16:")
+    assert sum(len(item["content"].encode()) + 256 for item in manifest["conversation"]) <= 128 * 1024
+
+
 def test_concurrent_submission_replay_creates_one_run(db, project_session):
     project_id, session_id = project_session
     db.commit()
@@ -107,7 +189,8 @@ def test_external_can_stop_only_its_own_submission(db, project_session):
     first = authenticate_bearer(db, create_token(db, first_owner, {project_id: ["work:submit", "work:cancel"]}))
     second = authenticate_bearer(db, create_token(db, second_owner, {project_id: ["work:submit", "work:cancel"]}))
     first_run = submit_run(db, first, project_id, session_id, "caller-one", "question one", [], uuid4(), "fixture")
-    second_run = submit_run(db, second, project_id, session_id, "caller-two", "question two", [], uuid4(), "fixture")
+    second_session = create_session(db, project_id, "second external session")
+    second_run = submit_run(db, second, project_id, second_session, "caller-two", "question two", [], uuid4(), "fixture")
     assert request_stop(db, first, first_run.run_id).state == "stopping"
     with pytest.raises(DomainError, match="forbidden"):
         request_stop(db, first, second_run.run_id)

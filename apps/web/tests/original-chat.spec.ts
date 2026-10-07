@@ -29,7 +29,7 @@ test('configured connection notice and plan review control remain available', as
 
   await expect(page.getByLabel('Current model')).toHaveValue(CONNECTION_ID);
   await expect(page.getByText(/Configured connection\. Live provider access is checked when a run starts\./)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Review plan' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Send question' })).toBeEnabled();
 });
 
 test('changing model after an unknown outcome gets a new submission key', async ({ page }) => {
@@ -46,10 +46,10 @@ test('changing model after an unknown outcome gets a new submission key', async 
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Compare models safely');
 
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('alert')).toContainText('could not confirm whether this request arrived');
   await page.getByLabel('Current model').selectOption(secondConnection);
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect.poll(() => fixture.writes.filter((write) => write.method === 'POST' && write.path.endsWith('/runs')).length).toBe(2);
 
   const submissions = fixture.writes.filter((write) => write.method === 'POST' && write.path.endsWith('/runs'));
@@ -79,8 +79,10 @@ test('search-scope edits block approval until a fresh plan preparation completes
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(preparedRun) });
   });
   await page.goto(SESSION_URL);
+  await page.locator('.chat-options > summary').click();
+  await page.getByLabel('Research workflow').selectOption('literature');
   await page.getByLabel('Research question').fill('What changes diffusion?');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('heading', { name: 'Review the plan' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Approve plan' })).toBeEnabled();
 

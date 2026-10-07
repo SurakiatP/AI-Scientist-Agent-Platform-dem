@@ -124,7 +124,7 @@ test('approving an edited plan sends its exact new revision and digest', async (
   const fixture = await installResearchFixtureRoutes(page, { run: null });
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Is the reference real?');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByText('Fixture / fixture-model')).toBeVisible();
   await expect(page.getByText('numpy 2.0.0')).toBeVisible(); await page.locator('.plan-stage-options > summary').click();
   await page.getByLabel('Research stages (one per line)').fill('search_literature');
@@ -145,7 +145,7 @@ test('revision conflict refreshes the plan instead of approving it', async ({ pa
   const fixture = await installResearchFixtureRoutes(page, { run: null, conflictOnApprove: true });
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Q');
-  await page.getByRole('button', { name: 'Review plan' }).click(); await page.getByText('Plan prepared. Review the current requirements and limits before approving.').waitFor();
+  await page.getByRole('button', { name: 'Send question' }).click(); await page.getByText('Plan prepared. Review the current requirements and limits before approving.').waitFor();
   await page.getByRole('button', { name: 'Approve plan' }).click();
   await expect(page.getByText('The plan changed')).toBeVisible();
   await expect(page.getByLabel('Research stages (one per line)')).toHaveValue('search_literature');
@@ -206,8 +206,8 @@ test('duplicate creation is blocked while pending and reconciled with one key', 
   const fixture = await installResearchFixtureRoutes(page, { run: null, holdSubmit: true });
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Q');
-  await page.getByRole('button', { name: 'Review plan' }).click();
-  await expect(page.getByRole('button', { name: 'Creating…' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Send question' }).click();
+  await expect(page.getByRole('button', { name: 'Sending…' })).toBeDisabled();
   fixture.releaseSubmit();
   await expect(page.getByText('Review the plan')).toBeVisible();
   expect(fixture.submitCount()).toBe(1);
@@ -217,7 +217,7 @@ test('new run URL survives refresh and preserves conversation query state', asyn
   await installResearchFixtureRoutes(page, { run: null });
   await page.goto(`${SESSION_URL}?output=${REPORT_ID}&source=plan`);
   await page.getByLabel('Research question').fill('Q');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('region', { name: 'Plan review' })).toBeVisible();
 
   const createdUrl = new URL(page.url());
@@ -235,7 +235,7 @@ test('late run creation does not navigate away after the conversation changes', 
   const fixture = await installResearchFixtureRoutes(page, { run: null, holdSubmit: true });
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Q');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect.poll(() => fixture.submitCount()).toBe(1);
 
   const response = page.waitForResponse((item) =>
@@ -251,7 +251,7 @@ test('late run creation keeps an owner-selected run in the URL', async ({ page }
   const fixture = await installResearchFixtureRoutes(page, { holdSubmit: true });
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Q');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect.poll(() => fixture.submitCount()).toBe(1);
 
   await page.evaluate((path) => {
@@ -272,10 +272,10 @@ test('an unconfirmed submission reuses its key', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: null, failFirstSubmit: true });
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Q');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('alert')).toContainText('could not confirm');
   fixture.setRun({ run_id: NEW_RUN_ID, state: 'awaiting_approval', artifacts: [] });
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByText('Review the plan')).toBeVisible();
   const keys = fixture.writes.filter((w) => w.path.endsWith('/runs')).map((w) => w.body.submission_key);
   expect(keys).toHaveLength(2);
@@ -300,7 +300,7 @@ test('composer waits for model readiness before allowing plan review', async ({ 
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('Does temperature change diffusion?');
   await connectionsRequested;
-  const reviewButton = page.getByRole('button', { name: 'Review plan' });
+  const reviewButton = page.getByRole('button', { name: 'Send question' });
   await expect(reviewButton).toBeDisabled();
 
   releaseConnections();
@@ -314,10 +314,10 @@ test('composer waits for model readiness before allowing plan review', async ({ 
 test('composer rejects empty questions and unconfigured models with next actions', async ({ page }) => {
   const fixture = await installResearchFixtureRoutes(page, { run: null, connection: 'unconfigured' });
   await page.goto(SESSION_URL);
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('alert')).toContainText('Enter a research question');
   await page.getByLabel('Research question').fill('Q');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('alert')).toContainText('No model is ready');
   await expect(page.getByRole('link', { name: 'Configure model' })).toBeVisible();
   expect(fixture.writes.filter((w) => w.path.endsWith('/runs'))).toHaveLength(0);
@@ -349,7 +349,7 @@ test('retry preloads the prior question and keeps partial outputs separate', asy
   await expect(page.getByLabel('Research question')).toHaveValue('Original question about diffusion');
   await expect(page.getByText('Previous run (kept)')).toBeVisible();
   await expect(page.locator('.artifact-provenance', { hasText: 'Partial output' })).toBeVisible();
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByText('Review the plan')).toBeVisible();
   await expect.poll(() => fixture.writes.find((w) => w.path.endsWith('/runs'))?.body.question).toBe('Original question about diffusion');
   expect(fixture.writes.find((w) => w.path.endsWith('/runs'))!.body).not.toHaveProperty('retry_of');
@@ -370,10 +370,11 @@ test('submit sends exactly the server fields and no retry_of', async ({ page }) 
   await page.goto(SESSION_URL); await page.locator('.chat-file-picker > summary').click();
   await page.getByLabel('Research question').fill('Q');
   await page.getByRole('button', { name: 'Add to question: example.csv' }).click();
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByText('Review the plan')).toBeVisible();
   const body = fixture.writes.find((w) => w.path === `/sessions/22222222-2222-4222-8222-222222222222/runs`)!.body;
-  expect(Object.keys(body).sort()).toEqual(['input_ids', 'model', 'provider_id', 'question', 'submission_key']);
+  expect(Object.keys(body).sort()).toEqual(['chat_turn', 'input_ids', 'model', 'provider_id', 'question', 'submission_key']);
+  expect(body.chat_turn).toBe(true);
   expect(body.input_ids).toEqual(['f1111111-1111-4111-8111-111111111111']);
 });
 
@@ -728,7 +729,7 @@ test('a delayed empty session bootstrap cannot erase a run submitted while it wa
   await page.goto(SESSION_URL);
   await bootstrapStarted;
   await page.getByLabel('Research question').fill('A fresh question');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('heading', { name: 'Review the plan' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Waiting approval' })).toBeVisible();
 
@@ -764,4 +765,48 @@ test('a stale REST snapshot cannot replace progress confirmed by a newer SSE eve
   await expect(page.getByText('Current stage: Verify references')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Waiting for your decision' })).toHaveCount(0);
   expect(snapshotCount).toBeGreaterThanOrEqual(2);
+});
+
+test('chat turn creates a chat-mode plan before approval', async ({ page }) => {
+  const fixture = await installResearchFixtureRoutes(page, { run: null, chatVisualization: true });
+  await page.goto(SESSION_URL);
+  await expect(page.getByLabel('Research workflow')).toHaveValue('chat');
+  await page.getByLabel('Research question').fill('Why is the treatment group lower?');
+  await page.getByRole('button', { name: 'Send question' }).click();
+  await expect.poll(() => fixture.writes.find((write) => write.path.endsWith('/prepare-plan'))?.body.workflow).toBe('chat');
+  expect(fixture.writes.find((write) => write.path.endsWith('/prepare-plan'))?.body.search_terms).toEqual([]);
+  expect(fixture.writes.find((write) => write.path.endsWith('/runs'))?.body.chat_turn).toBe(true);
+  await expect(page.getByLabel('Research question')).toHaveValue('');
+  await expect(page.getByRole('button', { name: 'Approve plan' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Approve plan' }).click();
+  await expect.poll(() => fixture.writes.some((write) => write.path.endsWith('/approve'))).toBe(true);
+
+});
+
+test('persisted assistant messages and SVG plots return after refresh', async ({ page }) => {
+  await installResearchFixtureRoutes(page, {
+    plotSvg: true,
+    messages: [
+      { id: 'm1', sequence: 1, role: 'user', content: 'Compare the measurements.', run_id: RUN_ID, created_at: '2026-10-05T00:00:00Z' },
+      { id: 'm2', sequence: 2, role: 'assistant', content: 'The treatment group is lower.', run_id: RUN_ID, created_at: '2026-10-05T00:00:01Z' },
+    ],
+  });
+  await page.goto(SESSION_URL);
+  await expect(page.getByText('The treatment group is lower.')).toBeVisible();
+  await page.reload();
+  await expect(page.getByText('The treatment group is lower.')).toBeVisible();
+  const outputs = page.getByRole('complementary', { name: 'Outputs' });
+  await outputs.getByRole('button', { name: 'Expand visual: Concentration profile' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Concentration profile' });
+  await expect(dialog.locator('img[alt="Concentration profile"]')).toBeVisible();
+});
+
+test('graph revision prompt is seeded from the selected graph', async ({ page }) => {
+  await installResearchFixtureRoutes(page);
+  await page.goto(SESSION_URL);
+  await page.getByText('Workflow options').click();
+  await page.getByLabel('Research workflow').selectOption('crossref_csv');
+  await page.getByRole('button', { name: 'Ask to revise this graph' }).click();
+  await expect(page.getByLabel('Research workflow')).toHaveValue('chat');
+  await expect(page.getByLabel('Research question')).toHaveValue(/Please revise graph “Concentration profile” \(artifact ID: dddddddd-dddd-4ddd-8ddd-dddddddddddd\)/);
 });

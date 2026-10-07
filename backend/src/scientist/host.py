@@ -468,15 +468,35 @@ def bootstrap(db, run_id: UUID, generation: int) -> WorkerBootstrap:
             trusted_runtime_pins=trusted_runtime_pins))
         return supervisor.continuation_bootstrap(db, run_id, generation, controller)
     stamp = time.time()
+    prior_messages = row["manifest"].get("conversation", [])
+    if not isinstance(prior_messages, list) or len(prior_messages) > 32:
+        raise RuntimeError("snapshot conversation is invalid")
+    messages = [
+        {"role": message["role"], "content": message["content"]}
+        for message in prior_messages
+        if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
+        and isinstance(message.get("content"), str)
+    ]
+    artifacts = row["manifest"].get("prior_artifacts", [])
+    if not isinstance(artifacts, list) or len(artifacts) > 32:
+        raise RuntimeError("snapshot artifact references are invalid")
+    if artifacts:
+        references = json.dumps(artifacts, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        messages.append({
+            "role": "developer",
+            "content": "Prior completed-run artifact references for this session (metadata only): " + references,
+        })
+    messages.append({"role": "user", "content": row["manifest"]["question"]})
+    current_user_index = len(messages) - 1
     context = RuntimeContextV1.model_validate({
         "schema_version": 1, "run_id": str(run_id), "project_id": str(row["project_id"]), "generation": generation,
         "revision": row["revision"], "input_snapshot_digest": row["snapshot"].strip(),
         "plan_digest": row["plan_digest"].strip(), "runtime_commit": cfg.runtime_commit, **pins,
         "provider_id": str(plan.provider_id), "provider_endpoint": endpoint, "model": plan.model,
         "plan": plan.model_dump(mode="json"), "turn_id": str(uuid4()), "system_prompt": SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": row["manifest"]["question"]}],
-        "native_message_metadata": [{"message_index": 0, "timestamp": stamp}],
-        "current_turn_user_index": 0, "native_turn_timestamp": stamp,
+        "messages": messages,
+        "native_message_metadata": [{"message_index": current_user_index, "timestamp": stamp}],
+        "current_turn_user_index": current_user_index, "native_turn_timestamp": stamp,
         "todo": {"todos": [], "revision": 0}, "compacted_context": None, "boundary": "before_model",
         "pending_assistant": None, "operation_mappings": [], "operation_sequence": 0, "workspace_manifest": []})
     return WorkerBootstrap(context=context.model_dump_json().encode(), workspace=[],

@@ -34,7 +34,7 @@ test('Review plan sends one preparation request using the submitted workflow, in
   await page.getByLabel('Numeric columns').fill('control');
   await page.getByLabel('Current model').selectOption(CONNECTION_ID);
   await page.getByLabel('Research question').fill('Submitted question');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect.poll(() => fixture.submitCount()).toBe(1);
 
   await page.getByLabel('Research question').fill('Changed after submit');
@@ -57,14 +57,15 @@ test('failed preparation is retained for explicit recovery and never resent on r
   });
   await page.goto(SESSION_URL);
   await page.getByLabel('Research question').fill('A recoverable plan');
-  await page.getByRole('button', { name: 'Review plan' }).click();
+  await page.getByRole('button', { name: 'Send question' }).click();
   await expect(page.getByRole('alert')).toContainText('will not be resent automatically');
   expect(prepares).toBe(1);
 
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Review the plan' })).toBeVisible();
   await page.locator('.chat-next-question > summary').click();
-  await expect(page.getByLabel('Research question')).toHaveValue('A recoverable plan');
+  await expect(page.getByLabel('Research question')).toHaveValue('');
+  await expect(page.getByText('A recoverable plan')).toBeVisible();
   expect(prepares).toBe(1);
   await page.getByRole('button', { name: 'Prepare plan' }).click();
   await expect.poll(() => prepares).toBe(2);

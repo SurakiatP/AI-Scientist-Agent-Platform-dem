@@ -16,12 +16,18 @@ from scientist.contracts import canonical_peer_parameters_bytes
 from scientist import limits, settings
 
 _SNAPSHOT_MAX_BYTES = 1024 * 1024
+_CONVERSATION_MAX_MESSAGES = 32
+_CONVERSATION_MAX_BYTES = 128 * 1024
+_CONVERSATION_MAX_MESSAGE_BYTES = 64 * 1024
 
 
 def submit_run(db: Session, principal: Principal, project_id: UUID, session_id: UUID,
                submission_key: str, question: str, input_ids: list[UUID],
-               provider_id: UUID, model: str, retry_of: UUID | None = None) -> RunView:
+               provider_id: UUID, model: str, retry_of: UUID | None = None,
+               serialize_session: bool = False) -> RunView:
     authorize(db, principal, "work:submit", project_id)
+    if serialize_session and len(question.encode("utf-8")) > _CONVERSATION_MAX_MESSAGE_BYTES:
+        raise DomainError("request_too_large", 413)
     if not 1 <= len(submission_key) <= 200 or not question.strip() or len(question) > 100000 or not model.strip() or len(model) > 200:
         raise DomainError("forbidden", 400)
     if len(input_ids) > 1000:
@@ -54,6 +60,16 @@ def submit_run(db: Session, principal: Principal, project_id: UUID, session_id: 
             raise DomainError("not_found", 404)
         if prior.state not in ("failed", "canceled"):
             raise DomainError("revision_conflict", 409)
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:turn_lock))"),
+               {"turn_lock": f"scientist.session.turn:{project_id}:{session_id}"})
+    active_turn = db.execute(text("""
+        SELECT 1 FROM runs
+        WHERE project_id = :project AND session_id = :session
+          AND state NOT IN ('completed', 'failed', 'canceled', 'rejected')
+        LIMIT 1 FOR UPDATE
+    """), {"project": project_id, "session": session_id}).scalar_one_or_none()
+    if active_turn is not None and serialize_session:
+        raise DomainError("revision_conflict", 409)
     manifest = _capture_snapshot(db, project_id, session_id, request)
     encoded_manifest = json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     if len(encoded_manifest.encode()) > _SNAPSHOT_MAX_BYTES:
@@ -655,12 +671,42 @@ def _capture_snapshot(db: Session, project_id: UUID, session_id: UUID, request: 
         /* scientist.snapshot.capture */
         WITH project_row AS MATERIALIZED (
             SELECT id, revision, instructions FROM projects WHERE id = :project
+        ), latest_messages AS (
+            SELECT id, sequence, role,
+                   CASE WHEN octet_length(content) <= :conversation_max_message_bytes THEN content END AS content,
+                   octet_length(content) > :conversation_max_message_bytes AS too_big
+            FROM messages
+            WHERE project_id = :project AND session_id = :session
+              AND role IN ('user', 'assistant')
+            ORDER BY sequence DESC
+            LIMIT :conversation_max_messages
+        ), recent_messages AS (
+            SELECT id, sequence, role, content, too_big,
+                   sum(CASE WHEN too_big THEN :conversation_max_bytes + 1
+                            ELSE octet_length(content) + 256 END)
+                       OVER (ORDER BY sequence DESC) AS context_bytes
+            FROM latest_messages
         ), conversation AS (
             SELECT COALESCE(jsonb_agg(jsonb_build_object(
                        'id', id::text, 'sequence', sequence, 'role', role, 'content', content
-                   ) ORDER BY sequence), '[]'::jsonb) AS data,
-                   COALESCE(sum(octet_length(content) + 256), 0) AS size
-            FROM messages WHERE project_id = :project AND session_id = :session
+                   ) ORDER BY sequence) FILTER (WHERE NOT too_big AND context_bytes <= :conversation_max_bytes),
+                   '[]'::jsonb) AS data,
+                   COALESCE(sum(octet_length(content) + 256)
+                            FILTER (WHERE NOT too_big AND context_bytes <= :conversation_max_bytes), 0) AS size,
+                   COALESCE(bool_or(too_big), false) AS oversized
+            FROM recent_messages
+        ), prior_artifacts AS (
+            SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                       'artifact_id', id::text, 'run_id', run_id::text, 'title', title, 'kind', kind,
+                       'sha256', sha256, 'size', size, 'content_type', content_type, 'partial', partial
+                   ) ORDER BY run_id DESC, id DESC), '[]'::jsonb) AS data,
+                   COALESCE(sum(octet_length(title) + octet_length(content_type) + 320), 0) AS size
+            FROM (
+                SELECT a.id, a.run_id, a.title, a.kind, a.sha256, a.size, a.content_type, a.partial
+                FROM artifacts a JOIN runs r ON r.id = a.run_id
+                WHERE r.project_id = :project AND r.session_id = :session AND r.state = 'completed'
+                ORDER BY a.run_id DESC, a.id DESC LIMIT 32
+            ) completed_artifacts
         ), citations_by_finding AS (
             SELECT fc.finding_id,
                    jsonb_agg(jsonb_build_object(
@@ -719,28 +765,36 @@ def _capture_snapshot(db: Session, project_id: UUID, session_id: UUID, request: 
                                + COALESCE(octet_length(sha256), 0) + COALESCE(octet_length(content_type), 0) + 256), 0) AS size
             FROM file_detail
         ), measured AS (
-            SELECT project_row.*, conversation.data AS conversation, findings.data AS findings, files.data AS files,
-                   octet_length(project_row.instructions) + conversation.size + findings.size + files.size
+            SELECT project_row.*, conversation.data AS conversation, prior_artifacts.data AS prior_artifacts,
+                   findings.data AS findings, files.data AS files,
+                   octet_length(project_row.instructions)
+                   + CASE WHEN conversation.oversized THEN :snapshot_max + 1 ELSE conversation.size END
+                   + prior_artifacts.size + findings.size + files.size
                    + :question_size + 512 AS total_size
-            FROM project_row CROSS JOIN conversation CROSS JOIN findings CROSS JOIN files
+            FROM project_row CROSS JOIN conversation CROSS JOIN prior_artifacts CROSS JOIN findings CROSS JOIN files
         )
         SELECT id::text AS project_id, revision,
                total_size > :snapshot_max AS oversized,
                CASE WHEN total_size > :snapshot_max THEN NULL ELSE instructions END AS instructions,
                CASE WHEN total_size > :snapshot_max THEN NULL ELSE conversation END AS conversation,
+               CASE WHEN total_size > :snapshot_max THEN NULL ELSE prior_artifacts END AS prior_artifacts,
                CASE WHEN total_size > :snapshot_max THEN NULL ELSE findings END AS findings,
                CASE WHEN total_size > :snapshot_max THEN NULL ELSE files END AS files
         FROM measured
     """), {
         "project": project_id, "session": session_id,
         "input_ids": [UUID(value) for value in request["input_ids"]],
+        "conversation_max_bytes": _CONVERSATION_MAX_BYTES,
+        "conversation_max_message_bytes": _CONVERSATION_MAX_MESSAGE_BYTES,
+        "conversation_max_messages": _CONVERSATION_MAX_MESSAGES,
         "question_size": len(request["question"].encode()), "snapshot_max": _SNAPSHOT_MAX_BYTES,
     }).mappings().one_or_none()
     if raw is None:
         raise DomainError("not_found", 404)
     if raw["oversized"]:
         raise DomainError("request_too_large", 413)
-    conversation, findings, files = raw["conversation"], raw["findings"], raw["files"]
+    conversation = raw["conversation"]
+    prior_artifacts, findings, files = raw["prior_artifacts"], raw["findings"], raw["files"]
     if len(files) != len(request["input_ids"]):
         raise DomainError("storage_unavailable", 503)
     for finding in findings:
@@ -770,7 +824,8 @@ def _capture_snapshot(db: Session, project_id: UUID, session_id: UUID, request: 
     return {
         "project": {"id": raw["project_id"], "revision": raw["revision"], "instructions": raw["instructions"]},
         "question": request["question"], "provider_id": request["provider_id"], "model": request["model"],
-        "conversation": conversation, "findings": findings, "files": captured_files,
+        "conversation": conversation, "prior_artifacts": prior_artifacts,
+        "findings": findings, "files": captured_files,
     }
 
 
