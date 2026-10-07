@@ -743,6 +743,7 @@ def recover(db: Session, run_id: UUID, *, budget_resume: bool = False) -> RunVie
         ORDER BY generation, CASE kind WHEN 'worker' THEN 0 ELSE 1 END, id FOR UPDATE
     """), {"run": run_id}).mappings().all()
     uncertain = False
+    deferred_worker_stops = []
     for executor in executors:
         if executor["state"] == "inactive":
             if not _inactive_executor_proven(executor):
@@ -854,9 +855,7 @@ def recover(db: Session, run_id: UUID, *, budget_resume: bool = False) -> RunVie
                 ref = _executor_ref(executor)
 
             if not cfg.engine.stop_worker(ref, 0):
-                uncertain = True
-                db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
-                           {"id": executor["id"]})
+                deferred_worker_stops.append(ref)
                 continue
             proof = {
                 "source": "owned-engine-exact-container",
@@ -941,6 +940,53 @@ def recover(db: Session, run_id: UUID, *, budget_resume: bool = False) -> RunVie
         uncertain = True
         db.execute(text("UPDATE runtime_executors SET state='unknown', updated_at=now() WHERE id=:id"),
                    {"id": executor["id"]})
+    # A worker can remain attached to its generation network until the dispatch
+    # sibling is stopped. Retry once after the executor pass, as stop() does.
+    for ref in deferred_worker_stops:
+        try:
+            stopped = bool(cfg.engine.stop_worker(ref, 0))
+        except Exception:
+            stopped = False
+        if not stopped:
+            uncertain = True
+            db.execute(text("""
+                UPDATE runtime_executors SET state='unknown', updated_at=now()
+                WHERE id=:id AND run_id=:run AND generation=:generation
+                  AND kind='worker' AND container_id=:container AND engine_id=:engine
+                  AND process_incarnation=:incarnation
+            """), {
+                "id": ref.executor_id,
+                "run": ref.run_id,
+                "generation": ref.generation,
+                "container": ref.container_id,
+                "engine": ref.engine_id,
+                "incarnation": ref.process_incarnation,
+            })
+            continue
+        proof = {
+            "source": "owned-engine-exact-container",
+            "engine_id": ref.engine_id,
+            "container_id": ref.container_id,
+            "stopped_at": datetime.now(timezone.utc).isoformat(),
+        }
+        changed = db.execute(text("""
+            UPDATE runtime_executors
+            SET state='inactive', proof=CAST(:proof AS jsonb), updated_at=now()
+            WHERE id=:id AND run_id=:run AND generation=:generation
+              AND kind='worker' AND container_id=:container AND engine_id=:engine
+              AND process_incarnation=:incarnation
+        """), {
+            "proof": json.dumps(proof, sort_keys=True),
+            "id": ref.executor_id,
+            "run": ref.run_id,
+            "generation": ref.generation,
+            "container": ref.container_id,
+            "engine": ref.engine_id,
+            "incarnation": ref.process_incarnation,
+        }).rowcount
+        if changed != 1:
+            uncertain = True
+
     pending_unknown = db.execute(text("""
         SELECT 1 FROM operations WHERE run_id=:run AND state='unknown' AND NOT COALESCE(result ? 'retry_identity', false) LIMIT 1
     """), {"run": run_id}).scalar_one_or_none() is not None

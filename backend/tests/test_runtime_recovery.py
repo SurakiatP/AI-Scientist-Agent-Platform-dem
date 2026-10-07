@@ -619,6 +619,52 @@ def test_recover_exactly_reaps_previous_generation_and_claims_next(
                       {"run": run.run_id}).scalar_one() == 0
 
 
+def test_recover_retries_worker_stop_after_dispatch_sibling_stops(
+    db, project_session, object_fixture, tmp_path, monkeypatch
+):
+    run = _prepare_recovery_run(db, project_session, object_fixture, tmp_path)
+    worker_ref = ExecutorRef(uuid4(), run.run_id, 1, "worker", None, uuid4(), "engine-test", "a" * 64)
+    dispatch_ref = ExecutorRef(uuid4(), run.run_id, 1, "dispatch", None, uuid4(), "engine-test", "b" * 64)
+    _insert_executor(db, run.run_id, worker_ref, "active", bound=True)
+    _insert_executor(db, run.run_id, dispatch_ref, "active", bound=True)
+    db.commit()
+
+    state = SimpleNamespace(network_attached=True, calls=[])
+
+    class Engine:
+        def stop_worker(self, ref, grace_seconds):
+            assert ref == worker_ref
+            assert grace_seconds == 0
+            state.calls.append("worker")
+            return not state.network_attached
+
+    class Dispatch:
+        def stop(self, _db, ref, grace_seconds):
+            assert ref == dispatch_ref
+            assert grace_seconds == 0
+            state.calls.append("dispatch")
+            state.network_attached = False
+            return True
+
+        def inactive(self, _db, _ref, _operation_id):
+            return not state.network_attached
+
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=Engine(), dispatch=Dispatch()))
+
+    recovered = supervisor.recover(db, run.run_id)
+
+    assert state.calls == ["worker", "dispatch", "worker"]
+    assert recovered.state == "queued", (recovered.state, recovered.waiting_reason)
+    rows = db.execute(text("""
+        SELECT kind, state, generation, container_id, engine_id, proof
+        FROM runtime_executors WHERE run_id=:run AND generation=1
+    """), {"run": run.run_id}).mappings().all()
+    assert len(rows) == 2
+    assert all(row["state"] == "inactive" and row["generation"] == 1 for row in rows)
+    assert all(row["proof"]["engine_id"] == row["engine_id"] for row in rows)
+    assert all(row["proof"]["container_id"] == row["container_id"] for row in rows)
+
+
 def test_recover_failed_dispatch_stop_keeps_reservation_and_generation_paused(
     db, project_session, object_fixture, tmp_path, monkeypatch
 ):
@@ -823,6 +869,7 @@ def _flaky_stop_engine(monkeypatch):
             return len(calls) > 1
 
     monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=Engine(), dispatch=object()))
+    return calls
 
 
 def _run_row(db, run_id):
@@ -831,14 +878,15 @@ def _run_row(db, run_id):
                       {"r": run_id}).one()
 
 
-def test_two_step_recover_through_quiescence_keeps_owner_decision(
+def test_recover_retries_worker_stop_within_pass_and_keeps_owner_decision(
     db, project_session, object_fixture, tmp_path, monkeypatch
 ):
     run, decision = _decision_run(db, project_session, object_fixture, tmp_path, 10)
-    _flaky_stop_engine(monkeypatch)
+    calls = _flaky_stop_engine(monkeypatch)
 
     first = supervisor.recover(db, run.run_id)
-    assert first.waiting_reason == "executor_quiescence_unproven"
+    assert (first.state, first.waiting_reason) == ("waiting_input", "budget_exhausted")
+    assert len(calls) == 2
     second = supervisor.recover(db, run.run_id)
 
     row = _run_row(db, run.run_id)
@@ -846,6 +894,61 @@ def test_two_step_recover_through_quiescence_keeps_owner_decision(
         "waiting_input", "budget_exhausted", decision)
     assert second.state == "waiting_input"
     assert _run_row(db, run.run_id).generation == 1
+
+
+@pytest.mark.parametrize("retry_raises", [False, True])
+def test_recover_failed_worker_retry_keeps_reservation_and_generation_paused(
+    db, project_session, monkeypatch, retry_raises
+):
+    run, _ = _reserved_stop_run(db, project_session, monkeypatch)
+    before = _ops_and_budget(db, run.run_id)
+    executors = db.execute(text("""
+        SELECT * FROM runtime_executors WHERE run_id=:run ORDER BY kind
+    """), {"run": run.run_id}).mappings().all()
+    worker = next(row for row in executors if row["kind"] == "worker")
+    dispatch = next(row for row in executors if row["kind"] == "dispatch")
+    worker_ref = supervisor._executor_ref(worker)
+    dispatch_ref = supervisor._executor_ref(dispatch)
+
+    class Engine:
+        calls = 0
+
+        def stop_worker(self, ref, grace_seconds):
+            assert ref == worker_ref
+            assert grace_seconds == 0
+            self.calls += 1
+            if self.calls == 1:
+                return False
+            if retry_raises:
+                raise RuntimeError("worker remains attached to network")
+            return False
+
+    class Dispatch:
+        def stop(self, _db, ref, grace_seconds):
+            assert ref == dispatch_ref
+            assert grace_seconds == 0
+            return True
+
+        def inactive(self, _db, _ref, _operation_id):
+            return True
+
+    engine = Engine()
+    monkeypatch.setattr(supervisor, "_config", SimpleNamespace(engine=engine, dispatch=Dispatch()))
+
+    recovered = supervisor.recover(db, run.run_id)
+
+    assert engine.calls == 2
+    assert (recovered.state, recovered.waiting_reason) == (
+        "waiting_input", "executor_quiescence_unproven"
+    )
+    assert db.execute(text("SELECT generation FROM runs WHERE id=:run"),
+                      {"run": run.run_id}).scalar_one() == 1
+    assert _ops_and_budget(db, run.run_id) == before
+    final = db.execute(text("""
+        SELECT kind, state FROM runtime_executors
+        WHERE run_id=:run AND generation=1 ORDER BY kind
+    """), {"run": run.run_id}).all()
+    assert final == [("dispatch", "inactive"), ("worker", "unknown")]
 
 
 def test_recover_of_resolved_queued_run_keeps_pending_owner_decision(
