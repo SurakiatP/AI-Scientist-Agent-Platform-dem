@@ -11,6 +11,10 @@ import pytest
 
 from scientist import profile_evidence as evidence, profile_preparation as prep
 
+
+def test_worker_receipt_binds_plot_renderer_source() -> None:
+    assert 'backend/src/scientist/scientific_render.py' in evidence.SOURCE_FILES
+
 KEY = b"synthetic-test-receipt-key-only!!!"
 IMAGE = "sha256:" + "a" * 64
 

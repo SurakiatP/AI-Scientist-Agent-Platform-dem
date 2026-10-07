@@ -22,6 +22,7 @@ SOURCE_FILES = frozenset({
     *(f'backend/src/scientist/{name}.py' for name in (
         '__init__', 'contracts', 'runtime_contracts', 'model_payload', 'runtime_adapter',
         'capability_registry', 'instruction_loader', 'resource_recipe', 'private_worker_api',
+        'scientific_render',
         'profile_preparation', 'profile_evidence', 'scientific_authority')),
     'runtime/entrypoint.py', 'runtime/skills-manifest.json', 'runtime/requirements.lock',
     'runtime/profiles/worker-base.json', 'docs/skills/capability-registry.json',
