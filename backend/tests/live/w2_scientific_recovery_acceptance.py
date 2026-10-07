@@ -281,9 +281,10 @@ def _receipts_at_tool_checkpoint(h, text):
 def _check_v2_receipts(rows) -> None:
     need(len(rows) == 4 and {row["output_index"] for row in rows} == {0, 1, 2, 3},
          "W2 V2 receipt set is not exactly four indexed outputs")
+    receipt_hashes = {row["receipt_sha256"].strip() for row in rows}
     need(len({row["artifact_id"] for row in rows}) == 4
-         and len({row["receipt_sha256"].strip() for row in rows}) == 4,
-         "W2 V2 receipts do not bind four distinct outputs and receipt digests")
+         and len(receipt_hashes) == 1 and bool(next(iter(receipt_hashes), "")),
+         "W2 V2 receipts do not bind four distinct outputs to one nonblank receipt digest")
     need(all((row["context"] or {}).get("boundary") == "tool_committed" for row in rows),
          "W2 V2 receipt is not bound to the committed tool checkpoint")
 
@@ -634,7 +635,7 @@ def self_check() -> None:
     need(marker_index >= 0 and events[marker_index + 1:] == [("commit",), ("sleep", 120)],
          "W2 fixture stall marker was not committed before its blocking wait")
     receipt_rows = [{"output_index": index, "artifact_id": f"artifact-{index}",
-                     "receipt_sha256": str(index) * 64, "context": {"boundary": "tool_committed"}}
+                     "receipt_sha256": "a" * 64, "context": {"boundary": "tool_committed"}}
                     for index in range(4)]
     _check_v2_receipts(receipt_rows)
     operations = ([{"kind": "llm", "state": "committed"} for _ in range(4)]
